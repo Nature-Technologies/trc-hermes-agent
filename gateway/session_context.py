@@ -37,7 +37,7 @@ needs to replace the import + call site:
 """
 
 from contextvars import ContextVar
-from typing import Any
+from typing import Any, Optional
 
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
 # When a contextvar holds _UNSET, we fall back to os.environ (CLI/cron compat).
@@ -93,6 +93,22 @@ _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", defaul
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 
+# Opaque end-user identity token that arrived on THIS request from the frontend
+# (Open WebUI's ``X-OpenWebUI-User-Jwt``: a short-lived HS256 JWT whose ``sub``
+# claim is the end user).  Forwarded verbatim onto outbound MCP tool calls so an
+# MCP server that enforces per-user permissions can identify the real caller
+# instead of trusting a value the reasoning model chose.
+#
+# Deliberately NOT in ``_VAR_MAP``: :func:`get_session_env` falls back to
+# ``os.environ``, and a process-global fallback is exactly the cross-user leak
+# this variable exists to prevent.  One shared Hermes process serves many users;
+# an identity readable from a process-global is an identity readable by the
+# wrong user.  Accessed through the dedicated helpers below instead.
+#
+# ``None`` means "no identity arrived on this request" — there is no default and
+# no fallback.  Missing identity must never resolve to somebody else's token.
+_END_USER_IDENTITY: ContextVar = ContextVar("HERMES_END_USER_IDENTITY", default=None)
+
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
 #
@@ -136,6 +152,30 @@ _VAR_MAP = {
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
 }
+
+
+def set_end_user_identity(token: Optional[str]):
+    """Bind the end-user identity token that arrived on this request.
+
+    Returns a reset token; pass it to :func:`reset_end_user_identity` in a
+    ``finally`` block so the binding cannot outlive the request.  Blank input
+    binds ``None`` — an empty identity is no identity, and must not be
+    distinguishable downstream from "nothing arrived".
+    """
+    return _END_USER_IDENTITY.set((token or "").strip() or None)
+
+
+def get_end_user_identity() -> Optional[str]:
+    """The end-user identity token for the current request, or ``None``.
+
+    No ``os.environ`` fallback by design — see ``_END_USER_IDENTITY``.
+    """
+    return _END_USER_IDENTITY.get()
+
+
+def reset_end_user_identity(token) -> None:
+    """Restore the previous identity binding (token from :func:`set_end_user_identity`)."""
+    _END_USER_IDENTITY.reset(token)
 
 
 def set_current_session_id(session_id: str) -> None:
@@ -244,6 +284,9 @@ def clear_session_vars(tokens: list) -> None:
     # behavior (CLI / unaware paths), not be mistaken for an opted-out
     # stateless adapter.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    # An end-user identity is strictly request-scoped: a finished handler must
+    # not leave one visible to whatever runs next in this context.
+    _END_USER_IDENTITY.set(None)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -292,6 +335,10 @@ def reset_session_vars() -> None:
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    # Same inheritance-leak reason, and the stakes are higher here: a task
+    # spawned from a context where a concurrent request had bound its end-user
+    # identity would otherwise forward THAT user's token on its MCP tool calls.
+    _END_USER_IDENTITY.set(None)
     try:
         from agent.runtime_cwd import clear_session_cwd
 

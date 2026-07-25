@@ -68,6 +68,51 @@ _api_request_profile: ContextVar[Optional[str]] = ContextVar(
     "api_server_request_profile", default=None
 )
 
+# Inbound header carrying the end user's identity token on every request.
+# Open WebUI sends a short-lived HS256 JWT here (claims: sub/email/name/role/
+# iss/iat/exp) when ENABLE_FORWARD_USER_INFO_HEADERS is on and
+# FORWARD_USER_INFO_HEADER_JWT_SECRET is set; its own header name is overridable
+# via FORWARD_USER_INFO_HEADER_JWT, so mirror that flexibility here.
+#
+# Hermes does NOT verify the signature — the MCP server that consumes the token
+# owns verification against the shared secret. Hermes forwards what arrived, and
+# forwards nothing when nothing arrived.
+_END_USER_JWT_HEADER = (
+    os.environ.get("HERMES_END_USER_JWT_HEADER", "").strip()
+    or "X-OpenWebUI-User-Jwt"
+)
+
+# Bounds on a forwarded identity token. The value is re-emitted as an outbound
+# HTTP header on MCP tool calls, so anything that cannot legally sit in a header
+# is DROPPED rather than sanitized: a mangled token is not an identity, and a
+# partially-stripped one could authenticate the wrong subject. The charset is
+# the JWT alphabet (base64url segments joined by dots), kept slightly wider to
+# tolerate padding and other opaque token formats.
+#
+# 4096 is far above a realistic token (Open WebUI's carries ~300 bytes of claims)
+# and comfortably below aiohttp's own 8190-byte header-field limit, so an
+# over-long value is rejected here with a diagnostic rather than as an opaque 431.
+_MAX_END_USER_JWT_LEN = 4096
+_END_USER_JWT_ALLOWED = re.compile(r"^[A-Za-z0-9._~+/=-]+$")
+
+
+def _sanitize_end_user_jwt(raw: Optional[str]) -> Optional[str]:
+    """Return a forwardable end-user identity token, or ``None``. Never raises."""
+    if not raw:
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+    if len(value) > _MAX_END_USER_JWT_LEN or not _END_USER_JWT_ALLOWED.match(value):
+        logger.warning(
+            "Ignoring malformed %s header (%d bytes): not a forwardable "
+            "identity token; this request proceeds with no end-user identity",
+            _END_USER_JWT_HEADER, len(value),
+        )
+        return None
+    return value
+
+
 def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> list[str]:
     if smart_denied:
         return ["once", "deny"]
@@ -91,6 +136,7 @@ from gateway.platforms.base import (
 )
 from agent.redact import redact_sensitive_text
 from gateway.readiness import collect_runtime_readiness
+from gateway.session_context import get_end_user_identity
 
 logger = logging.getLogger(__name__)
 
@@ -1747,6 +1793,37 @@ class APIServerAdapter(BasePlatformAdapter):
                 _api_request_profile.reset(token)
 
         return profile_prefix_middleware
+
+    @staticmethod
+    def _make_end_user_identity_middleware():
+        """Bind the inbound end-user identity token to this request's context.
+
+        Request-scoped by construction: the ContextVar is set per aiohttp task
+        and reset when the handler returns, so one shared process serving many
+        users can never hand user B the token that arrived with user A's
+        request. Concurrent requests each get their own task-local binding.
+
+        The token is consumed downstream by the MCP client, which forwards it
+        verbatim on outbound tool calls so a permission-enforcing MCP server
+        learns the real caller. Hermes never mints or synthesizes an identity —
+        no inbound header means no identity, not a default one.
+        """
+
+        @web.middleware
+        async def end_user_identity_middleware(request: "web.Request", handler):
+            from gateway.session_context import (
+                reset_end_user_identity,
+                set_end_user_identity,
+            )
+
+            token = _sanitize_end_user_jwt(request.headers.get(_END_USER_JWT_HEADER))
+            reset_token = set_end_user_identity(token)
+            try:
+                return await handler(request)
+            finally:
+                reset_end_user_identity(reset_token)
+
+        return end_user_identity_middleware
 
     def _http_route_table(self) -> List[tuple]:
         """Return (method, path, handler) rows registered by ``connect()``.
@@ -5751,11 +5828,22 @@ class APIServerAdapter(BasePlatformAdapter):
         # run_in_executor threads, so the profile scope must be re-entered
         # inside _run() from this explicit value.
         request_profile = _api_request_profile.get()
+        # Same capture-before-hop reason as request_profile: the MCP tool handler
+        # reads the end-user identity on the agent thread, and the executor
+        # thread starts with a fresh context. Capture this request's value here
+        # and re-establish it inside _run() (task-local, so concurrent requests
+        # never observe each other's identity).
+        request_end_user_identity = get_end_user_identity()
 
         def _run():
-            from gateway.session_context import clear_session_vars
+            from gateway.session_context import (
+                clear_session_vars,
+                reset_end_user_identity,
+                set_end_user_identity,
+            )
 
             with self._profile_scope(request_profile):
+                identity_token = set_end_user_identity(request_end_user_identity)
                 tokens = self._bind_api_server_session(
                     chat_id=session_id or "",
                     session_key=gateway_session_key or session_id or "",
@@ -5903,6 +5991,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 finally:
                     clear_session_vars(tokens)
+                    reset_end_user_identity(identity_token)
 
         self._activate_admitted_request()
         self._inflight_agent_runs += 1
@@ -6681,6 +6770,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 mw
                 for mw in (
                     self._make_profile_prefix_middleware(),
+                    self._make_end_user_identity_middleware(),
                     cors_middleware,
                     body_limit_middleware,
                     security_headers_middleware,

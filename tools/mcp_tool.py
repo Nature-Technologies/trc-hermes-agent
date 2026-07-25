@@ -38,6 +38,17 @@ Example config::
         headers:
           Authorization: "Bearer sk-..."
         timeout: 180
+        forward_user_identity: true   # attach the calling END USER's identity
+                              # token (from the inbound request) to every tool
+                              # call, so a server enforcing per-user
+                              # permissions knows who it is acting for.
+                              # Opt-in per server: the token is a live signed
+                              # credential and must not reach servers with no
+                              # business seeing it. Streamable HTTP only.
+                              # Default: false.
+        user_identity_header: "X-Hermes-End-User-Jwt"  # outbound header name
+                              # for the above (default shown). The value is the
+                              # token verbatim — Hermes forwards, never mints.
         skip_preflight: true  # bypass the content-type probe for a valid
                               # Streamable HTTP endpoint that answers HEAD/GET
                               # with a non-MCP content type but serves real
@@ -71,6 +82,10 @@ Features:
       sampling/createMessage (text and tool-use responses)
     - Parallel tool call opt-in: per-server ``supports_parallel_tool_calls``
       flag allows concurrent execution of tools from the same server
+    - Per-request end-user identity forwarding: opt-in ``forward_user_identity``
+      attaches the inbound request's end-user token to each outbound tool call
+      (see ``_make_end_user_identity_hook``), so one shared Hermes process can
+      serve many users against a permission-enforcing MCP server
 
 Architecture:
     A dedicated background event loop (_mcp_loop) runs in a daemon thread.
@@ -329,6 +344,17 @@ _MCP_LOG_LEVEL_MAP = {
 
 _DEFAULT_TOOL_TIMEOUT = 300      # seconds for tool calls
 _DEFAULT_CONNECT_TIMEOUT = 60    # seconds for initial connection per server
+
+# Outbound header carrying the forwarded per-request end-user identity on MCP
+# tool calls (opt-in per server via ``forward_user_identity``; override the name
+# with ``user_identity_header``).  The value is the token exactly as it arrived
+# — Hermes forwards, it never mints or re-signs an identity.
+#
+# Deliberately NOT ``Authorization``: that header carries the MCP *server's* own
+# service credential (the static ``headers`` block or OAuth 2.1 PKCE) and has
+# cross-origin redirect stripping attached, so service identity and end-user
+# identity stay two independent layers the server can verify separately.
+_DEFAULT_USER_IDENTITY_HEADER = "X-Hermes-End-User-Jwt"
 _MAX_RECONNECT_RETRIES = 5
 _MAX_INITIAL_CONNECT_RETRIES = 3 # retries for the very first connection attempt
 _MAX_BACKOFF_SECONDS = 60
@@ -1828,6 +1854,7 @@ class MCPServerTask:
         "_registered_tool_names", "_auth_type", "_refresh_lock",
         "_rpc_lock", "_pending_refresh_tasks",
         "_pending_call_context",
+        "_forward_user_identity", "_user_identity_header", "_end_user_identity",
         "_lifecycle_started_at", "_last_tool_call_at",
         "_idle_timeout_seconds", "_max_lifetime_seconds", "_recycled_reason",
         "initialize_result", "_ping_unsupported",
@@ -1886,6 +1913,15 @@ class MCPServerTask:
         # gateway-platform attribution and routes the approval prompt
         # to the right surface (Telegram, Slack, etc.).
         self._pending_call_context: Optional[contextvars.Context] = None
+        # Per-request end-user identity forwarding (opt-in, HTTP transport only).
+        # ``_forward_user_identity`` / ``_user_identity_header`` are resolved from
+        # config when the streamable-HTTP transport connects; ``_end_user_identity``
+        # is armed by the tool handler for the duration of ONE tools/call and read
+        # by the outbound httpx request hook.  See
+        # :func:`_make_end_user_identity_hook`.
+        self._forward_user_identity: bool = False
+        self._user_identity_header: str = _DEFAULT_USER_IDENTITY_HEADER
+        self._end_user_identity: Optional[str] = None
         now = time.monotonic()
         self._lifecycle_started_at: float = now
         self._last_tool_call_at: float = now
@@ -2744,6 +2780,18 @@ class MCPServerTask:
         ssl_verify = config.get("ssl_verify", True)
         client_cert = _resolve_client_cert(self.name, config)
 
+        # Per-request end-user identity forwarding. Re-resolved on every
+        # (re)connect and defaulted to OFF so a transport that cannot support it
+        # never silently claims to: only the streamable-HTTP path below lets us
+        # own the httpx client and therefore install a per-POST request hook.
+        self._forward_user_identity = False
+        forward_user_identity = _parse_boolish(
+            config.get("forward_user_identity", False), default=False
+        )
+        self._user_identity_header = str(
+            config.get("user_identity_header") or _DEFAULT_USER_IDENTITY_HEADER
+        )
+
         # OAuth 2.1 PKCE: route through the central MCPOAuthManager so the
         # same provider instance is reused across reconnects, pre-flow
         # disk-watch is active, and config-time CLI code paths share state.
@@ -2778,6 +2826,17 @@ class MCPServerTask:
                     f"MCP server '{self.name}' requires SSE transport but "
                     "mcp.client.sse.sse_client is not available. "
                     "Upgrade the mcp package to get SSE support."
+                )
+            if forward_user_identity:
+                # Fail loudly rather than silently not forwarding: an operator
+                # who set this expects per-user permission enforcement, and a
+                # silent no-op would look like "every user is authorized".
+                logger.error(
+                    "MCP server '%s': forward_user_identity is not supported on "
+                    "the SSE transport (Hermes does not own the httpx client "
+                    "there) — per-request end-user identity will NOT be sent. "
+                    "Use the default Streamable HTTP transport instead.",
+                    self.name,
                 )
             # sse_read_timeout governs how long sse_client will wait between
             # events on the SSE stream. Using the tool_timeout (default 60s)
@@ -2885,6 +2944,14 @@ class MCPServerTask:
                 "verify": ssl_verify,
                 "event_hooks": {"response": [_strip_auth_on_cross_origin_redirect]},
             }
+            if forward_user_identity:
+                # Per-POST injection point for the caller's identity. Enabled
+                # only here because this is the one path where Hermes owns the
+                # httpx client (mcp >= 1.24.0) and can therefore hook requests.
+                self._forward_user_identity = True
+                client_kwargs["event_hooks"]["request"] = [
+                    _make_end_user_identity_hook(self, self._user_identity_header)
+                ]
             if headers:
                 client_kwargs["headers"] = headers
             if _oauth_auth is not None:
@@ -2926,6 +2993,16 @@ class MCPServerTask:
             return reason
         else:
             # Deprecated API (mcp < 1.24.0): manages httpx client internally.
+            if forward_user_identity:
+                # Same reasoning as the SSE branch: the SDK owns the client on
+                # this path, so there is no per-request hook to install.
+                logger.error(
+                    "MCP server '%s': forward_user_identity requires mcp >= "
+                    "1.24.0 (the SDK owns the httpx client on this build) — "
+                    "per-request end-user identity will NOT be sent. Upgrade "
+                    "the mcp package.",
+                    self.name,
+                )
             _http_kwargs: dict = {
                 "headers": headers,
                 "timeout": float(connect_timeout),
@@ -4199,6 +4276,35 @@ def _filter_mcp_children(pids: set) -> set:
     return filtered
 
 
+def _make_end_user_identity_hook(server: Any, header_name: str):
+    """Return an httpx ``request`` hook that stamps the armed end-user identity.
+
+    Why a hook rather than a header on the client: the streamable-HTTP transport
+    opens ONE long-lived ``httpx.AsyncClient`` per configured server at startup
+    (see :meth:`MCPServerTask._run_http`), so its header block is process-wide by
+    construction and cannot carry a per-request value.  Each ``tools/call`` is
+    still its own HTTP POST on that client, and this hook runs per POST.
+
+    Per-request correctness rests on one invariant: the identity is read from
+    ``server._end_user_identity``, which :func:`_make_tool_handler` arms for
+    exactly the duration of one ``tools/call`` while holding the per-server
+    ``_rpc_lock``.  That lock already serializes client-initiated RPCs, so at
+    most one identity is ever armed and it belongs to the call in flight.
+
+    When nothing is armed the header is actively removed rather than left alone,
+    so an absent identity can never inherit a client-level default or a value
+    from a previous caller.  Missing identity means no identity.
+    """
+    async def _stamp_end_user_identity(request) -> None:
+        token = getattr(server, "_end_user_identity", None)
+        if token:
+            request.headers[header_name] = token
+        else:
+            request.headers.pop(header_name, None)
+
+    return _stamp_end_user_identity
+
+
 def _mcp_loop_exception_handler(loop, context):
     """Suppress benign 'Event loop is closed' noise during shutdown.
 
@@ -4528,6 +4634,29 @@ def _get_connected_server_for_call(server_name: str) -> Optional[MCPServerTask]:
     return server
 
 
+def _resolve_end_user_identity(server: Any) -> Optional[str]:
+    """The current request's end-user identity, if *server* opted in to it.
+
+    Returns ``None`` for every server that did not set
+    ``forward_user_identity`` — the token is a live signed credential, so
+    opt-in is what keeps it from reaching unrelated (possibly third-party) MCP
+    servers.
+
+    Fail-safe: any problem reading the identity yields ``None``, which makes
+    the call behave exactly as it did before this feature existed.  It must
+    never fall back to a default or another user's token.
+    """
+    if not getattr(server, "_forward_user_identity", False):
+        return None
+    try:
+        from gateway.session_context import get_end_user_identity
+
+        return get_end_user_identity()
+    except Exception:
+        logger.debug("Could not resolve end-user identity", exc_info=True)
+        return None
+
+
 def _mark_server_call_started(server: Any) -> None:
     """Record a user-visible MCP operation when the server supports it."""
     mark_tool_call = getattr(server, "mark_tool_call", None)
@@ -4610,6 +4739,17 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     "error": f"MCP server '{server_name}' is not connected"
                 }, ensure_ascii=False)
 
+        # Per-request end-user identity for THIS call, captured HERE on the agent
+        # thread. It cannot ride a ContextVar onto the MCP loop: tasks scheduled
+        # via run_coroutine_threadsafe are created inside the loop thread and copy
+        # the loop thread's context, not ours (see _run_on_mcp_loop). So read it
+        # now and hand it to _call as a plain value.
+        #
+        # Only opted-in servers pay for this, and a server that never opted in
+        # cannot be armed at all — a user's signed identity is a live credential
+        # and must not reach MCP servers with no business seeing it.
+        end_user_identity = _resolve_end_user_identity(server)
+
         async def _call():
             _mark_server_call_started(server)
             async with server._rpc_lock:
@@ -4618,9 +4758,15 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # task, which doesn't inherit our contextvars) can replay
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
+                # Arm the identity for exactly this round trip. _rpc_lock is
+                # held across it, so the outbound POST that the request hook
+                # stamps is unambiguously this call's — and the finally below
+                # guarantees nothing stays armed for the next caller.
+                server._end_user_identity = end_user_identity
                 try:
                     result = await server.session.call_tool(tool_name, arguments=args)
                 finally:
+                    server._end_user_identity = None
                     server._pending_call_context = None
             # The RPC round-trip completed — the session is demonstrably
             # healthy at the transport level (even if the tool itself

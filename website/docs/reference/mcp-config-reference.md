@@ -60,6 +60,8 @@ mcp_servers:
 | `skip_preflight` | bool | HTTP | Bypass the fail-fast content-type probe for valid Streamable HTTP endpoints whose HEAD/GET answers a non-MCP content type (default: `false`) |
 | `tools` | mapping | both | Filtering and utility-tool policy |
 | `auth` | string | HTTP | Authentication method. Set to `oauth` to enable OAuth 2.1 with PKCE |
+| `forward_user_identity` | bool | Streamable HTTP | Forward the calling end user's identity token on every tool call (default: `false`). See [Forwarding end-user identity](#forwarding-end-user-identity) |
+| `user_identity_header` | string | Streamable HTTP | Outbound header name for the forwarded identity (default: `X-Hermes-End-User-Jwt`) |
 | `sampling` | mapping | both | Server-initiated LLM request policy (see MCP guide) |
 
 ## `tools` policy keys
@@ -233,6 +235,77 @@ Notes:
 - Paths support `~` expansion. Missing files fail fast at connect time with a server-scoped error message.
 - `ssl_verify: false` disables server certificate verification entirely. Don't use this with real services.
 - Works on both Streamable HTTP and SSE transports.
+
+## Forwarding end-user identity
+
+A single Hermes process serves many end users. An MCP server that enforces
+per-user permissions therefore needs to know which *end user* a tool call is
+being made for — not just that Hermes made it. `forward_user_identity` attaches
+the caller's identity token to every outbound tool call on that server.
+
+```yaml
+mcp_servers:
+  ragnarok:
+    url: "http://app:8000/mcp"
+    forward_user_identity: true
+    headers:
+      # The server's own service credential — unaffected by the above.
+      Authorization: "Bearer ${RAGNAROK_SERVICE_TOKEN}"
+```
+
+### The contract
+
+**Inbound.** Hermes reads the identity from the `X-OpenWebUI-User-Jwt` header on
+each request to the API server. Open WebUI sends this when
+`ENABLE_FORWARD_USER_INFO_HEADERS=true` and `FORWARD_USER_INFO_HEADER_JWT_SECRET`
+is set: an HS256 JWT whose `sub` claim is the user id, plus `email`, `name`,
+`role`, `iss: "open-webui"`, `iat`, and `exp` (default lifetime 300s). Override
+the header name with the `HERMES_END_USER_JWT_HEADER` environment variable.
+
+**Outbound.** Hermes attaches the token verbatim to each `tools/call` request:
+
+```http
+POST /mcp HTTP/1.1
+Authorization: Bearer <service credential from `headers`>
+X-Hermes-End-User-Jwt: eyJhbGciOiJIUzI1NiJ9...
+MCP-Protocol-Version: 2025-11-25
+```
+
+The value is the raw token — no `Bearer` prefix. Rename the header with
+`user_identity_header` if the server expects something else.
+
+`Authorization` is deliberately *not* used: it carries the MCP server's own
+service credential (from `headers`, or from OAuth 2.1 PKCE) and has
+cross-origin-redirect stripping attached. Keeping them separate lets the server
+verify two independent things — which service is calling, and which user it is
+calling for.
+
+### Guarantees
+
+- **Per-request.** The token attached to a tool call is the one from the request
+  that triggered it. It is read from a request-scoped context and armed for the
+  duration of a single `tools/call`, so concurrent users cannot observe each
+  other's tokens.
+- **No fallback.** When no identity header arrives, no identity header is sent.
+  A missing identity never resolves to a default or to another user's token.
+- **Opt-in per server.** Servers without `forward_user_identity: true` never
+  receive the token. The token is a live signed credential; this keeps it from
+  reaching third-party MCP servers that have no business seeing it.
+- **Forward only.** Hermes never mints, re-signs, or synthesizes an identity, and
+  never derives one from session state. It forwards what arrived, or nothing.
+- **Not verified by Hermes.** Signature verification belongs to the MCP server,
+  which checks it against the shared secret and takes `sub` as the caller. Hermes
+  only validates that the value is well-formed enough to sit in an HTTP header
+  (rejecting anything else rather than sanitizing it).
+
+### Limitations
+
+- Streamable HTTP only. On the SSE transport and on `mcp < 1.24.0` the SDK owns
+  the HTTP client, so there is no per-request hook; Hermes logs an error at
+  connect time rather than silently not forwarding.
+- `POST /v1/runs` is excluded. Those runs are detached background jobs that
+  outlive the HTTP request, so there is no live caller to forward, and a captured
+  short-lived token would go stale mid-run.
 
 ## Reloading config
 
