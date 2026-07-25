@@ -177,7 +177,8 @@ jobs:
   # This is a registry-side operation — no building, no layer re-push —
   # so it runs in ~30 seconds.
   #
-  # On main pushes: tags both :main and :latest.
+  # On branch pushes: tags :<branch> (slashes replaced with dashes) and
+  # :git-<short-sha>.
   # On releases: tags :<release_tag_name>.
   # ---------------------------------------------------------------------------
   merge:
@@ -242,5 +243,6 @@ jobs:
           if [ "${{ github.event_name }}" = "release" ]; then
             docker buildx imagetools inspect "${IMAGE_NAME}:${RELEASE_TAG}"
           else
-            docker buildx imagetools inspect "${IMAGE_NAME}:main"
+            branch_tag="${GITHUB_REF_NAME//\//-}"
+            docker buildx imagetools inspect "${IMAGE_NAME}:${branch_tag}"
           fi
