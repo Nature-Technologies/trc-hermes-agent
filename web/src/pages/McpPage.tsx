@@ -1,5 +1,14 @@
 import { useCallback, useEffect, useLayoutEffect, useState } from "react";
-import { KeyRound, Package, Power, Server, Trash2, X, Zap } from "lucide-react";
+import {
+  KeyRound,
+  Package,
+  Power,
+  Server,
+  Trash2,
+  UserCheck,
+  X,
+  Zap,
+} from "lucide-react";
 import { Badge } from "@nous-research/ui/ui/components/badge";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Select, SelectOption } from "@nous-research/ui/ui/components/select";
@@ -61,6 +70,8 @@ export default function McpPage() {
   const [command, setCommand] = useState("");
   const [args, setArgs] = useState("");
   const [env, setEnv] = useState("");
+  const [forwardUserIdentity, setForwardUserIdentity] = useState(false);
+  const [userIdentityHeader, setUserIdentityHeader] = useState("");
   const [creating, setCreating] = useState(false);
   const closeCreateModal = useCallback(() => {
     setBearerToken("");
@@ -80,6 +91,7 @@ export default function McpPage() {
 
   // Enable/disable state
   const [togglingName, setTogglingName] = useState<string | null>(null);
+  const [togglingIdentity, setTogglingIdentity] = useState<string | null>(null);
   const [restartNote, setRestartNote] = useState<string | null>(null);
 
   // Catalog install modal state
@@ -129,6 +141,8 @@ export default function McpPage() {
         command,
         args,
         env,
+        forwardUserIdentity,
+        userIdentityHeader,
       });
     } catch (error) {
       showToast(
@@ -154,6 +168,8 @@ export default function McpPage() {
       setCommand("");
       setArgs("");
       setEnv("");
+      setForwardUserIdentity(false);
+      setUserIdentityHeader("");
       setTransport("http");
       setCreateModalOpen(false);
       loadServers();
@@ -217,6 +233,35 @@ export default function McpPage() {
       showToast(`Error: ${e}`, "error");
     } finally {
       setTogglingName(null);
+    }
+  };
+
+  const handleToggleUserIdentity = async (server: McpServer) => {
+    const next = !server.forward_user_identity;
+    setTogglingIdentity(server.name);
+    try {
+      await api.setMcpServerUserIdentity(server.name, next);
+      setServers((prev) =>
+        prev.map((s) =>
+          s.name === server.name
+            ? {
+                ...s,
+                forward_user_identity: next,
+                // The backend clears the override when forwarding goes off.
+                user_identity_header: next ? s.user_identity_header : null,
+              }
+            : s,
+        ),
+      );
+      setRestartNote(
+        next
+          ? "Identity forwarding on — takes effect on the next gateway restart."
+          : "Identity forwarding off — takes effect on the next gateway restart.",
+      );
+    } catch (e) {
+      showToast(`Error: ${e}`, "error");
+    } finally {
+      setTogglingIdentity(null);
     }
   };
 
@@ -453,6 +498,50 @@ export default function McpPage() {
                       backend.
                     </p>
                   )}
+
+                  <div className="grid gap-2">
+                    <label
+                      htmlFor="mcp-forward-identity"
+                      className="flex items-start gap-2 cursor-pointer"
+                    >
+                      <input
+                        id="mcp-forward-identity"
+                        type="checkbox"
+                        className="mt-0.5 accent-current"
+                        checked={forwardUserIdentity}
+                        onChange={(e) =>
+                          setForwardUserIdentity(e.target.checked)
+                        }
+                      />
+                      <span className="text-sm">
+                        Forward end-user identity
+                        <span className="block text-xs text-muted-foreground">
+                          Attach the calling user&apos;s identity token to every
+                          tool call, so this server can enforce per-user
+                          permissions. Only enable for servers you trust with
+                          your users&apos; identities.
+                        </span>
+                      </span>
+                    </label>
+                  </div>
+                  {forwardUserIdentity && (
+                    <div className="grid gap-2">
+                      <Label htmlFor="mcp-identity-header">
+                        Identity header (optional)
+                      </Label>
+                      <Input
+                        id="mcp-identity-header"
+                        placeholder="X-Hermes-End-User-Jwt"
+                        value={userIdentityHeader}
+                        onChange={(e) => setUserIdentityHeader(e.target.value)}
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        Leave blank for the default. The value sent is the
+                        token exactly as it arrived — Hermes forwards it, never
+                        mints it.
+                      </p>
+                    </div>
+                  )}
                 </>
               ) : (
                 <>
@@ -637,6 +726,17 @@ export default function McpPage() {
                         {server.auth === "header" ? "bearer" : server.auth}
                       </Badge>
                     )}
+                    {server.forward_user_identity && (
+                      <Badge
+                        tone="success"
+                        title={`Forwards the end user's identity token as ${
+                          server.user_identity_header ??
+                          "X-Hermes-End-User-Jwt"
+                        }`}
+                      >
+                        end-user identity
+                      </Badge>
+                    )}
                     {!server.enabled && <Badge tone="outline">disabled</Badge>}
                   </div>
                   <div className="flex items-center gap-4 text-xs text-muted-foreground">
@@ -693,6 +793,40 @@ export default function McpPage() {
                       }
                     >
                       Authenticate
+                    </Button>
+                  )}
+
+                  {server.transport === "http" && (
+                    <Button
+                      ghost
+                      size="icon"
+                      title={
+                        server.forward_user_identity
+                          ? `Stop forwarding end-user identity (${
+                              server.user_identity_header ??
+                              "X-Hermes-End-User-Jwt"
+                            })`
+                          : "Forward end-user identity to this server"
+                      }
+                      aria-label={
+                        server.forward_user_identity
+                          ? "Stop forwarding end-user identity"
+                          : "Forward end-user identity"
+                      }
+                      aria-pressed={server.forward_user_identity}
+                      onClick={() => handleToggleUserIdentity(server)}
+                      disabled={togglingIdentity === server.name}
+                      className={
+                        server.forward_user_identity
+                          ? "text-success"
+                          : undefined
+                      }
+                    >
+                      {togglingIdentity === server.name ? (
+                        <Spinner />
+                      ) : (
+                        <UserCheck />
+                      )}
                     </Button>
                   )}
 

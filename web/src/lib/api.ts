@@ -1022,6 +1022,26 @@ export const api = {
         body: JSON.stringify({ enabled }),
       },
     ),
+  setMcpServerUserIdentity: (
+    name: string,
+    forwardUserIdentity: boolean,
+    userIdentityHeader?: string,
+  ) =>
+    fetchJSON<{
+      ok: boolean;
+      name: string;
+      forward_user_identity: boolean;
+      user_identity_header: string | null;
+    }>(`/api/mcp/servers/${encodeURIComponent(name)}/user-identity`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        forward_user_identity: forwardUserIdentity,
+        ...(userIdentityHeader
+          ? { user_identity_header: userIdentityHeader }
+          : {}),
+      }),
+    }),
   getMcpCatalog: () =>
     fetchJSON<{ entries: McpCatalogEntry[]; diagnostics: McpCatalogDiagnostic[] }>(
       "/api/mcp/catalog",
@@ -1419,6 +1439,10 @@ export interface McpServer {
   auth: "header" | "oauth" | null;
   enabled: boolean;
   tools: string[] | null;
+  /** Forwards the calling end user's identity token on every tool call. */
+  forward_user_identity: boolean;
+  /** Outbound header name; null = the default (X-Hermes-End-User-Jwt). */
+  user_identity_header: string | null;
 }
 
 export interface McpCatalogEntry {
@@ -1461,6 +1485,8 @@ export interface McpServerCreate {
   env?: Record<string, string>;
   auth?: McpHttpAuth;
   bearer_token?: string;
+  forward_user_identity?: boolean;
+  user_identity_header?: string;
 }
 
 export interface McpTestResult {

@@ -253,6 +253,20 @@ mcp_servers:
       Authorization: "Bearer ${RAGNAROK_SERVICE_TOKEN}"
 ```
 
+### From the Dashboard
+
+You don't have to edit YAML. On the **MCP** page:
+
+- **Existing server** — the person icon on the server row toggles forwarding on
+  and off. A green `end-user identity` badge marks the servers that forward, and
+  hovering either one shows the outbound header name. The icon only appears on
+  HTTP servers, since stdio has no headers to attach an identity to.
+- **New server** — the *Add server* form has a **Forward end-user identity**
+  checkbox, plus an optional header-name field that appears once it's ticked.
+
+Both write the same `forward_user_identity` key described below and take effect
+on the next gateway restart or `/reload-mcp`.
+
 ### The contract
 
 **Inbound.** Hermes reads the identity from the `X-OpenWebUI-User-Jwt` header on

@@ -12692,6 +12692,17 @@ class MCPServerCreate(BaseModel):
     auth: Optional[str] = None
     # One-time provisioning input; persisted only to the profile's .env.
     bearer_token: Optional[SecretStr] = None
+    # Forward the calling end user's identity token on every tool call so a
+    # permission-enforcing MCP server knows who it is acting for. HTTP only.
+    forward_user_identity: bool = False
+    # Outbound header name for the above; None = the documented default.
+    user_identity_header: Optional[str] = None
+    profile: Optional[str] = None
+
+
+class MCPUserIdentityToggle(BaseModel):
+    forward_user_identity: bool
+    user_identity_header: Optional[str] = None
     profile: Optional[str] = None
 
 
@@ -12699,6 +12710,27 @@ class MCPServersReplace(BaseModel):
     # Whole-map replace (name → raw server config) for the GUI mcp.json editor.
     servers: Dict[str, Dict[str, Any]] = {}
     profile: Optional[str] = None
+
+
+def _validate_user_identity_header(raw: Optional[str]) -> Optional[str]:
+    """Validate an outbound identity header NAME, or return None for default.
+
+    The name goes straight onto an outbound HTTP request, so reject anything
+    that is not a legal RFC 7230 header token — a value carrying a space,
+    colon, or CRLF would either be dropped by httpx or, worse, split the
+    request. Empty means "use the documented default".
+    """
+    if raw is None:
+        return None
+    name = raw.strip()
+    if not name:
+        raise ValueError("Identity header name cannot be blank")
+    if not re.fullmatch(r"[A-Za-z0-9!#$%&'*+.^_`|~-]+", name):
+        raise ValueError(
+            f"Invalid identity header name {name!r}: use a single HTTP header "
+            "token (letters, digits and -_. with no spaces or colons)"
+        )
+    return name
 
 
 def _normalize_mcp_server_create(
@@ -12755,10 +12787,28 @@ def _normalize_mcp_server_create(
         server_config["url"] = url
         if auth == "oauth":
             server_config["auth"] = "oauth"
+
+        identity_header = _validate_user_identity_header(body.user_identity_header)
+        if body.forward_user_identity:
+            server_config["forward_user_identity"] = True
+            if identity_header:
+                server_config["user_identity_header"] = identity_header
+        elif identity_header:
+            # Storing a header name that will never be sent reads as though
+            # per-user identity is configured when it is off. Say so instead.
+            raise ValueError(
+                "user_identity_header requires forward_user_identity to be enabled"
+            )
     else:
         if auth != "none" or body.bearer_token is not None:
             raise ValueError(
                 "HTTP authentication is not supported for stdio MCP servers"
+            )
+        if body.forward_user_identity or body.user_identity_header:
+            # A silent no-op here would look like per-user enforcement is on.
+            raise ValueError(
+                "End-user identity forwarding is not supported for stdio MCP "
+                "servers (there are no HTTP headers to attach it to)"
             )
         server_config["command"] = command
         if body.args:
@@ -12802,6 +12852,10 @@ def _mcp_server_summary(name: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
         "enabled": cfg.get("enabled", True) is not False,
         # Tool selection: list of enabled tool names, or None = all.
         "tools": cfg.get("tools"),
+        # Per-request end-user identity forwarding (opt-in, HTTP only).
+        "forward_user_identity": cfg.get("forward_user_identity") is True,
+        # None = the outbound default (X-Hermes-End-User-Jwt).
+        "user_identity_header": cfg.get("user_identity_header"),
     }
 
 
@@ -13219,6 +13273,64 @@ async def set_mcp_server_enabled(
         servers[name]["enabled"] = bool(body.enabled)
         save_config(cfg)
     return {"ok": True, "name": name, "enabled": bool(body.enabled)}
+
+
+@app.put("/api/mcp/servers/{name}/user-identity")
+async def set_mcp_server_user_identity(
+    name: str, body: MCPUserIdentityToggle, profile: Optional[str] = None
+):
+    """Opt an MCP server in/out of end-user identity forwarding.
+
+    Toggles ``forward_user_identity`` on the server's config.yaml entry — the
+    same key the MCP client reads at connect time. Turning it on makes every
+    outbound tool call carry the calling end user's identity token, so a server
+    enforcing per-user permissions knows who it is acting for.
+
+    Turning it off REMOVES the key (and any header override) rather than
+    writing ``false``: opt-in state should be visible by its absence, and a
+    stale header override would misrepresent a disabled feature as configured.
+
+    Takes effect on the next gateway restart / ``/reload-mcp``.
+    """
+    try:
+        identity_header = _validate_user_identity_header(body.user_identity_header)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    with _profile_scope(body.profile or profile):
+        cfg = load_config()
+        servers = cfg.get("mcp_servers")
+        if not isinstance(servers, dict) or name not in servers:
+            raise HTTPException(status_code=404, detail=f"Server '{name}' not found")
+        entry = servers[name]
+        if not isinstance(entry, dict):
+            raise HTTPException(status_code=400, detail="Malformed server config")
+        if body.forward_user_identity and not entry.get("url"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "End-user identity forwarding is not supported for stdio "
+                    "MCP servers (there are no HTTP headers to attach it to)"
+                ),
+            )
+
+        if body.forward_user_identity:
+            entry["forward_user_identity"] = True
+            if identity_header:
+                entry["user_identity_header"] = identity_header
+        else:
+            entry.pop("forward_user_identity", None)
+            entry.pop("user_identity_header", None)
+        save_config(cfg)
+
+    return {
+        "ok": True,
+        "name": name,
+        "forward_user_identity": bool(body.forward_user_identity),
+        "user_identity_header": (
+            identity_header if body.forward_user_identity else None
+        ),
+    }
 
 
 @app.get("/api/mcp/catalog")

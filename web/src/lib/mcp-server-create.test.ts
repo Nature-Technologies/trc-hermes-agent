@@ -70,6 +70,82 @@ describe("buildMcpServerCreate", () => {
     });
   });
 
+  it("opts an HTTP server into end-user identity forwarding", () => {
+    const server = buildMcpServerCreate({
+      ...emptyMcpServerDraft(),
+      name: "ragnarok",
+      url: "http://app:8000/mcp",
+      forwardUserIdentity: true,
+    });
+
+    expect(server).toEqual({
+      name: "ragnarok",
+      url: "http://app:8000/mcp",
+      forward_user_identity: true,
+    });
+  });
+
+  it("sends a custom outbound identity header only when one is given", () => {
+    expect(
+      buildMcpServerCreate({
+        ...emptyMcpServerDraft(),
+        name: "ragnarok",
+        url: "http://app:8000/mcp",
+        forwardUserIdentity: true,
+        userIdentityHeader: "  X-RAGnarok-Caller  ",
+      }),
+    ).toEqual({
+      name: "ragnarok",
+      url: "http://app:8000/mcp",
+      forward_user_identity: true,
+      user_identity_header: "X-RAGnarok-Caller",
+    });
+
+    // Blank means "use the documented default" — don't send an empty override.
+    expect(
+      buildMcpServerCreate({
+        ...emptyMcpServerDraft(),
+        name: "ragnarok",
+        url: "http://app:8000/mcp",
+        forwardUserIdentity: true,
+        userIdentityHeader: "   ",
+      }),
+    ).toEqual({
+      name: "ragnarok",
+      url: "http://app:8000/mcp",
+      forward_user_identity: true,
+    });
+  });
+
+  it("omits identity forwarding entirely when it is off", () => {
+    const server = buildMcpServerCreate({
+      ...emptyMcpServerDraft(),
+      name: "public",
+      url: "https://example.com/mcp",
+      // A header typed then toggled off must not leak into the request.
+      userIdentityHeader: "X-Should-Not-Appear",
+    });
+
+    expect(server).toEqual({
+      name: "public",
+      url: "https://example.com/mcp",
+    });
+  });
+
+  it("drops identity forwarding for stdio servers", () => {
+    // stdio has no HTTP headers, so the flag is meaningless there.
+    const server = buildMcpServerCreate({
+      ...emptyMcpServerDraft(),
+      name: "local",
+      transport: "stdio",
+      command: "uvx",
+      forwardUserIdentity: true,
+      userIdentityHeader: "X-Nope",
+    });
+
+    expect(server).toEqual({ name: "local", command: "uvx" });
+  });
+
   it("rejects missing transport fields and Bearer tokens", () => {
     expect(() => buildMcpServerCreate(emptyMcpServerDraft())).toThrow(
       "Name required",

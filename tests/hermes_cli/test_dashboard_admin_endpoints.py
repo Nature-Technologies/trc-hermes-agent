@@ -180,6 +180,169 @@ class TestMcpEndpoints:
             "/api/mcp/servers/nope/enabled", json={"enabled": True}
         ).status_code == 404
 
+    def test_user_identity_forwarding_roundtrips_through_config(self):
+        """The dashboard is the intended way to opt a server in, so the flag
+        must land on the same config.yaml key the MCP client reads."""
+        from hermes_cli.mcp_config import _get_mcp_servers
+
+        r = self.client.post(
+            "/api/mcp/servers",
+            json={
+                "name": "ragnarok",
+                "url": "http://app:8000/mcp",
+                "forward_user_identity": True,
+            },
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["forward_user_identity"] is True
+        assert _get_mcp_servers()["ragnarok"]["forward_user_identity"] is True
+
+        srv = [
+            s for s in self.client.get("/api/mcp/servers").json()["servers"]
+            if s["name"] == "ragnarok"
+        ][0]
+        assert srv["forward_user_identity"] is True
+
+    def test_user_identity_defaults_off_and_omits_the_key(self):
+        """Opt-in means opt-in: an ordinary server must not gain the flag."""
+        from hermes_cli.mcp_config import _get_mcp_servers
+
+        r = self.client.post(
+            "/api/mcp/servers", json={"name": "plain", "url": "https://x/mcp"}
+        )
+        assert r.status_code == 200
+        assert r.json()["forward_user_identity"] is False
+        assert "forward_user_identity" not in _get_mcp_servers()["plain"]
+
+    def test_custom_outbound_identity_header_is_persisted(self):
+        from hermes_cli.mcp_config import _get_mcp_servers
+
+        r = self.client.post(
+            "/api/mcp/servers",
+            json={
+                "name": "custom",
+                "url": "http://app:8000/mcp",
+                "forward_user_identity": True,
+                "user_identity_header": "X-RAGnarok-Caller",
+            },
+        )
+        assert r.status_code == 200
+        assert r.json()["user_identity_header"] == "X-RAGnarok-Caller"
+        cfg = _get_mcp_servers()["custom"]
+        assert cfg["user_identity_header"] == "X-RAGnarok-Caller"
+
+    @pytest.mark.parametrize("payload", [
+        {"name": "bad", "command": "npx", "forward_user_identity": True},
+        {"name": "bad", "command": "npx", "user_identity_header": "X-Nope"},
+    ])
+    def test_identity_forwarding_rejected_for_stdio(self, payload):
+        """stdio has no HTTP headers — accepting the flag would be a silent
+        no-op that looks like per-user enforcement is on."""
+        r = self.client.post("/api/mcp/servers", json=payload)
+        assert r.status_code == 400
+        assert "stdio" in r.json()["detail"].lower()
+
+    def test_identity_header_without_forwarding_rejected(self):
+        """A header name with the feature off would never be sent; say so
+        rather than silently storing dead config."""
+        r = self.client.post(
+            "/api/mcp/servers",
+            json={
+                "name": "bad",
+                "url": "https://x/mcp",
+                "user_identity_header": "X-Orphan",
+            },
+        )
+        assert r.status_code == 400
+
+    @pytest.mark.parametrize("bad_header", [
+        "X Bad Header",      # spaces are not legal in a header name
+        "X-Bad:Header",      # colon terminates the name
+        "X-Bad\r\nInjected", # CRLF injection
+        "",                  # empty once trimmed
+    ])
+    def test_malformed_outbound_header_name_rejected(self, bad_header):
+        r = self.client.post(
+            "/api/mcp/servers",
+            json={
+                "name": "bad",
+                "url": "https://x/mcp",
+                "forward_user_identity": True,
+                "user_identity_header": bad_header,
+            },
+        )
+        assert r.status_code == 400
+
+    def test_identity_forwarding_toggle(self):
+        """Toggling an already-configured server is the common case — the
+        RAGnarok entry usually exists before anyone wants this on."""
+        from hermes_cli.mcp_config import _get_mcp_servers
+
+        self.client.post(
+            "/api/mcp/servers", json={"name": "tog", "url": "http://app:8000/mcp"}
+        )
+
+        r = self.client.put(
+            "/api/mcp/servers/tog/user-identity",
+            json={"forward_user_identity": True},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["forward_user_identity"] is True
+        assert _get_mcp_servers()["tog"]["forward_user_identity"] is True
+
+        srv = [
+            s for s in self.client.get("/api/mcp/servers").json()["servers"]
+            if s["name"] == "tog"
+        ][0]
+        assert srv["forward_user_identity"] is True
+
+        # Turning it back off must remove the opt-in, not leave a false key.
+        r = self.client.put(
+            "/api/mcp/servers/tog/user-identity",
+            json={"forward_user_identity": False},
+        )
+        assert r.status_code == 200 and r.json()["forward_user_identity"] is False
+        assert "forward_user_identity" not in _get_mcp_servers()["tog"]
+
+    def test_identity_forwarding_toggle_sets_custom_header(self):
+        from hermes_cli.mcp_config import _get_mcp_servers
+
+        self.client.post(
+            "/api/mcp/servers", json={"name": "tog2", "url": "http://app:8000/mcp"}
+        )
+        r = self.client.put(
+            "/api/mcp/servers/tog2/user-identity",
+            json={
+                "forward_user_identity": True,
+                "user_identity_header": "X-RAGnarok-Caller",
+            },
+        )
+        assert r.status_code == 200
+        assert _get_mcp_servers()["tog2"]["user_identity_header"] == "X-RAGnarok-Caller"
+
+        # Turning forwarding off clears the now-meaningless header override.
+        self.client.put(
+            "/api/mcp/servers/tog2/user-identity",
+            json={"forward_user_identity": False},
+        )
+        assert "user_identity_header" not in _get_mcp_servers()["tog2"]
+
+    def test_identity_forwarding_toggle_rejects_stdio_and_missing(self):
+        self.client.post(
+            "/api/mcp/servers", json={"name": "localsrv", "command": "npx"}
+        )
+        r = self.client.put(
+            "/api/mcp/servers/localsrv/user-identity",
+            json={"forward_user_identity": True},
+        )
+        assert r.status_code == 400
+        assert "stdio" in r.json()["detail"].lower()
+
+        assert self.client.put(
+            "/api/mcp/servers/nope/user-identity",
+            json={"forward_user_identity": True},
+        ).status_code == 404
+
     def test_catalog_lists_entries(self):
         r = self.client.get("/api/mcp/catalog")
         assert r.status_code == 200

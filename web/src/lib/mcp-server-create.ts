@@ -11,6 +11,10 @@ export interface McpServerDraft {
   command: string;
   args: string;
   env: string;
+  /** Forward the calling end user's identity token on every tool call. */
+  forwardUserIdentity: boolean;
+  /** Outbound header name; blank = the documented default. */
+  userIdentityHeader: string;
 }
 
 export function emptyMcpServerDraft(): McpServerDraft {
@@ -23,6 +27,8 @@ export function emptyMcpServerDraft(): McpServerDraft {
     command: "",
     args: "",
     env: "",
+    forwardUserIdentity: false,
+    userIdentityHeader: "",
   };
 }
 
@@ -62,6 +68,14 @@ export function buildMcpServerCreate(draft: McpServerDraft): McpServerCreate {
     if (draft.httpAuth !== "none") server.auth = draft.httpAuth;
     if (draft.httpAuth === "header") {
       server.bearer_token = draft.bearerToken;
+    }
+    // Only send the header override when forwarding is actually on — a name
+    // typed and then toggled off must not reach the server, which rejects an
+    // orphaned override.
+    if (draft.forwardUserIdentity) {
+      server.forward_user_identity = true;
+      const header = draft.userIdentityHeader.trim();
+      if (header) server.user_identity_header = header;
     }
     return server;
   }
