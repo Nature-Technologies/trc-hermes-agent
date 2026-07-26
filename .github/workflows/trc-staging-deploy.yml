@@ -1,0 +1,210 @@
+name: TRC staging deploy (hermes-agent)
+
+# Additive and TRC-only. This does NOT build or publish -- docker.yml already
+# does that. It rolls an already-published digest onto the staging host.
+#
+# Manual by design. `image_digest` is required, so every deploy is reproducible
+# and a rollback is re-dispatching this workflow with the previous digest,
+# which the "Deploy" step prints into the run log before replacing it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_digest:
+        description: 'Digest to deploy, e.g. sha256:<64 hex>. Tags are rejected.'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # Stops this repository overlapping itself. Cross-repository races are
+  # handled by the flock on the host, because a concurrency group cannot span
+  # repositories.
+  group: trc-staging-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy hermes-agent to staging
+    if: github.repository == 'Nature-Technologies/trc-hermes-agent'
+    runs-on: ubuntu-latest
+    environment: staging
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Validate digest
+        env:
+          DIGEST: ${{ inputs.image_digest }}
+        run: |
+          set -eu
+          hex="${DIGEST#sha256:}"
+          if [ "$hex" = "$DIGEST" ]; then
+            echo "::error::image_digest must start with sha256:"; exit 1
+          fi
+          if [ "${#hex}" -ne 64 ]; then
+            echo "::error::image_digest must be sha256: plus 64 hex chars"; exit 1
+          fi
+          case "$hex" in
+            *[!0-9a-f]*)
+              echo "::error::digest hex must be lowercase 0-9a-f"; exit 1 ;;
+          esac
+
+      - name: Install SSH key and pin host key
+        env:
+          SSH_KEY: ${{ secrets.TRC_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.TRC_SSH_KNOWN_HOSTS }}
+        run: |
+          set -eu
+          if [ -z "$KNOWN_HOSTS" ]; then
+            echo "::error::TRC_SSH_KNOWN_HOSTS is empty. Host keys are pinned, not bypassed."
+            exit 1
+          fi
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      - name: Copy deploy artifacts
+        env:
+          SSH_HOST: ${{ secrets.TRC_SSH_HOST }}
+          SSH_USER: ${{ secrets.TRC_SSH_USER }}
+          SSH_PORT: ${{ secrets.TRC_SSH_PORT || '22' }}
+        run: |
+          set -eu
+          ssh -i ~/.ssh/id_deploy -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
+            'mkdir -p /srv/trc/staging/hermes-agent /srv/trc/staging/fingerprints'
+          scp -i ~/.ssh/id_deploy -P "$SSH_PORT" \
+            deploy/trc/docker-compose-staging-trc.yml \
+            deploy/trc/config.yaml \
+            "$SSH_USER@$SSH_HOST:/srv/trc/staging/hermes-agent/"
+
+      - name: Render .env and deploy
+        env:
+          SSH_HOST: ${{ secrets.TRC_SSH_HOST }}
+          SSH_USER: ${{ secrets.TRC_SSH_USER }}
+          SSH_PORT: ${{ secrets.TRC_SSH_PORT || '22' }}
+          DIGEST: ${{ inputs.image_digest }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          HERMES_API_KEY: ${{ secrets.HERMES_API_KEY }}
+          DASH_USER: ${{ secrets.HERMES_DASHBOARD_BASIC_AUTH_USERNAME }}
+          DASH_PASS: ${{ secrets.HERMES_DASHBOARD_BASIC_AUTH_PASSWORD }}
+          GHCR_READ_TOKEN: ${{ secrets.GHCR_READ_TOKEN }}
+        run: |
+          set -eu
+          # Command tracing (xtrace) must stay off in this step: it would print every secret below.
+
+          if [ "${#HERMES_API_KEY}" -lt 16 ]; then
+            echo "::error::HERMES_API_KEY must be at least 16 characters. Below that the gateway refuses to start the API server at all, so the symptom is connection-refused on :8642, not a 401."
+            exit 1
+          fi
+
+          # The .env is rendered here and copied as a file so no secret ever
+          # appears in a remote command line or in the host's process list.
+          umask 077
+          {
+            printf 'HERMES_IMAGE=ghcr.io/nature-technologies/trc-hermes-agent@%s\n' "$DIGEST"
+            printf 'OPENROUTER_API_KEY=%s\n' "$OPENROUTER_API_KEY"
+            printf 'HERMES_API_KEY=%s\n' "$HERMES_API_KEY"
+            printf 'HERMES_DASHBOARD_BASIC_AUTH_USERNAME=%s\n' "$DASH_USER"
+            printf 'HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=%s\n' "$DASH_PASS"
+            printf 'HERMES_BIND=127.0.0.1\n'
+          } > env.staging
+          scp -i ~/.ssh/id_deploy -P "$SSH_PORT" env.staging \
+            "$SSH_USER@$SSH_HOST:/srv/trc/staging/hermes-agent/.env"
+          rm -f env.staging
+
+          # Publish a fingerprint of the shared gateway key so the Paperclip
+          # deploy can detect that its third copy has drifted. Twelve hex
+          # characters of a SHA-256 over a 64-character random secret is not a
+          # secret and is not brute-forceable.
+          printf '%s' "$HERMES_API_KEY" | sha256sum | cut -c1-12 > hermes.fpr
+          scp -i ~/.ssh/id_deploy -P "$SSH_PORT" hermes.fpr \
+            "$SSH_USER@$SSH_HOST:/srv/trc/staging/fingerprints/hermes-api-key"
+          rm -f hermes.fpr
+
+          if [ -n "$GHCR_READ_TOKEN" ]; then
+            # Piped over the ssh channel, never as an argument.
+            printf '%s' "$GHCR_READ_TOKEN" | ssh -i ~/.ssh/id_deploy -p "$SSH_PORT" \
+              "$SSH_USER@$SSH_HOST" \
+              'docker login ghcr.io -u trc-deploy --password-stdin'
+          fi
+
+          ssh -i ~/.ssh/id_deploy -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" 'bash -s' <<'REMOTE'
+          set -eu
+          cd /srv/trc/staging/hermes-agent
+          chmod 600 .env
+
+          # Idempotent. Concurrent creates from another repo's deploy lose
+          # harmlessly on the `|| true`.
+          docker network create poc-net 2>/dev/null || true
+          docker volume create trc-staging-hermes-memory >/dev/null
+
+          # Record the rollback target. Read the digest from the IMAGE, not the
+          # container: a container's inspect output has no RepoDigests key at
+          # all, so `docker inspect <container>` cannot produce this.
+          if img="$(docker inspect --format '{{.Image}}' hermes-agent 2>/dev/null)"; then
+            echo "rollback target (digest currently running):"
+            docker image inspect "$img" \
+              --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{else}}(built locally, no digest){{end}}'
+          else
+            echo "no hermes-agent container running yet"
+          fi
+
+          flock /var/lock/trc-deploy.lock -c '
+            cd /srv/trc/staging/hermes-agent
+            docker compose -f docker-compose-staging-trc.yml pull
+            docker compose -f docker-compose-staging-trc.yml up -d --remove-orphans
+          '
+          REMOTE
+
+      - name: Smoke test
+        env:
+          SSH_HOST: ${{ secrets.TRC_SSH_HOST }}
+          SSH_USER: ${{ secrets.TRC_SSH_USER }}
+          SSH_PORT: ${{ secrets.TRC_SSH_PORT || '22' }}
+        run: |
+          set -eu
+          ssh -i ~/.ssh/id_deploy -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" 'bash -s' <<'REMOTE'
+          set -eu
+          # Read the key from the .env just written, so the secret does not
+          # cross the wire a second time.
+          set -a; . /srv/trc/staging/hermes-agent/.env; set +a
+
+          # The gateway needs a few seconds to bind :8642 after up -d.
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null \
+                 -H "Authorization: Bearer $HERMES_API_KEY" \
+                 http://127.0.0.1:8642/v1/models; then
+              ok=1; break
+            fi
+            sleep 2
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "gateway never answered on :8642 with the deployed key"
+            docker logs --tail 50 hermes-agent || true
+            exit 1
+          fi
+          echo "gateway OK"
+
+          # trc-shared reachability. Assert the REQUEST SUCCEEDS, not that it
+          # returns 200: an MCP endpoint may answer a bare GET with 405 or 406.
+          # What is under test is DNS plus routing to the backend. python3 is
+          # used rather than curl because it is guaranteed present in this
+          # Python-based image.
+          docker exec hermes-agent python3 - <<'PY'
+          import sys, urllib.error, urllib.request
+          try:
+              urllib.request.urlopen("http://app:8000/mcp", timeout=10)
+              print("reached app:8000/mcp over trc-shared")
+          except urllib.error.HTTPError as exc:
+              print(f"reached app:8000/mcp over trc-shared (HTTP {exc.code})")
+          except Exception as exc:
+              print(f"could NOT reach app:8000/mcp over trc-shared: {exc}")
+              sys.exit(1)
+          PY
+          REMOTE

@@ -122,6 +122,59 @@ def check_compose_renders() -> None:
     )
 
 
+WORKFLOW = HERE.parents[1] / ".github" / "workflows" / "trc-staging-deploy.yml"
+
+
+def check_deploy_workflow() -> None:
+    """Assert the deploy workflow's security and reproducibility invariants.
+
+    These are properties a generic YAML linter cannot know about: the digest
+    pin that makes rollback a re-dispatch, the host-side mutex that stands in
+    for a cross-repository concurrency group, and the two ways this workflow
+    could leak or weaken credentials.
+    """
+    check(WORKFLOW.is_file(), f"missing {WORKFLOW}")
+    if not WORKFLOW.is_file():
+        return
+    raw = WORKFLOW.read_text(encoding="utf-8")
+    doc = yaml.safe_load(raw)
+
+    # YAML 1.1 parses the bare key `on` as the boolean True, so read both
+    # spellings rather than guessing which one PyYAML lands on.
+    triggers = doc.get("on", doc.get(True)) or {}
+    check(
+        set(triggers) == {"workflow_dispatch"},
+        "deploy must be workflow_dispatch only -- auto-deploy was explicitly "
+        f"rejected; got triggers {sorted(str(t) for t in triggers)}",
+    )
+    inputs = ((triggers.get("workflow_dispatch") or {}).get("inputs")) or {}
+    check(
+        "image_digest" in inputs,
+        "workflow_dispatch must take an `image_digest` input",
+    )
+    check(
+        bool((inputs.get("image_digest") or {}).get("required")),
+        "`image_digest` must be required -- deploys are digest-pinned so that "
+        "rollback is a re-dispatch with the previous digest",
+    )
+    check(
+        "flock" in raw,
+        "the remote script must serialize on flock: three repositories deploy "
+        "into one host and a GitHub concurrency group cannot span repositories",
+    )
+    check("set -eu" in raw, "the remote script must run under `set -eu`")
+    check(
+        "set -x" not in raw,
+        "the remote script must never use `set -x` -- it would print every "
+        "secret into the run log",
+    )
+    check(
+        "StrictHostKeyChecking=no" not in raw
+        and "StrictHostKeyChecking no" not in raw,
+        "host keys must be pinned via TRC_SSH_KNOWN_HOSTS, not bypassed",
+    )
+
+
 def report() -> int:
     if failures:
         print(f"{len(failures)} check(s) failed:", file=sys.stderr)
@@ -192,6 +245,7 @@ def main() -> int:
 
     check_env_example_declares_every_reference()
     check_compose_renders()
+    check_deploy_workflow()
     return report()
 
 
