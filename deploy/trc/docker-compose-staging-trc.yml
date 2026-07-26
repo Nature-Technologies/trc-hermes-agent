@@ -1,0 +1,61 @@
+# TRC staging deploy for hermes-agent. Additive and TRC-only -- no upstream
+# tooling reads this file. See docs/deploy/trc-staging.md.
+#
+# This is one of three independent compose projects that together reproduce the
+# topology the retired trc-docker-paperclip-hermes repo used to own in a single
+# file. Contract checks live in deploy/trc/validate_compose.py; read its
+# docstring before changing `external: true` or any container_name here.
+name: trc-staging-hermes-agent
+
+networks:
+  # Both bridges are external: they are shared with other compose projects, so
+  # none of those projects can own their creation. `poc-net` is created once on
+  # the host; `trc-shared` belongs to whoever runs the trc-backend stack.
+  poc-net:
+    external: true
+  trc-shared:
+    external: true
+
+volumes:
+  # Hermes state: sessions, logs, memories, cron, workspace. External so that a
+  # rename of this compose project can never silently swap in an empty volume.
+  trc-staging-hermes-memory:
+    external: true
+
+services:
+  hermes-agent:
+    image: ${HERMES_IMAGE:?HERMES_IMAGE must be set}
+    # Load-bearing: open-webui reaches this service at
+    # http://hermes-agent:8642 from a *different* compose project, which
+    # resolves by container name over poc-net. Renaming this breaks chat with
+    # no error in this file.
+    container_name: hermes-agent
+    command: gateway run
+    networks: [poc-net, trc-shared]
+    restart: unless-stopped
+    ports:
+      # Loopback by default: only in-network services need these.
+      - "${HERMES_BIND:-127.0.0.1}:8642:8642"
+      - "${HERMES_BIND:-127.0.0.1}:9119:9119"
+    environment:
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY}"
+      HERMES_YOLO_MODE: "true"
+      API_SERVER_ENABLED: "true"
+      API_SERVER_HOST: "0.0.0.0"
+      API_SERVER_PORT: "8642"
+      # Must be >=16 chars. The gateway refuses to start the API server below
+      # that, so a short key surfaces as connection-refused on :8642 rather
+      # than a 401. The deploy workflow asserts the length before deploying.
+      API_SERVER_KEY: "${HERMES_API_KEY:?HERMES_API_KEY must be set}"
+      HERMES_DASHBOARD: "1"
+      HERMES_DASHBOARD_HOST: "0.0.0.0"
+      HERMES_DASHBOARD_BASIC_AUTH_USERNAME: "${HERMES_DASHBOARD_BASIC_AUTH_USERNAME}"
+      HERMES_DASHBOARD_BASIC_AUTH_PASSWORD: "${HERMES_DASHBOARD_BASIC_AUTH_PASSWORD}"
+      HERMES_SKIP_CONFIG_MIGRATION: "1"
+    volumes:
+      - trc-staging-hermes-memory:/opt/data
+      # Relative to this file's directory, i.e. /srv/trc/staging/hermes-agent.
+      # The deploy workflow copies config.yaml alongside this compose file, so
+      # config.yaml is now git-managed: server-side edits are overwritten on
+      # the next deploy. Change it in this repo, not on the host.
+      - ./config.yaml:/opt/data/config.yaml
