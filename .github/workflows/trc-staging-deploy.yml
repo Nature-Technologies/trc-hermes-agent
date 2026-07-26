@@ -104,6 +104,12 @@ jobs:
 
           # The .env is rendered here and copied as a file so no secret ever
           # appears in a remote command line or in the host's process list.
+          # Values are written UNQUOTED on purpose: this file is parsed by
+          # Compose's env_file reader, which strips no shell quoting of its
+          # own. That also means this file must NEVER be shell-sourced (e.g.
+          # `. .env`) -- a value containing a space, `#`, `$(...)` or a
+          # backtick would be misread or, worse, executed. Extract a single
+          # key with `sed`/`grep` instead (see the smoke-test step).
           umask 077
           {
             printf 'HERMES_IMAGE=ghcr.io/nature-technologies/trc-hermes-agent@%s\n' "$DIGEST"
@@ -170,16 +176,24 @@ jobs:
           set -eu
           ssh -i ~/.ssh/id_deploy -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" 'bash -s' <<'REMOTE'
           set -eu
-          # Read the key from the .env just written, so the secret does not
-          # cross the wire a second time.
-          set -a; . /srv/trc/staging/hermes-agent/.env; set +a
+          # Read only the key we need, without shell-evaluating the file: the
+          # .env is written for Compose's env_file parser, which strips no
+          # shell quoting of its own, so sourcing it here could execute
+          # whatever a dashboard password happens to contain and would let
+          # this step see a different value than the container actually got.
+          HERMES_API_KEY="$(sed -n 's/^HERMES_API_KEY=//p' /srv/trc/staging/hermes-agent/.env)"
+          if [ -z "$HERMES_API_KEY" ]; then
+            echo "could not read HERMES_API_KEY from the deployed .env"
+            exit 1
+          fi
 
-          # The gateway needs a few seconds to bind :8642 after up -d.
+          # The gateway needs a few seconds to bind :8642 after up -d. The
+          # header is delivered over stdin via a curl config file, not argv,
+          # so the key never appears in `ps` on the host.
           ok=0
           for i in $(seq 1 30); do
-            if curl -fsS -o /dev/null \
-                 -H "Authorization: Bearer $HERMES_API_KEY" \
-                 http://127.0.0.1:8642/v1/models; then
+            if printf 'header = "Authorization: Bearer %s"\n' "$HERMES_API_KEY" \
+                 | curl -fsS -o /dev/null --config - http://127.0.0.1:8642/v1/models; then
               ok=1; break
             fi
             sleep 2
@@ -196,7 +210,7 @@ jobs:
           # What is under test is DNS plus routing to the backend. python3 is
           # used rather than curl because it is guaranteed present in this
           # Python-based image.
-          docker exec hermes-agent python3 - <<'PY'
+          docker exec -i hermes-agent python3 - <<'PY'
           import sys, urllib.error, urllib.request
           try:
               urllib.request.urlopen("http://app:8000/mcp", timeout=10)

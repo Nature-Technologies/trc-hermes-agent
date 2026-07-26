@@ -146,10 +146,43 @@ def _run_script_lines(doc: dict) -> list[str]:
     return lines
 
 
-def _set_flags(line: str) -> str | None:
-    """The flag cluster from a `set -...` line, or None if the line is not one."""
-    match = re.match(r"^\s*set\s+(-o\s+xtrace|-[a-zA-Z]+)", line)
-    return match.group(1) if match else None
+def _set_words(line: str) -> list[str] | None:
+    """The option words of a `set ...` line, or None if the line is not one."""
+    match = re.match(r"^\s*set\s+(-.*)$", line)
+    return match.group(1).split() if match else None
+
+
+def _enables_tracing(line: str) -> bool:
+    words = _set_words(line)
+    if words is None:
+        return False
+    for index, word in enumerate(words):
+        if word == "-o":
+            if index + 1 < len(words) and words[index + 1] == "xtrace":
+                return True
+            continue
+        if word.startswith("-") and "x" in word.lstrip("-"):
+            return True
+    return False
+
+
+def _strict_mode_chars(line: str) -> set[str]:
+    """Short-option letters enabled by a `set ...` line, ignoring `-o name`."""
+    words = _set_words(line)
+    if words is None:
+        return set()
+    chars: set[str] = set()
+    skip = False
+    for word in words:
+        if skip:
+            skip = False
+            continue
+        if word == "-o":
+            skip = True
+            continue
+        if word.startswith("-"):
+            chars |= set(word.lstrip("-"))
+    return chars
 
 
 def check_deploy_workflow() -> None:
@@ -186,24 +219,18 @@ def check_deploy_workflow() -> None:
     )
     script_lines = _run_script_lines(doc)
 
-    traced = [
-        ln.strip()
-        for ln in script_lines
-        if (flags := _set_flags(ln)) and (flags.startswith("-o") or "x" in flags)
-    ]
+    traced = [ln.strip() for ln in script_lines if _enables_tracing(ln)]
     check(
         not traced,
         f"shell tracing is enabled by {traced} -- tracing prints every secret "
-        "into the run log. This catches `set -x`, `set -eux`, `set -xe` and "
-        "`set -o xtrace`, not only the bare form",
+        "into the run log. This catches `set -x`, `set -eux`, `set -xe`, "
+        "`set -e -u -x` and `set -o xtrace`, while leaving `set -o pipefail` "
+        "alone",
     )
     check(
-        any(
-            (flags := _set_flags(ln)) and "e" in flags and "u" in flags
-            for ln in script_lines
-        ),
-        "no `run:` block enables strict mode -- every deploy script must set "
-        "at least -e and -u",
+        any({"e", "u"} <= _strict_mode_chars(ln) for ln in script_lines),
+        "no `run:` block enables strict mode -- at least one must set both -e "
+        "and -u",
     )
     check(
         any("flock" in ln for ln in script_lines),
