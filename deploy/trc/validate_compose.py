@@ -17,6 +17,7 @@ Run: python deploy/trc/validate_compose.py
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 import tempfile
@@ -63,12 +64,36 @@ def placeholder(key: str) -> str:
     return "x" * 64
 
 
-def check_compose_renders() -> None:
-    keys = [
+def env_example_keys() -> list[str]:
+    return [
         line.split("=", 1)[0].strip()
         for line in ENV_EXAMPLE.read_text(encoding="utf-8").splitlines()
         if "=" in line and not line.lstrip().startswith("#")
     ]
+
+
+def check_env_example_declares_every_reference() -> None:
+    """Assert every ${VAR} the compose file references is declared in the example.
+
+    `docker compose config` cannot carry this. For a plain ${VAR} substitution it
+    emits a warning and still exits 0, so only the ${VAR:?} spellings would ever
+    fail -- an omission from .env.staging.example would silently become a blank
+    default. Comparing the two sets directly is what makes it an error.
+    """
+    referenced = set(
+        re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)", COMPOSE.read_text(encoding="utf-8"))
+    )
+    missing = sorted(referenced - set(env_example_keys()))
+    check(
+        not missing,
+        f"compose references {missing} but .env.staging.example does not declare "
+        "them -- a plain ${VAR} omission would otherwise default to a blank "
+        "string with only a warning from `docker compose config`",
+    )
+
+
+def check_compose_renders() -> None:
+    keys = env_example_keys()
     check(bool(keys), "no assignments found in .env.staging.example")
     if not keys:
         return
@@ -91,8 +116,9 @@ def check_compose_renders() -> None:
     Path(env_path).unlink(missing_ok=True)
     check(
         proc.returncode == 0,
-        "`docker compose config` failed -- every variable the compose file "
-        f"references must be declared in .env.staging.example:\n{proc.stderr.strip()}",
+        "`docker compose config` failed -- rendering the compose file with "
+        "placeholder values for every key in .env.staging.example must "
+        f"succeed, which exercises the `${{VAR:?}}` guards:\n{proc.stderr.strip()}",
     )
 
 
@@ -164,6 +190,7 @@ def main() -> int:
                 "this compose project -- depends_on cannot cross projects",
             )
 
+    check_env_example_declares_every_reference()
     check_compose_renders()
     return report()
 
