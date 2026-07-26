@@ -95,7 +95,7 @@ jobs:
           GHCR_READ_TOKEN: ${{ secrets.GHCR_READ_TOKEN }}
         run: |
           set -eu
-          # Command tracing (xtrace) must stay off in this step: it would print every secret below.
+          # Never `set -x` in this step: it would print every secret below.
 
           if [ "${#HERMES_API_KEY}" -lt 16 ]; then
             echo "::error::HERMES_API_KEY must be at least 16 characters. Below that the gateway refuses to start the API server at all, so the symptom is connection-refused on :8642, not a 401."

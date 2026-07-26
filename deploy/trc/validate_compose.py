@@ -125,6 +125,33 @@ def check_compose_renders() -> None:
 WORKFLOW = HERE.parents[1] / ".github" / "workflows" / "trc-staging-deploy.yml"
 
 
+def _run_script_lines(doc: dict) -> list[str]:
+    """Every executable line of every `run:` block, full-line shell comments dropped.
+
+    Assertions about script behaviour cannot match the raw file text: these
+    scripts document the rules they follow, so a comment saying "never set -x"
+    reads as a violation and a comment saying "serialize on flock" reads as
+    compliance. Only executable lines carry either meaning.
+    """
+    lines: list[str] = []
+    for job in (doc.get("jobs") or {}).values():
+        for step in ((job or {}).get("steps") or []):
+            script = (step or {}).get("run")
+            if not script:
+                continue
+            lines += [
+                ln for ln in script.splitlines()
+                if ln.strip() and not ln.lstrip().startswith("#")
+            ]
+    return lines
+
+
+def _set_flags(line: str) -> str | None:
+    """The flag cluster from a `set -...` line, or None if the line is not one."""
+    match = re.match(r"^\s*set\s+(-o\s+xtrace|-[a-zA-Z]+)", line)
+    return match.group(1) if match else None
+
+
 def check_deploy_workflow() -> None:
     """Assert the deploy workflow's security and reproducibility invariants.
 
@@ -157,16 +184,31 @@ def check_deploy_workflow() -> None:
         "`image_digest` must be required -- deploys are digest-pinned so that "
         "rollback is a re-dispatch with the previous digest",
     )
+    script_lines = _run_script_lines(doc)
+
+    traced = [
+        ln.strip()
+        for ln in script_lines
+        if (flags := _set_flags(ln)) and (flags.startswith("-o") or "x" in flags)
+    ]
     check(
-        "flock" in raw,
-        "the remote script must serialize on flock: three repositories deploy "
-        "into one host and a GitHub concurrency group cannot span repositories",
+        not traced,
+        f"shell tracing is enabled by {traced} -- tracing prints every secret "
+        "into the run log. This catches `set -x`, `set -eux`, `set -xe` and "
+        "`set -o xtrace`, not only the bare form",
     )
-    check("set -eu" in raw, "the remote script must run under `set -eu`")
     check(
-        "set -x" not in raw,
-        "the remote script must never use `set -x` -- it would print every "
-        "secret into the run log",
+        any(
+            (flags := _set_flags(ln)) and "e" in flags and "u" in flags
+            for ln in script_lines
+        ),
+        "no `run:` block enables strict mode -- every deploy script must set "
+        "at least -e and -u",
+    )
+    check(
+        any("flock" in ln for ln in script_lines),
+        "no `run:` block calls flock: three repositories deploy into one host "
+        "and a GitHub concurrency group cannot span repositories",
     )
     check(
         "StrictHostKeyChecking=no" not in raw
