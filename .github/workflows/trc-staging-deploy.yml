@@ -187,13 +187,20 @@ jobs:
             exit 1
           fi
 
-          # The gateway needs a few seconds to bind :8642 after up -d. The
-          # header is delivered over stdin via a curl config file, not argv,
-          # so the key never appears in `ps` on the host.
+          # The bearer header goes to curl through a 0600 file rather than argv
+          # (visible in ps) or a --config value (curl applies escape rules
+          # inside quoted config values, so a key containing " or \ would be
+          # silently truncated or mangled). `-H @file` is read verbatim.
+          # mktemp creates the file 0600, and the secret is already on this host
+          # in .env at the same permissions, so this adds no new exposure.
+          hdr="$(mktemp)"
+          trap 'rm -f "$hdr"' EXIT
+          printf 'Authorization: Bearer %s\n' "$HERMES_API_KEY" > "$hdr"
+
+          # The gateway needs a few seconds to bind :8642 after up -d.
           ok=0
           for i in $(seq 1 30); do
-            if printf 'header = "Authorization: Bearer %s"\n' "$HERMES_API_KEY" \
-                 | curl -fsS -o /dev/null --config - http://127.0.0.1:8642/v1/models; then
+            if curl -fsS -o /dev/null -H @"$hdr" http://127.0.0.1:8642/v1/models; then
               ok=1; break
             fi
             sleep 2
