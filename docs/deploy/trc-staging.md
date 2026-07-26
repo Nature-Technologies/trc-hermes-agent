@@ -5,6 +5,13 @@ Deploys this fork's image to the TRC staging host as its own compose project,
 and `paperclip` deploy themselves the same way, and all three attach to the
 shared external `poc-net` bridge.
 
+## Host prerequisites
+
+The deploy creates `poc-net` and its own volume idempotently, but **not**
+`trc-shared` — that bridge is owned by whoever runs the trc-backend stack.
+The `Copy deploy artifacts` step fails early if it is missing, before any
+secret is written to the host. Create it on the backend side, not here.
+
 ## Running a deploy
 
 1. Find the digest to deploy:

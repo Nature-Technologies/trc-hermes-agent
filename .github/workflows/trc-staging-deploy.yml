@@ -75,8 +75,19 @@ jobs:
           SSH_PORT: ${{ secrets.TRC_SSH_PORT || '22' }}
         run: |
           set -eu
-          ssh -i ~/.ssh/id_deploy -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
-            'mkdir -p /srv/trc/staging/hermes-agent /srv/trc/staging/fingerprints'
+          ssh -i ~/.ssh/id_deploy -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" 'bash -s' <<'REMOTE'
+          set -eu
+          # trc-shared is created by whoever runs the trc-backend stack, never by
+          # this deploy. Checked here, before any secret is copied to the host, so
+          # a missing backend network fails the run without leaving a rendered
+          # .env or a fingerprint behind.
+          if ! docker network inspect trc-shared >/dev/null 2>&1; then
+            echo "the external network trc-shared does not exist on this host."
+            echo "It is owned by the trc-backend stack and this deploy does not create it."
+            exit 1
+          fi
+          mkdir -p /srv/trc/staging/hermes-agent /srv/trc/staging/fingerprints
+          REMOTE
           scp -i ~/.ssh/id_deploy -P "$SSH_PORT" \
             deploy/trc/docker-compose-staging-trc.yml \
             deploy/trc/config.yaml \
@@ -160,7 +171,7 @@ jobs:
             echo "no hermes-agent container running yet"
           fi
 
-          flock /var/lock/trc-deploy.lock -c '
+          flock /var/lock/trc-deploy.lock -c 'set -e
             cd /srv/trc/staging/hermes-agent
             docker compose -f docker-compose-staging-trc.yml pull
             docker compose -f docker-compose-staging-trc.yml up -d --remove-orphans
