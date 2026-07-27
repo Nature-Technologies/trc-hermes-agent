@@ -55,8 +55,9 @@ Three consequences of the remote-daemon design worth knowing:
 **The runner is persistent and SHARED.** Unlike a GitHub-hosted runner, this
 machine is reused by later jobs — including `trc-open-webui` and `paperclip`'s
 deploys, which can run **concurrently** with this one on the same `$HOME`.
-That drove two different fixes, because the two shared files carry different
-risk:
+**Three** files in that `$HOME` would otherwise be shared, and they carry
+different risk. Two are now isolated per job; only `known_hosts` remains
+genuinely shared:
 
 - **The private key is a hard collision, so it is structurally isolated.** It
   is written to `$RUNNER_TEMP/id_rsa` — **never** `~/.ssh/id_rsa` — and loaded
@@ -71,6 +72,24 @@ risk:
   the agent are both removed in the final `Clean up secrets on the runner`
   step, which runs with `if: always()` — including the path where an earlier
   step failed before the agent ever started.
+- **`~/.docker/config.json` is a hard collision too, and is likewise
+  structurally isolated.** The deploy job sets `DOCKER_CONFIG` as **job-level**
+  `env:`, pointing at a per-job directory outside the build context, and creates
+  it before `docker login`. Every `docker`, `docker compose`, `docker buildx`
+  and `docker/login-action` call in the job honours that variable, so the GHCR
+  credential and buildx's state both live in job-private scratch space. Without
+  it the final cleanup step's `docker logout ghcr.io` would strip the GHCR
+  credential out from under a sibling repo's concurrent `docker compose pull` —
+  which is exactly why the logout is safe to keep now: it can only touch this
+  job's own directory, which the cleanup then deletes outright.
+
+  Note that job-level here is correct and is **not** the hazard a job-level
+  `DOCKER_HOST` would be. `DOCKER_CONFIG` says only *where credentials live*,
+  never *which daemon to talk to*, so unlike `DOCKER_HOST` it cannot redirect
+  the build step off the runner. (It is built from `github.workspace` rather
+  than the more obvious `runner.temp` because the `runner` context is not
+  available in `jobs.<job_id>.env` — GitHub rejects the whole workflow with
+  "Unrecognized named-value: 'runner'".)
 - **`~/.ssh/known_hosts` is still genuinely shared, and that is left as a
   documented operational requirement rather than fixed structurally** — the
   risk is lower (worst case under a race is a redundant rescan, not a hard
@@ -90,6 +109,23 @@ risk:
   removed in the final cleanup step.
 
 ## Host prerequisites
+
+### One-time host preparation (before the FIRST dispatch)
+
+`bootstrap: true` cannot stand up a host on its own from nothing, and the list
+below is what the workflow genuinely cannot do for itself. Run this **once per
+host, as root or with sudo, before any dispatch** — including a `bootstrap:
+true` one:
+
+```
+sudo install -d -o <deploy-user> -g <deploy-user> /srv/trc /srv/trc/staging
+```
+
+Both levels are needed, not just the leaf: the deploy's host-prep step runs
+`mkdir -p` under `/srv/trc/staging`, which needs write on that directory, and
+creating `/srv/trc/staging` itself needs write on `/srv` — neither of which a
+non-root deploy user has on a fresh host. The deploy never uses `sudo`, by
+design, so this cannot be folded into the workflow.
 
 The deploy creates **only** `poc-net`, idempotently, on every run. Outside
 `bootstrap` mode (see below) it creates neither `trc-shared` nor
@@ -139,7 +175,10 @@ runner **must run as a separate OS user**, so they do not share `$HOME` and
 therefore do not share `~/.ssh/known_hosts`. The private key itself does not
 have this constraint: it lives under the job-scoped `$RUNNER_TEMP`, so two
 jobs on the same runner user cannot collide over it even if this requirement
-is violated — only `known_hosts` is at risk.
+is violated. Neither does `~/.docker/config.json`, which the job-level
+`DOCKER_CONFIG` moves into a per-job directory. **`known_hosts` is the only
+genuinely shared file left**, which is why this requirement is about that file
+specifically.
 
 ### Phase 2 preconditions
 
@@ -273,6 +312,27 @@ on every network and volume, plus each **service's** own `networks:` membership,
 since a top-level network no service joins is silently ignored. For the deploy
 workflow specifically it also asserts:
 
+- the job requests the **`self-hosted`** runner label (all three `runs-on`
+  spellings understood: scalar, list, and the `{group, labels}` mapping) —
+  `ubuntu-latest` cannot reach the internal staging host at all;
+- `environment` is exactly **`staging`**, lowercase — GitHub matches
+  environment names case-sensitively, so `Staging` resolves no secrets and
+  every one of them arrives as the empty string;
+- **every** `DOCKER_HOST` value references both `secrets.HOST` and
+  `secrets.USERNAME`, so a literal host cannot be substituted. Of the three
+  assertions above this is the one that catches a **silent** failure: a
+  hardcoded `ssh://root@10.0.0.9:22` renders every application secret and
+  deploys them to whatever machine that literal names, with the smoke tests
+  passing against it. The other two fail loudly at runtime;
+- the `Write SSH key and scan the host key` step **positively** contains the
+  whole non-destructive `known_hosts` merge: an `ssh-keyscan` into
+  `$RUNNER_TEMP`, a `test -s` on it, `ssh-keygen -R` **twice** (the bare-host
+  and `[host]:port` spellings), and an append (`>>`) onto
+  `~/.ssh/known_hosts`. The "never truncate" rule below is negative-only, and
+  on its own it passes a workflow that has no host-key handling at all;
+- the `if: always()` cleanup step runs `ssh-agent -k` — deleting the key file
+  does not unload the key, and a leaked agent keeps it decrypted in memory on
+  this persistent runner, one more per dispatch;
 - `docker context create` appears **nowhere** in the workflow;
 - `DOCKER_HOST` appears only as **step-level** `env:`, never at workflow or
   job level — either would apply to the build step too;
@@ -290,7 +350,8 @@ workflow specifically it also asserts:
   workflow — only under `$RUNNER_TEMP`, so sibling jobs on the same runner
   can never collide over it;
 - an `if: always()` cleanup step exists that removes `id_rsa` and
-  `.env.staging` and runs `docker logout`;
+  `.env.staging` and runs `docker logout` (which is now confined to this job's
+  own `DOCKER_CONFIG` directory, and cannot strip a sibling job's credential);
 - `docker volume create` is only reachable from inside a branch whose
   **enclosing** `if`/`elif` condition tests the `bootstrap` input — checked
   with an if/elif/else/fi-aware scan, not merely "does `bootstrap` appear
