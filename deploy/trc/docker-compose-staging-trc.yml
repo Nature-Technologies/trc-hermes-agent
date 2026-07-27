@@ -54,8 +54,7 @@ services:
       HERMES_SKIP_CONFIG_MIGRATION: "1"
     volumes:
       - trc-staging-hermes-memory:/opt/data
-      # Relative to this file's directory, i.e. /srv/trc/staging/hermes-agent.
-      # The deploy workflow copies config.yaml alongside this compose file, so
-      # config.yaml is now git-managed: server-side edits are overwritten on
-      # the next deploy. Change it in this repo, not on the host.
-      - ./config.yaml:/opt/data/config.yaml
+      # Absolute path ON THE SERVER. Bind-mount sources are resolved by the
+      # remote daemon, so a relative path here would point at a directory that
+      # exists only on the CI runner. The deploy scp's this file into place.
+      - ${HERMES_CONFIG_PATH:?HERMES_CONFIG_PATH must be set}:/opt/data/config.yaml

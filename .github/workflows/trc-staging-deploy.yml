@@ -1,265 +1,226 @@
 name: TRC staging deploy (hermes-agent)
+run-name: Deploy hermes-agent to Dev/Test Server
 
-# Additive and TRC-only. This does NOT build or publish -- docker.yml already
-# does that. It rolls an already-published digest onto the staging host.
+# Additive and TRC-only. Does NOT build: trc-publish.yml publishes the image and
+# this rolls the configured moving tag onto the staging host.
 #
-# Manual by design. `image_digest` is required, so every deploy is reproducible
-# and a rollback is re-dispatching this workflow with the previous digest,
-# which the "Deploy" step prints into the run log before replacing it.
+# Runs `docker compose` from the runner against the host's Docker daemon over an
+# SSH context. Two consequences worth knowing:
+#   - the rendered .env is read by the LOCAL compose CLI and never lands on the
+#     server; values reach the containers as environment, not as a file on disk
+#   - bind-mount sources are resolved by the REMOTE daemon, so every bind path
+#     must be absolute and must already exist on the server
 
 on:
   workflow_dispatch:
-    inputs:
-      image_digest:
-        description: 'Digest to deploy, e.g. sha256:<64 hex>. Tags are rejected.'
-        required: true
-        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  # Stops this repository overlapping itself. Cross-repository races are
-  # handled by the flock on the host, because a concurrency group cannot span
-  # repositories.
   group: trc-staging-deploy
   cancel-in-progress: false
+
+env:
+  # The moving tag this deploy tracks, published by trc-publish.yml. Change this
+  # one line to follow a different branch tag.
+  IMAGE_TAG: dev
+  IMAGE_REPO: ghcr.io/nature-technologies/trc-hermes-agent
+  COMPOSE_FILE_PATH: deploy/trc/docker-compose-staging-trc.yml
+  HOST_DIR: /srv/trc/staging/hermes-agent
 
 jobs:
   deploy:
     name: Deploy hermes-agent to staging
     if: github.repository == 'Nature-Technologies/trc-hermes-agent'
     runs-on: ubuntu-latest
-    environment: staging
-    timeout-minutes: 15
+    environment: Staging
+    timeout-minutes: 20
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Validate digest
+      - name: Write SSH key and scan the host key
         env:
-          DIGEST: ${{ inputs.image_digest }}
+          SSH_PRIVATE_KEY_DEV: ${{ secrets.SSH_PRIVATE_KEY_DEV }}
+          HOST: ${{ secrets.HOST }}
         run: |
           set -eu
-          hex="${DIGEST#sha256:}"
-          if [ "$hex" = "$DIGEST" ]; then
-            echo "::error::image_digest must start with sha256:"; exit 1
+          # Never `set -x` in any step here: it would print secrets into the log.
+          if [ -z "$SSH_PRIVATE_KEY_DEV" ]; then
+            echo "::error::SSH_PRIVATE_KEY_DEV is empty"; exit 1
           fi
-          if [ "${#hex}" -ne 64 ]; then
-            echo "::error::image_digest must be sha256: plus 64 hex chars"; exit 1
+          if [ -z "$HOST" ]; then
+            echo "::error::HOST is empty"; exit 1
           fi
-          case "$hex" in
-            *[!0-9a-f]*)
-              echo "::error::digest hex must be lowercase 0-9a-f"; exit 1 ;;
-          esac
-
-      - name: Install SSH key and pin host key
-        env:
-          SSH_KEY: ${{ secrets.TRC_SSH_KEY }}
-          KNOWN_HOSTS: ${{ secrets.TRC_SSH_KNOWN_HOSTS }}
-        run: |
-          set -eu
-          if [ -z "$KNOWN_HOSTS" ]; then
-            echo "::error::TRC_SSH_KNOWN_HOSTS is empty. Host keys are pinned, not bypassed."
+          install -m 600 -D /dev/null ~/.ssh/id_rsa
+          printf '%s\n' "$SSH_PRIVATE_KEY_DEV" > ~/.ssh/id_rsa
+          # Trust-on-first-use: the host key is taken from the host at deploy
+          # time rather than pinned. StrictHostKeyChecking stays ON, so a key
+          # that changes mid-run still aborts.
+          ssh-keyscan -H "$HOST" > ~/.ssh/known_hosts 2>/dev/null
+          if [ ! -s ~/.ssh/known_hosts ]; then
+            echo "::error::ssh-keyscan returned nothing for $HOST — host unreachable or SSH closed"
             exit 1
           fi
-          umask 077
-          mkdir -p ~/.ssh
-          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy
-          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
 
-      - name: Copy deploy artifacts
+      - name: Set up the remote Docker context
         env:
-          SSH_HOST: ${{ secrets.TRC_SSH_HOST }}
-          SSH_USER: ${{ secrets.TRC_SSH_USER }}
-          SSH_PORT: ${{ secrets.TRC_SSH_PORT || '22' }}
+          HOST: ${{ secrets.HOST }}
+          USERNAME: ${{ secrets.USERNAME }}
         run: |
           set -eu
-          ssh -i ~/.ssh/id_deploy -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" 'bash -s' <<'REMOTE'
+          docker context create trc-staging \
+            --docker "host=ssh://${USERNAME}@${HOST}"
+          docker context use trc-staging
+          # Proves the SSH transport and the remote daemon before anything else.
+          docker version --format 'remote daemon {{.Server.Version}}'
+
+      - name: Verify host preconditions
+        run: |
           set -eu
-          # trc-shared is created by whoever runs the trc-backend stack, never by
-          # this deploy. Checked here, before any secret is copied to the host, so
-          # a missing backend network fails the run without leaving a rendered
-          # .env or a fingerprint behind.
+          # Fail closed on the external volume. Compose refuses to start when an
+          # external volume is missing, and that is the guard: creating it here
+          # would boot Hermes against a silently EMPTY volume -- no sessions, no
+          # memories, no cron -- and every smoke test below would still pass.
+          # It is created and populated during the Phase 2 migration.
+          if ! docker volume inspect trc-staging-hermes-memory >/dev/null 2>&1; then
+            echo "::error::external volume trc-staging-hermes-memory does not exist on the host. Create and populate it during the Phase 2 migration; this deploy will not create it."
+            exit 1
+          fi
+          # trc-shared belongs to the trc-backend stack; this deploy never
+          # creates it.
           if ! docker network inspect trc-shared >/dev/null 2>&1; then
-            echo "the external network trc-shared does not exist on this host."
-            echo "It is owned by the trc-backend stack and this deploy does not create it."
+            echo "::error::external network trc-shared does not exist on the host. It is owned by the trc-backend stack."
             exit 1
           fi
-          mkdir -p /srv/trc/staging/hermes-agent /srv/trc/staging/fingerprints
-          REMOTE
-          scp -i ~/.ssh/id_deploy -P "$SSH_PORT" \
-            deploy/trc/docker-compose-staging-trc.yml \
-            deploy/trc/config.yaml \
-            "$SSH_USER@$SSH_HOST:/srv/trc/staging/hermes-agent/"
+          # poc-net carries no data, so creating it is safe and idempotent.
+          docker network create poc-net 2>/dev/null || true
 
-      - name: Render .env and deploy
+      - name: Copy Hermes config to the host
         env:
-          SSH_HOST: ${{ secrets.TRC_SSH_HOST }}
-          SSH_USER: ${{ secrets.TRC_SSH_USER }}
+          HOST: ${{ secrets.HOST }}
+          USERNAME: ${{ secrets.USERNAME }}
           SSH_PORT: ${{ secrets.TRC_SSH_PORT || '22' }}
-          DIGEST: ${{ inputs.image_digest }}
+        run: |
+          set -eu
+          # config.yaml is a bind mount, and bind sources are resolved by the
+          # REMOTE daemon -- so unlike the .env, this file genuinely has to be
+          # on the server. It carries no secret (model, dashboard and MCP URL
+          # config only).
+          ssh -i ~/.ssh/id_rsa -p "$SSH_PORT" "${USERNAME}@${HOST}" \
+            "mkdir -p ${HOST_DIR}"
+          scp -i ~/.ssh/id_rsa -P "$SSH_PORT" \
+            deploy/trc/config.yaml \
+            "${USERNAME}@${HOST}:${HOST_DIR}/config.yaml"
+
+      - name: Render the environment file
+        env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           HERMES_API_KEY: ${{ secrets.HERMES_API_KEY }}
           DASH_USER: ${{ secrets.HERMES_DASHBOARD_BASIC_AUTH_USERNAME }}
           DASH_PASS: ${{ secrets.HERMES_DASHBOARD_BASIC_AUTH_PASSWORD }}
-          GHCR_READ_TOKEN: ${{ secrets.GHCR_READ_TOKEN }}
         run: |
           set -eu
-          # Never `set -x` in this step: it would print every secret below.
+          # This file stays on the runner. The local compose CLI reads it and
+          # sends the values to the remote daemon as container environment, so
+          # no plaintext secret is ever written to the staging host.
 
           if [ "${#HERMES_API_KEY}" -lt 16 ]; then
             echo "::error::HERMES_API_KEY must be at least 16 characters. Below that the gateway refuses to start the API server at all, so the symptom is connection-refused on :8642, not a 401."
             exit 1
           fi
-
-          # Charset guard for every secret rendered into .env below. Compose's
-          # env_file parser interpolates `$VAR` and `${VAR}` inside values and
-          # treats an unquoted ` #` as the start of a comment, so a secret
-          # containing $, a backtick or # reaches the container as a DIFFERENT
-          # string than the repository secret holds. Nothing errors: the service
-          # starts and the failure surfaces later as an unexplained 401 or an
-          # unreachable dashboard. Values are written unquoted on purpose (see
-          # the render block below), so rejecting the characters is the only
-          # reliable guard.
-          reject_interpolation_chars() {
-            case "$2" in
+          for name in OPENROUTER_API_KEY HERMES_API_KEY DASH_USER DASH_PASS; do
+            eval "value=\${$name}"
+            case "$value" in
               *'$'*|*'`'*|*'#'*)
-                echo "::error::$1 must not contain \$, a backtick or #. Compose's .env parser interpolates the first two and treats # as a comment, so the container would receive a different value than the secret holds. Regenerate it with: openssl rand -hex 32"
+                echo "::error::$name contains \$, a backtick or #, which Compose mangles when interpolating the env file"
                 exit 1 ;;
             esac
-          }
-          reject_interpolation_chars OPENROUTER_API_KEY "$OPENROUTER_API_KEY"
-          reject_interpolation_chars HERMES_API_KEY "$HERMES_API_KEY"
-          reject_interpolation_chars HERMES_DASHBOARD_BASIC_AUTH_USERNAME "$DASH_USER"
-          reject_interpolation_chars HERMES_DASHBOARD_BASIC_AUTH_PASSWORD "$DASH_PASS"
+          done
 
-          # The .env is rendered here and copied as a file so no secret ever
-          # appears in a remote command line or in the host's process list.
-          # Values are written UNQUOTED on purpose: this file is parsed by
-          # Compose's env_file reader, which strips no shell quoting of its
-          # own. That also means this file must NEVER be shell-sourced (e.g.
-          # `. .env`) -- a value containing a space, `#`, `$(...)` or a
-          # backtick would be misread or, worse, executed. Extract a single
-          # key with `sed`/`grep` instead (see the smoke-test step).
           umask 077
           {
-            printf 'HERMES_IMAGE=ghcr.io/nature-technologies/trc-hermes-agent@%s\n' "$DIGEST"
+            printf 'HERMES_IMAGE=%s:%s\n' "$IMAGE_REPO" "$IMAGE_TAG"
             printf 'OPENROUTER_API_KEY=%s\n' "$OPENROUTER_API_KEY"
             printf 'HERMES_API_KEY=%s\n' "$HERMES_API_KEY"
             printf 'HERMES_DASHBOARD_BASIC_AUTH_USERNAME=%s\n' "$DASH_USER"
             printf 'HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=%s\n' "$DASH_PASS"
             printf 'HERMES_BIND=127.0.0.1\n'
-          } > env.staging
-          scp -i ~/.ssh/id_deploy -P "$SSH_PORT" env.staging \
-            "$SSH_USER@$SSH_HOST:/srv/trc/staging/hermes-agent/.env"
-          rm -f env.staging
+            printf 'HERMES_CONFIG_PATH=%s/config.yaml\n' "$HOST_DIR"
+          } > .env.staging
 
-          # Publish a fingerprint of the shared gateway key so the Paperclip
-          # deploy can detect that its third copy has drifted. Twelve hex
-          # characters of a SHA-256 over a 64-character random secret is not a
-          # secret and is not brute-forceable.
-          printf '%s' "$HERMES_API_KEY" | sha256sum | cut -c1-12 > hermes.fpr
-          scp -i ~/.ssh/id_deploy -P "$SSH_PORT" hermes.fpr \
-            "$SSH_USER@$SSH_HOST:/srv/trc/staging/fingerprints/hermes-api-key"
-          rm -f hermes.fpr
-
-          if [ -n "$GHCR_READ_TOKEN" ]; then
-            # Piped over the ssh channel, never as an argument.
-            printf '%s' "$GHCR_READ_TOKEN" | ssh -i ~/.ssh/id_deploy -p "$SSH_PORT" \
-              "$SSH_USER@$SSH_HOST" \
-              'docker login ghcr.io -u trc-deploy --password-stdin'
-          fi
-
-          ssh -i ~/.ssh/id_deploy -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" 'bash -s' <<'REMOTE'
-          set -eu
-          cd /srv/trc/staging/hermes-agent
-          chmod 600 .env
-
-          # Idempotent. Concurrent creates from another repo's deploy lose
-          # harmlessly on the `|| true`.
-          docker network create poc-net 2>/dev/null || true
-
-          # Deliberately NOT `docker volume create`. Compose refuses to start when
-          # an external volume is missing, and that fail-closed behaviour is the
-          # whole point of declaring them external: pre-creating one here would
-          # boot the service against a silently EMPTY volume, and every smoke
-          # test below would still pass. The volume is created and populated
-          # during the Phase 2 migration, not by a deploy.
-          if ! docker volume inspect trc-staging-hermes-memory >/dev/null 2>&1; then
-            echo "the external volume trc-staging-hermes-memory does not exist on this host."
-            echo "Create and populate it during the Phase 2 migration; this deploy will not create it."
-            exit 1
-          fi
-
-          # Record the rollback target. Read the digest from the IMAGE, not the
-          # container: a container's inspect output has no RepoDigests key at
-          # all, so `docker inspect <container>` cannot produce this.
-          if img="$(docker inspect --format '{{.Image}}' hermes-agent 2>/dev/null)"; then
-            echo "rollback target (digest currently running):"
-            docker image inspect "$img" \
-              --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{else}}(built locally, no digest){{end}}'
-          else
-            echo "no hermes-agent container running yet"
-          fi
-
-          flock /var/lock/trc-deploy.lock -c 'set -e
-            cd /srv/trc/staging/hermes-agent
-            docker compose -f docker-compose-staging-trc.yml pull
-            docker compose -f docker-compose-staging-trc.yml up -d --remove-orphans
-          '
-          REMOTE
-
-      - name: Smoke test
+      - name: Publish the shared-key fingerprint
         env:
-          SSH_HOST: ${{ secrets.TRC_SSH_HOST }}
-          SSH_USER: ${{ secrets.TRC_SSH_USER }}
+          HERMES_API_KEY: ${{ secrets.HERMES_API_KEY }}
+          HOST: ${{ secrets.HOST }}
+          USERNAME: ${{ secrets.USERNAME }}
           SSH_PORT: ${{ secrets.TRC_SSH_PORT || '22' }}
         run: |
           set -eu
-          ssh -i ~/.ssh/id_deploy -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" 'bash -s' <<'REMOTE'
-          set -eu
-          # Read only the key we need, without shell-evaluating the file: the
-          # .env is written for Compose's env_file parser, which strips no
-          # shell quoting of its own, so sourcing it here could execute
-          # whatever a dashboard password happens to contain and would let
-          # this step see a different value than the container actually got.
-          HERMES_API_KEY="$(sed -n 's/^HERMES_API_KEY=//p' /srv/trc/staging/hermes-agent/.env)"
-          if [ -z "$HERMES_API_KEY" ]; then
-            echo "could not read HERMES_API_KEY from the deployed .env"
-            exit 1
-          fi
+          # Twelve hex characters of a SHA-256 over the gateway key. Not a
+          # secret and not brute-forceable; it lets the paperclip deploy detect
+          # that its third copy of HERMES_API_KEY has drifted.
+          printf '%s' "$HERMES_API_KEY" | sha256sum | cut -c1-12 > hermes.fpr
+          ssh -i ~/.ssh/id_rsa -p "$SSH_PORT" "${USERNAME}@${HOST}" \
+            'mkdir -p /srv/trc/staging/fingerprints'
+          scp -i ~/.ssh/id_rsa -P "$SSH_PORT" hermes.fpr \
+            "${USERNAME}@${HOST}:/srv/trc/staging/fingerprints/hermes-api-key"
+          rm -f hermes.fpr
 
-          # The bearer header goes to curl through a 0600 file rather than argv
-          # (visible in ps) or a --config value (curl applies escape rules
-          # inside quoted config values, so a key containing " or \ would be
-          # silently truncated or mangled). `-H @file` is read verbatim.
-          # mktemp creates the file 0600, and the secret is already on this host
-          # in .env at the same permissions, so this adds no new exposure.
+      - name: Pull and deploy
+        run: |
+          set -eu
+          echo "deploying ${IMAGE_REPO}:${IMAGE_TAG}"
+          docker compose --env-file .env.staging -f "$COMPOSE_FILE_PATH" pull
+          docker compose --env-file .env.staging -f "$COMPOSE_FILE_PATH" up -d --remove-orphans
+          # Record what actually landed, so a rollback has a named target. Read
+          # from the IMAGE, not the container: a container's inspect output has
+          # no RepoDigests key at all.
+          img="$(docker inspect --format '{{.Image}}' hermes-agent)"
+          echo "deployed digest:"
+          docker image inspect "$img" \
+            --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{else}}(no digest){{end}}'
+
+      - name: Smoke test
+        env:
+          HERMES_API_KEY: ${{ secrets.HERMES_API_KEY }}
+        run: |
+          set -eu
+          # The bearer header goes to curl through a 0600 file rather than argv.
           hdr="$(mktemp)"
           trap 'rm -f "$hdr"' EXIT
           printf 'Authorization: Bearer %s\n' "$HERMES_API_KEY" > "$hdr"
 
-          # The gateway needs a few seconds to bind :8642 after up -d.
+          # curl runs INSIDE the container, so :8642 is reached over the compose
+          # network and no host port needs to be open to the runner.
           ok=0
-          for i in $(seq 1 30); do
-            if curl -fsS -o /dev/null -H @"$hdr" http://127.0.0.1:8642/v1/models; then
-              ok=1; break
-            fi
+          for _ in $(seq 1 30); do
+            if docker exec -i hermes-agent python3 - <<'PY'
+          import os, sys, urllib.error, urllib.request
+          req = urllib.request.Request(
+              "http://127.0.0.1:8642/v1/models",
+              headers={"Authorization": "Bearer " + os.environ["API_SERVER_KEY"]},
+          )
+          try:
+              urllib.request.urlopen(req, timeout=10)
+          except Exception as exc:
+              print(f"gateway not ready: {exc}")
+              sys.exit(1)
+          print("gateway OK")
+          PY
+            then ok=1; break; fi
             sleep 2
           done
           if [ "$ok" -ne 1 ]; then
-            echo "gateway never answered on :8642 with the deployed key"
+            echo "::error::gateway never answered on :8642 with the deployed key"
             docker logs --tail 50 hermes-agent || true
             exit 1
           fi
-          echo "gateway OK"
 
           # trc-shared reachability. Assert the REQUEST SUCCEEDS, not that it
-          # returns 200: an MCP endpoint may answer a bare GET with 405 or 406.
-          # What is under test is DNS plus routing to the backend. python3 is
-          # used rather than curl because it is guaranteed present in this
-          # Python-based image.
+          # returns 200 -- an MCP endpoint may answer a bare GET with 405/406.
+          # What is under test is DNS plus routing to the backend.
           docker exec -i hermes-agent python3 - <<'PY'
           import sys, urllib.error, urllib.request
           try:
@@ -271,4 +232,10 @@ jobs:
               print(f"could NOT reach app:8000/mcp over trc-shared: {exc}")
               sys.exit(1)
           PY
-          REMOTE
+
+      - name: Remove the deploy context
+        if: always()
+        run: |
+          set -eu
+          docker context use default || true
+          docker context rm trc-staging || true

@@ -1,0 +1,74 @@
+name: TRC publish image
+run-name: Publish trc-hermes-agent (${{ github.ref_name }}) to GHCR
+
+# Additive and TRC-only. Exists so chore/new-ci carries publishing on its own
+# and chore/ci can be obsoleted, without editing docker.yml. Scope is narrow on
+# purpose: linux/amd64, one image, a moving branch tag plus a sha tag. It does
+# not replicate docker.yml's multi-arch matrix, push-by-digest merge job, or
+# test gating -- CI covers tests, and the TRC deploy consumes only this image.
+
+on:
+  push:
+    branches: [dev, chore/new-ci]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: trc-publish-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: ghcr.io/nature-technologies/trc-hermes-agent
+
+jobs:
+  publish:
+    name: Build and push trc-hermes-agent
+    if: github.repository == 'Nature-Technologies/trc-hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags
+        id: tags
+        run: |
+          set -eu
+          # Branch ref as a moving tag, slashes flattened, plus an immutable
+          # sha tag so any published build can still be named exactly.
+          ref="${GITHUB_REF_NAME//\//-}"
+          printf 'moving=%s:%s\n' "$IMAGE_NAME" "$ref" >> "$GITHUB_OUTPUT"
+          printf 'sha=%s:sha-%s\n' "$IMAGE_NAME" "${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.tags.outputs.moving }}
+            ${{ steps.tags.outputs.sha }}
+          build-args: |
+            HERMES_GIT_SHA=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=trc-publish-amd64
+          cache-to: type=gha,mode=max,scope=trc-publish-amd64
