@@ -23,10 +23,21 @@ run-name: Deploy hermes-agent to Dev/Test Server
 #     as a file on disk
 #   - bind-mount sources are resolved by the REMOTE daemon, so every bind
 #     path must be absolute and must already exist on the server
-#   - this runner is PERSISTENT: it is reused by later jobs, so every secret
-#     this workflow writes to disk (the private key, .env.staging, the
-#     fingerprint temp file) is removed in the final cleanup step, which
-#     runs even when an earlier step fails
+#   - this runner is PERSISTENT and SHARED with sibling repos' deploys
+#     (trc-open-webui, paperclip), which can run concurrently on the same
+#     $HOME. The private key is loaded into a per-job ssh-agent from a file
+#     under $RUNNER_TEMP -- never ~/.ssh/id_rsa -- so one job's cleanup can
+#     never delete the key a sibling job is mid-deploy with. Every secret
+#     this workflow writes to disk (the key, .env.staging, the fingerprint
+#     temp file) is removed and the agent killed in the final cleanup step,
+#     which runs even when an earlier step fails. ~/.ssh/known_hosts is
+#     still genuinely shared (see docs/deploy/trc-staging.md) -- that is
+#     lower-risk (worst case is a redundant rescan) and is handled by
+#     documenting a one-job-at-a-time / separate-users requirement instead
+#     of structural isolation
+#   - the deploy pulls the IMMUTABLE `:git-<7-char-sha>` tag this run built,
+#     not the moving `:staging` pointer -- see the "Render the environment
+#     file" step
 
 on:
   workflow_dispatch:
@@ -56,7 +67,10 @@ jobs:
   deploy:
     name: Build and deploy hermes-agent to staging
     if: github.repository == 'Nature-Technologies/trc-hermes-agent'
-    runs-on: self-hosted
+    # Labelled, not bare `self-hosted`, so a non-Linux runner registered
+    # later on this label set cannot pick up a job that needs docker/buildx
+    # and an OpenSSH client.
+    runs-on: [self-hosted, linux]
     environment: staging
     timeout-minutes: 45
     steps:
@@ -77,25 +91,48 @@ jobs:
           if [ -z "$HOST" ]; then
             echo "::error::HOST is empty"; exit 1
           fi
-          install -m 700 -d ~/.ssh
-          install -m 600 -D /dev/null ~/.ssh/id_rsa
-          printf '%s\n' "$SSH_PRIVATE_KEY_DEV" > ~/.ssh/id_rsa
-          # Trust-on-first-use: the host key is taken from the host at deploy
-          # time rather than pinned. StrictHostKeyChecking stays ON, so a key
-          # that changes mid-run still aborts.
+
+          # The key lives ONLY under $RUNNER_TEMP -- never ~/.ssh/id_rsa --
+          # and is loaded into a per-job ssh-agent. This runner is
+          # PERSISTENT and shared with sibling repos' deploys, which can run
+          # concurrently on the same $HOME: a shared ~/.ssh/id_rsa would let
+          # one job's cleanup delete the key a sibling job is mid-deploy
+          # with. The agent's socket is exported via $GITHUB_ENV so every
+          # later step in THIS job inherits it, which authenticates both the
+          # explicit ssh/scp calls below (passed -i explicitly too, since
+          # that costs nothing and does not depend on default-identity
+          # resolution) and the ssh the Docker CLI spawns internally for
+          # DOCKER_HOST.
+          install -m 600 -D /dev/null "$RUNNER_TEMP/id_rsa"
+          printf '%s\n' "$SSH_PRIVATE_KEY_DEV" > "$RUNNER_TEMP/id_rsa"
+          eval "$(ssh-agent -a "$RUNNER_TEMP/ssh-agent.sock")" >/dev/null
+          ssh-add "$RUNNER_TEMP/id_rsa" >/dev/null
+          {
+            echo "SSH_AUTH_SOCK=$RUNNER_TEMP/ssh-agent.sock"
+            echo "SSH_AGENT_PID=$SSH_AGENT_PID"
+          } >> "$GITHUB_ENV"
+
+          # known_hosts is still genuinely SHARED across sibling jobs on
+          # this runner -- see docs/deploy/trc-staging.md, which documents
+          # that the runner must process one job at a time, and that
+          # multiple runners on one machine must run as separate users. The
+          # scan-then-append below is non-destructive, so the residual race
+          # here is low-risk (worst case: a redundant rescan), unlike the
+          # id_rsa collision above, which is a hard failure.
           #
-          # This runner is PERSISTENT, so ~/.ssh/known_hosts carries entries
-          # from other jobs that are not ours to delete -- scan into
-          # $RUNNER_TEMP first, never straight onto the real file.
+          # Trust-on-first-use: the host key is taken from the host at
+          # deploy time rather than pinned. StrictHostKeyChecking stays ON,
+          # so a key that changes mid-run still aborts.
           ssh-keyscan -T 10 -p "$SSH_PORT" -H "$HOST" > "$RUNNER_TEMP/known_hosts"
           # ssh-keyscan exits 0 even when nothing answered -- this is the
           # actual reachability check, and it must fail now, not 45 minutes
           # into the build.
           test -s "$RUNNER_TEMP/known_hosts"
+          install -m 700 -d ~/.ssh
           touch ~/.ssh/known_hosts
           # Remove any stale entry for this host, both spellings -- keyscan
           # writes a bare host for port 22 and `[host]:port` otherwise -- then
-          # append the fresh scan. Never truncate with `>`.
+          # append the fresh scan. Never truncate with `>` or `tee`.
           ssh-keygen -R "$HOST" -f ~/.ssh/known_hosts >/dev/null 2>&1 || true
           ssh-keygen -R "[${HOST}]:${SSH_PORT}" -f ~/.ssh/known_hosts >/dev/null 2>&1 || true
           cat "$RUNNER_TEMP/known_hosts" >> ~/.ssh/known_hosts
@@ -185,9 +222,9 @@ jobs:
           # REMOTE daemon -- so unlike .env.staging, this file genuinely has
           # to be on the server. It carries no secret (model, dashboard and
           # MCP URL config only).
-          ssh -p "$SSH_PORT" "${USERNAME}@${HOST}" \
+          ssh -i "$RUNNER_TEMP/id_rsa" -p "$SSH_PORT" "${USERNAME}@${HOST}" \
             "mkdir -p ${HOST_DIR} /srv/trc/staging/fingerprints"
-          scp -P "$SSH_PORT" \
+          scp -i "$RUNNER_TEMP/id_rsa" -P "$SSH_PORT" \
             deploy/trc/config.yaml \
             "${USERNAME}@${HOST}:${HOST_DIR}/config.yaml"
 
@@ -197,6 +234,15 @@ jobs:
           HERMES_API_KEY: ${{ secrets.HERMES_API_KEY }}
           DASH_USER: ${{ secrets.HERMES_DASHBOARD_BASIC_AUTH_USERNAME }}
           DASH_PASS: ${{ secrets.HERMES_DASHBOARD_BASIC_AUTH_PASSWORD }}
+          # The IMMUTABLE tag this run built, not the moving `:staging`
+          # pointer -- so the deploy runs exactly what this run built, and
+          # "what is running" is unambiguous. `:staging` is still pushed
+          # above (Build and push) as a human-readable pointer, but nothing
+          # in this workflow ever deploys it. For rollback, edit this one
+          # line on a throwaway branch to hardcode an older `:git-<7>` tag
+          # instead of this dynamic expression -- see
+          # docs/deploy/trc-staging.md.
+          DEPLOY_IMAGE: ${{ steps.tags.outputs.sha }}
         run: |
           set -eu
           # This file stays on the runner. The local compose CLI reads it and
@@ -218,7 +264,7 @@ jobs:
 
           umask 077
           {
-            printf 'HERMES_IMAGE=%s:staging\n' "$IMAGE"
+            printf 'HERMES_IMAGE=%s\n' "$DEPLOY_IMAGE"
             printf 'OPENROUTER_API_KEY=%s\n' "$OPENROUTER_API_KEY"
             printf 'HERMES_API_KEY=%s\n' "$HERMES_API_KEY"
             printf 'HERMES_DASHBOARD_BASIC_AUTH_USERNAME=%s\n' "$DASH_USER"
@@ -239,7 +285,7 @@ jobs:
           # secret and not brute-forceable; it lets the paperclip deploy detect
           # that its third copy of HERMES_API_KEY has drifted.
           printf '%s' "$HERMES_API_KEY" | sha256sum | cut -c1-12 > hermes.fpr
-          scp -P "$SSH_PORT" hermes.fpr \
+          scp -i "$RUNNER_TEMP/id_rsa" -P "$SSH_PORT" hermes.fpr \
             "${USERNAME}@${HOST}:/srv/trc/staging/fingerprints/hermes-api-key"
 
       - name: Pull and deploy
@@ -247,7 +293,11 @@ jobs:
           DOCKER_HOST: ssh://${{ secrets.USERNAME }}@${{ secrets.HOST }}:${{ secrets.SSH_PORT || '22' }}
         run: |
           set -eu
-          echo "deploying ${IMAGE}:staging"
+          # Read the tag back from .env.staging rather than recomputing it,
+          # so this log line can never drift from what actually gets
+          # deployed -- including on a rollback dispatch that hardcoded a
+          # different tag in the "Render the environment file" step.
+          echo "deploying $(grep '^HERMES_IMAGE=' .env.staging | cut -d= -f2-)"
           docker compose --env-file .env.staging -f "$COMPOSE_FILE_PATH" pull
           docker compose --env-file .env.staging -f "$COMPOSE_FILE_PATH" up -d --remove-orphans
           # Record what actually landed, so a rollback has a named target. Read
@@ -308,10 +358,13 @@ jobs:
 
       - name: Clean up secrets on the runner
         # if: always() -- this runner is PERSISTENT and reused by later jobs,
-        # so every secret written to disk above must be removed even when an
-        # earlier step failed.
+        # so every secret written to disk above must be removed, and the
+        # per-job ssh-agent killed, even when an earlier step failed --
+        # including a failure before the agent ever started (ssh-agent -k
+        # and the rm's are all best-effort for exactly that reason).
         if: always()
         run: |
           set -eu
-          rm -f ~/.ssh/id_rsa .env.staging hermes.fpr
+          rm -f "$RUNNER_TEMP/id_rsa" .env.staging hermes.fpr
+          ssh-agent -k >/dev/null 2>&1 || true
           docker logout ghcr.io || true

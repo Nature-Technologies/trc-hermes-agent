@@ -187,6 +187,15 @@ def _enables_tracing(line: str) -> bool:
     return False
 
 
+def _step_by_name(doc: dict, name: str) -> dict | None:
+    """The first step whose `name:` exactly matches, or None."""
+    for job in (doc.get("jobs") or {}).values():
+        for step in (job or {}).get("steps") or []:
+            if (step or {}).get("name") == name:
+                return step
+    return None
+
+
 def _step_with_uses_containing(doc: dict, needle: str) -> dict | None:
     """The first step whose `uses:` value contains `needle`, or None.
 
@@ -227,14 +236,17 @@ def _strict_mode_chars(line: str) -> set[str]:
 
 HEREDOC_RE = re.compile(r"<<-?\s*'?[A-Za-z_][A-Za-z0-9_]*'?\s*$")
 
-# A single `>` (not `>>`) redirect of `ssh-keyscan` output straight onto
-# `known_hosts` truncates the file. `~/.ssh` persists between jobs on a
-# self-hosted runner, so other entries there are not ours to delete -- the
-# scan must land in $RUNNER_TEMP first and be merged in with `ssh-keygen -R`
-# plus `>>`. A literal `>` inside a `>>` still matches this regex, but the
-# workflow never appends raw keyscan output directly (it always goes through
-# $RUNNER_TEMP), so that combination does not arise here.
-KEYSCAN_TRUNCATE_RE = re.compile(r"ssh-keyscan.*>.*known_hosts")
+# Raw `ssh-keyscan` output must never land directly on the real
+# `~/.ssh/known_hosts` -- by `>` (which truncates it) OR by piping through
+# `tee` (which truncates too unless `-a` is passed, and even `tee -a` skips
+# the `ssh-keygen -R` stale-entry removal the workflow relies on). `~/.ssh`
+# persists between jobs on a self-hosted runner, so other entries there are
+# not ours to delete or duplicate -- the scan must land in $RUNNER_TEMP first
+# and be merged in with `ssh-keygen -R` plus `>>`. A literal `>` inside a
+# `>>` still matches this regex, but the workflow never appends raw keyscan
+# output directly (it always goes through $RUNNER_TEMP), so that combination
+# does not arise here.
+KEYSCAN_TRUNCATE_RE = re.compile(r"ssh-keyscan\b.*(?:>|\|\s*tee\b).*known_hosts")
 
 
 def _docker_exec_is_interactive(line: str) -> bool:
@@ -309,6 +321,15 @@ def check_deploy_workflow() -> None:
     # Checked per-step (each `run:` is one contiguous script) rather than on
     # the flattened cross-job line list, so "bootstrap" merely appearing
     # somewhere else in the file cannot gate a create in an unrelated step.
+    #
+    # A depth-tracked if/elif/else/fi scan, not "does 'bootstrap' appear
+    # anywhere earlier in the step": that weaker check passes an
+    # unconditional create placed AFTER the bootstrap branch's `fi` (the
+    # branch closed, so it no longer gates anything below it), which is
+    # exactly the fail-open case a reviewer found. Each stack frame tracks
+    # whether the CURRENTLY ACTIVE clause of that if-block (the most recent
+    # if/elif/else at that depth) tests `bootstrap`; a create only passes
+    # while at least one enclosing frame is in its bootstrap-gated clause.
     for job in (doc.get("jobs") or {}).values():
         for step in (job or {}).get("steps") or []:
             script = (step or {}).get("run") or ""
@@ -318,15 +339,33 @@ def check_deploy_workflow() -> None:
                 ln for ln in script.splitlines()
                 if ln.strip() and not ln.lstrip().startswith("#")
             ]
-            for i, ln in enumerate(step_lines):
+            stack: list[bool] = []
+            for ln in step_lines:
+                stripped = ln.strip()
+                m = re.match(r"^(if|elif)\b(.*)$", stripped)
+                if m:
+                    gated = "bootstrap" in stripped
+                    if m.group(1) == "elif" and stack:
+                        stack[-1] = gated
+                    else:
+                        stack.append(gated)
+                    continue
+                if re.match(r"^else\b", stripped):
+                    if stack:
+                        stack[-1] = False
+                    continue
+                if re.match(r"^fi\b", stripped):
+                    if stack:
+                        stack.pop()
+                    continue
                 if not re.search(r"\bdocker\s+volume\s+create\b", ln):
                     continue
-                preceding = "\n".join(step_lines[:i])
                 check(
-                    "bootstrap" in preceding,
-                    f"{ln.strip()!r} pre-creates a volume on the host without "
-                    "being gated behind a check of the `bootstrap` input "
-                    "earlier in the same step. Compose REFUSES to start when "
+                    any(stack),
+                    f"{ln.strip()!r} pre-creates a volume on the host "
+                    "reachable OUTSIDE a branch gated on the `bootstrap` "
+                    "input (either never inside one, or after that branch's "
+                    "`fi` already closed it). Compose REFUSES to start when "
                     "an external volume is missing, and that fail-closed "
                     "behaviour is the entire point of declaring the volume "
                     "external: an unconditional create silently turns a loud "
@@ -401,33 +440,44 @@ def check_deploy_workflow() -> None:
             "NOT pass -i, or it consumes the rest of the enclosing script",
         )
 
-    # DOCKER_HOST must be scoped to individual steps, never the job. A
-    # job-level DOCKER_HOST would also apply to the build step, and buildx
-    # binds to whichever daemon is current -- so the image would build on the
-    # deploy host instead of the runner.
+    # DOCKER_HOST must be scoped to individual steps, never the workflow or
+    # the job. Either would also apply to the build step, and buildx binds to
+    # whichever daemon is current -- so the image would build on the deploy
+    # host instead of the runner.
     job_level_docker_host = [
         name for name, job in (doc.get("jobs") or {}).items()
         if "DOCKER_HOST" in set(((job or {}).get("env")) or {})
     ]
+    non_step_docker_host = job_level_docker_host + (
+        ["workflow"] if "DOCKER_HOST" in set(doc.get("env") or {}) else []
+    )
     check(
-        not job_level_docker_host,
-        f"DOCKER_HOST must never be set at job level (found on job(s) "
-        f"{job_level_docker_host}) -- that would apply to the build step "
+        not non_step_docker_host,
+        f"DOCKER_HOST must never be set at workflow or job level (found on "
+        f"{non_step_docker_host}) -- either would apply to the build step "
         "too, and buildx binds to whichever daemon is current, so the image "
         "would build on the deploy host instead of the runner",
     )
-    step_level_docker_host = [
-        step.get("name") or (step.get("run") or "")[:40]
-        for job in (doc.get("jobs") or {}).values()
-        for step in (job or {}).get("steps") or []
-        if "DOCKER_HOST" in _step_env_keys(step)
-    ]
-    check(
-        bool(step_level_docker_host),
-        "DOCKER_HOST must appear as step-level `env:` on at least one step "
-        "-- the host-precondition, deploy and smoke-test steps need it to "
-        "reach the remote daemon over SSH",
-    )
+    # "At least one step has it" is not enough: dropping DOCKER_HOST from
+    # any ONE of these three specifically would silently redirect that
+    # step's docker/compose calls to the runner's own daemon instead of the
+    # deploy host's, while every other DOCKER_HOST-bearing step stays green.
+    # Each is asserted by name.
+    for step_name in ("Verify host preconditions", "Pull and deploy", "Smoke test"):
+        named_step = _step_by_name(doc, step_name)
+        check(
+            named_step is not None,
+            f"no step named {step_name!r} -- expected one of the steps that "
+            "must run against the deploy host's daemon",
+        )
+        if named_step is not None:
+            check(
+                "DOCKER_HOST" in _step_env_keys(named_step),
+                f"the {step_name!r} step must have DOCKER_HOST in its own "
+                "`env:` -- without it this step's docker/compose calls would "
+                "silently run against the runner's own daemon instead of the "
+                "deploy host's",
+            )
 
     # The build step must run against the runner's OWN daemon, never the
     # deploy host's -- it must not inherit DOCKER_HOST from anywhere.
@@ -453,12 +503,28 @@ def check_deploy_workflow() -> None:
     ]
     check(
         not keyscan_truncates,
-        f"{keyscan_truncates} redirects `ssh-keyscan` output onto "
-        "known_hosts with a bare `>`, which TRUNCATES the file -- "
-        "~/.ssh/known_hosts persists between jobs on a self-hosted runner, "
-        "so entries already there are not ours to delete. Scan into "
-        "$RUNNER_TEMP first, remove any stale entry for this host with "
-        "`ssh-keygen -R`, then append (`>>`)",
+        f"{keyscan_truncates} writes `ssh-keyscan` output directly onto "
+        "known_hosts (via `>` or piped through `tee`), which either "
+        "TRUNCATES the file or skips the `ssh-keygen -R` stale-entry removal "
+        "-- ~/.ssh/known_hosts persists between jobs on a self-hosted "
+        "runner, so entries already there are not ours to delete or "
+        "duplicate. Scan into $RUNNER_TEMP first, remove any stale entry for "
+        "this host with `ssh-keygen -R`, then append (`>>`)",
+    )
+
+    # The private key must never land in ~/.ssh -- this runner is shared
+    # with sibling repos' deploys (trc-open-webui, paperclip), which can run
+    # concurrently on the same $HOME. A shared ~/.ssh/id_rsa would let one
+    # job's `rm -f ~/.ssh/id_rsa` cleanup delete the key a sibling job is
+    # mid-deploy with. It must live only under $RUNNER_TEMP, loaded into a
+    # per-job ssh-agent.
+    check(
+        not any("~/.ssh/id_rsa" in ln for ln in script_lines),
+        "the private key must never be written to ~/.ssh/id_rsa -- this "
+        "runner is shared with sibling jobs and reused across them, so a "
+        "shared key file lets one job's cleanup delete the key a sibling is "
+        "mid-deploy with. Write it under $RUNNER_TEMP and load it into a "
+        "per-job ssh-agent instead",
     )
 
     cleanup_step = None

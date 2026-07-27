@@ -11,13 +11,17 @@ image on the runner, pushes it to GHCR, and then rolls it out to the staging
 host in the same run, so the tag the deploy pulls always exists by the time it
 pulls it.
 
-The workflow runs on a **self-hosted runner** (`runs-on: self-hosted`),
-because the staging host is internal and unreachable from a GitHub-hosted
-runner. The build step runs with no special Docker configuration — it builds
-and pushes using the runner's own local daemon. Only the later steps that
-actually need to reach the staging host set `DOCKER_HOST: ssh://…` in their
-own **step-level** `env:`. That scoping is deliberate and never a job-level
-`env:` or a `docker context`:
+The workflow runs on a **self-hosted runner** (`runs-on: [self-hosted,
+linux]` — labelled, not bare `self-hosted`, so a non-Linux runner registered
+later on this label set cannot pick up a job that needs docker/buildx and an
+OpenSSH client), because the staging host is internal and unreachable from a
+GitHub-hosted runner. The build step runs with no special Docker
+configuration — it builds and pushes using the runner's own local daemon.
+Only the three later steps that actually need to reach the staging host —
+`Verify host preconditions`, `Pull and deploy`, `Smoke test` — set
+`DOCKER_HOST: ssh://…` in their own **step-level** `env:`. That scoping is
+deliberate and never a workflow-level or job-level `env:`, and never a
+`docker context`:
 
 - A `docker context` is *persistent state* on a self-hosted runner. `docker
   context create` fails with "already exists" on the second run against the
@@ -48,19 +52,42 @@ Three consequences of the remote-daemon design worth knowing:
   runner with the built-in `GITHUB_TOKEN` before pulling; this works whether
   the package is public (as it is today) or private.
 
-**The runner is persistent.** Unlike a GitHub-hosted runner, this machine is
-reused by later jobs — including other repos' deploys. That has two
-consequences baked into the workflow:
+**The runner is persistent and SHARED.** Unlike a GitHub-hosted runner, this
+machine is reused by later jobs — including `trc-open-webui` and `paperclip`'s
+deploys, which can run **concurrently** with this one on the same `$HOME`.
+That drove two different fixes, because the two shared files carry different
+risk:
 
-- `~/.ssh/known_hosts` carries entries from other jobs that are not this
-  workflow's to delete. The host-key scan writes into `$RUNNER_TEMP` first,
-  removes any stale entry for *this* host with `ssh-keygen -R` (both the
-  bare-host and `[host]:port` spellings), and only then **appends**
-  (`>>`) — it never truncates the real file with a bare `>`.
-- Every secret this workflow writes to disk on the runner —
-  `~/.ssh/id_rsa`, `.env.staging`, the `hermes.fpr` fingerprint temp file —
-  is removed in a final `Clean up secrets on the runner` step, which runs
-  with `if: always()` so a failed deploy still leaves the runner clean.
+- **The private key is a hard collision, so it is structurally isolated.** It
+  is written to `$RUNNER_TEMP/id_rsa` — **never** `~/.ssh/id_rsa` — and loaded
+  into a per-job `ssh-agent` whose socket is exported via `$GITHUB_ENV` for
+  every later step in that job. A shared `~/.ssh/id_rsa` would let one job's
+  cleanup (`rm -f ~/.ssh/id_rsa`) delete the key a sibling job is mid-deploy
+  with; per-job `$RUNNER_TEMP` isolation makes that impossible, since
+  `$RUNNER_TEMP` is scoped to the individual job. The agent authenticates both
+  the explicit `ssh`/`scp` calls (which also pass `-i "$RUNNER_TEMP/id_rsa"`
+  explicitly, redundantly with the agent, since that costs nothing) and the
+  `ssh` the Docker CLI spawns internally for `DOCKER_HOST`. The key file and
+  the agent are both removed in the final `Clean up secrets on the runner`
+  step, which runs with `if: always()` — including the path where an earlier
+  step failed before the agent ever started.
+- **`~/.ssh/known_hosts` is still genuinely shared, and that is left as a
+  documented operational requirement rather than fixed structurally** — the
+  risk is lower (worst case under a race is a redundant rescan, not a hard
+  auth failure) and there is no per-job equivalent of `$RUNNER_TEMP` for a
+  file every job needs to read. The host-key scan writes into `$RUNNER_TEMP`
+  first, removes any stale entry for *this* host with `ssh-keygen -R` (both
+  the bare-host and `[host]:port` spellings), and only then **appends**
+  (`>>`) to the real file — never a bare `>` or a `tee` without `-a`, either
+  of which would truncate entries other jobs rely on. **This means the runner
+  that executes this workflow must process one job at a time**, and if more
+  than one self-hosted runner is registered on the same machine (e.g. to
+  parallelize trc-hermes-agent, trc-open-webui and paperclip deploys), each
+  runner must run as a **separate OS user** so they do not share `$HOME` and
+  therefore do not share `~/.ssh/known_hosts`.
+- Every other secret this workflow writes to disk on the runner —
+  `.env.staging`, the `hermes.fpr` fingerprint temp file — is likewise
+  removed in the final cleanup step.
 
 ## Host prerequisites
 
@@ -100,6 +127,20 @@ The deploy user (`USERNAME`) also needs:
 - **membership of the `docker` group** (or root) on the host, so the SSH
   session backing `DOCKER_HOST` can reach the daemon socket without `sudo`.
 
+### Runner prerequisites
+
+The runner this workflow executes on must **process one job at a time** —
+`~/.ssh/known_hosts` is genuinely shared across jobs (see "The runner is
+persistent and SHARED" above), and the non-destructive scan-then-append
+pattern assumes no other job is touching that file concurrently. If more than
+one self-hosted runner is registered on the same machine — e.g. to let
+trc-hermes-agent, trc-open-webui and paperclip deploy in parallel — each
+runner **must run as a separate OS user**, so they do not share `$HOME` and
+therefore do not share `~/.ssh/known_hosts`. The private key itself does not
+have this constraint: it lives under the job-scoped `$RUNNER_TEMP`, so two
+jobs on the same runner user cannot collide over it even if this requirement
+is violated — only `known_hosts` is at risk.
+
 ### Phase 2 preconditions
 
 This repo's only stateful dependency is `trc-staging-hermes-memory`. Before the
@@ -113,43 +154,64 @@ is for a fresh host with no prior data to migrate).
 
 ## Running a deploy
 
-The workflow builds and publishes two tags on every dispatch:
+The workflow builds and publishes two tags on every dispatch, but they play
+different roles:
 
-- `ghcr.io/nature-technologies/trc-hermes-agent:staging` — a **moving** tag,
-  overwritten by every run. This is what the deploy pulls.
+- `ghcr.io/nature-technologies/trc-hermes-agent:staging` — a **moving**
+  pointer, overwritten by every run. Pushed for human convenience (e.g.
+  browsing the GHCR package), but **nothing in this workflow ever deploys
+  it.**
 - `ghcr.io/nature-technologies/trc-hermes-agent:git-<7-char-sha>` — an
-  **immutable** tag naming the exact commit that was built. This is what
-  rollback points at.
+  **immutable** tag naming the exact commit that was built. **This is what
+  gets deployed.** The `Render the environment file` step sets
+  `DEPLOY_IMAGE: ${{ steps.tags.outputs.sha }}` in its own `env:` and writes
+  that value into `.env.staging` as `HERMES_IMAGE`, so the deploy runs exactly
+  what this run built — "what is running" is unambiguous, and never depends on
+  `:staging` having been overwritten by a later, unrelated run between build
+  and deploy.
 
 1. Actions → **TRC staging deploy (hermes-agent)** → Run workflow.
 2. Leave `bootstrap` unchecked (default `false`) unless this is the first
    deploy to a brand-new host.
 3. The workflow builds the image from the checked-out ref, pushes both tags,
-   and deploys `:staging`.
+   and deploys the `:git-<7-char-sha>` one it just pushed.
+
+The `Pull and deploy` step logs the deployed tag by reading it back out of
+`.env.staging` (`grep '^HERMES_IMAGE=' .env.staging`) rather than
+recomputing it, so the log line can never drift from what is actually
+running — including under the rollback override below.
 
 ### Rolling back
 
-**There is no digest input.** Rolling back means re-dispatching the workflow
-from a branch whose workflow definition points at the `:git-<short-sha>` tag
-of the build you want, instead of building a new one:
+**There is no digest input.** Because every routine deploy already runs the
+immutable tag it just built, rolling back to an *older* build means
+re-dispatching the workflow from a branch where the **`Render the environment
+file`** step — not `Pull and deploy` — has its `DEPLOY_IMAGE` env line
+hardcoded to an older tag instead of the dynamic
+`${{ steps.tags.outputs.sha }}` expression:
 
 1. Branch off the current `dev` (name it anything that is not `dev`, e.g.
    `rollback/2026-07-27`).
-2. Edit this workflow on that branch so the `Pull and deploy` step deploys
-   `${IMAGE}:git-<short-sha>` instead of `${IMAGE}:staging` — pick the short
-   sha from a previous run's logs or the GHCR package's tag list. Commit and
-   push the branch.
+2. In `.github/workflows/trc-staging-deploy.yml` on that branch, find the
+   `Render the environment file` step and change its
+   `DEPLOY_IMAGE: ${{ steps.tags.outputs.sha }}` line to a hardcoded
+   `DEPLOY_IMAGE: ghcr.io/nature-technologies/trc-hermes-agent:git-<short-sha>`
+   — pick the short sha from a previous run's logs or the GHCR package's tag
+   list. Commit and push the branch.
 3. Actions → **TRC staging deploy (hermes-agent)** → Run workflow, and select
    **that branch** as the workflow ref (the "Use workflow from" selector). The
    deploy is `workflow_dispatch`-only, so it runs the workflow definition from
    whichever ref you pick.
 4. Delete the branch once you are done. To roll forward again, dispatch the
-   deploy from `dev` as normal, which builds fresh and redeploys `:staging`.
+   deploy from `dev` as normal, which builds fresh and deploys its own new
+   `:git-<sha>`.
 
-Because build and deploy are unified, a rollback dispatch **also rebuilds and
-re-pushes `:staging` from that branch's source** unless you edit the workflow
-to skip the build step or point the pull at the `:git-` tag directly, as
-above — a plain re-dispatch from an old branch is not itself a rollback.
+Because build and deploy are unified, a rollback dispatch **still rebuilds and
+pushes fresh `:staging`/`:git-<newsha>` tags from that branch's source** — but
+with `DEPLOY_IMAGE` hardcoded as above, the deploy step itself pulls and runs
+the specific **older** tag you named, not the one it just built. A plain
+re-dispatch from an old branch, without that edit, is not itself a rollback —
+it would build and deploy a fresh image from old source under a new sha.
 
 The `Pull and deploy` step still prints the digest that actually landed, so
 every run log records what is now running.
@@ -173,9 +235,9 @@ not resolve here.
 Host keys are **scanned at deploy time**
 (`ssh-keyscan -T 10 -p "$SSH_PORT" -H "$HOST" > "$RUNNER_TEMP/known_hosts"`)
 rather than pinned in advance, and then merged into `~/.ssh/known_hosts`
-non-destructively — see "The runner is persistent" above for why it is never
-a bare `>` onto the real file. Trust-on-first-use has the same trade-off it
-always did:
+non-destructively — see "The runner is persistent and SHARED" above for why
+it is never a bare `>` (or an unadorned `tee`) onto the real file.
+Trust-on-first-use has the same trade-off it always did:
 
 - It still protects against a passive attacker who cannot intercept the very
   first connection of a run — `StrictHostKeyChecking` is never disabled, so if
@@ -212,18 +274,29 @@ since a top-level network no service joins is silently ignored. For the deploy
 workflow specifically it also asserts:
 
 - `docker context create` appears **nowhere** in the workflow;
-- `DOCKER_HOST` appears only as **step-level** `env:`, never at job level —
-  a job-level `DOCKER_HOST` would apply to the build step too;
+- `DOCKER_HOST` appears only as **step-level** `env:`, never at workflow or
+  job level — either would apply to the build step too;
+- `DOCKER_HOST` is present, specifically, on each of the `Verify host
+  preconditions`, `Pull and deploy` and `Smoke test` steps by name — not just
+  "at least one step has it" (which would let it silently go missing from any
+  one of the three while the others stay green);
 - the step running `docker/build-push-action` has no `DOCKER_HOST` in its own
   `env:` — it must build on the runner, not the deploy host;
-- no line redirects `ssh-keyscan` output onto `known_hosts` with a bare `>`
-  outside `$RUNNER_TEMP` — that would truncate a file that persists across
-  jobs on this runner;
+- no line writes raw `ssh-keyscan` output directly onto `known_hosts` outside
+  `$RUNNER_TEMP`, whether via a bare `>` or piped through `tee` — either
+  bypasses the `ssh-keygen -R` stale-entry removal on a file that persists
+  across jobs on this runner;
+- the private key is never written to `~/.ssh/id_rsa` anywhere in the
+  workflow — only under `$RUNNER_TEMP`, so sibling jobs on the same runner
+  can never collide over it;
 - an `if: always()` cleanup step exists that removes `id_rsa` and
   `.env.staging` and runs `docker logout`;
-- `docker volume create` never appears unconditionally — only reachable
-  through a branch gated on the `bootstrap` input, and even then only after
-  a loud `::warning::`;
+- `docker volume create` is only reachable from inside a branch whose
+  **enclosing** `if`/`elif` condition tests the `bootstrap` input — checked
+  with an if/elif/else/fi-aware scan, not merely "does `bootstrap` appear
+  earlier in the step", so an unconditional create placed *after* that
+  branch's `fi` (i.e. no longer actually gated by anything) is still
+  rejected;
 - Compose is invoked with `--env-file`, so secret values are never
   interpolated into a shell command string;
 - `compose pull` precedes `compose up -d` (same-line `pull && up -d` counts,
