@@ -113,6 +113,27 @@ jobs:
             exit 1
           fi
 
+          # Charset guard for every secret rendered into .env below. Compose's
+          # env_file parser interpolates `$VAR` and `${VAR}` inside values and
+          # treats an unquoted ` #` as the start of a comment, so a secret
+          # containing $, a backtick or # reaches the container as a DIFFERENT
+          # string than the repository secret holds. Nothing errors: the service
+          # starts and the failure surfaces later as an unexplained 401 or an
+          # unreachable dashboard. Values are written unquoted on purpose (see
+          # the render block below), so rejecting the characters is the only
+          # reliable guard.
+          reject_interpolation_chars() {
+            case "$2" in
+              *'$'*|*'`'*|*'#'*)
+                echo "::error::$1 must not contain \$, a backtick or #. Compose's .env parser interpolates the first two and treats # as a comment, so the container would receive a different value than the secret holds. Regenerate it with: openssl rand -hex 32"
+                exit 1 ;;
+            esac
+          }
+          reject_interpolation_chars OPENROUTER_API_KEY "$OPENROUTER_API_KEY"
+          reject_interpolation_chars HERMES_API_KEY "$HERMES_API_KEY"
+          reject_interpolation_chars HERMES_DASHBOARD_BASIC_AUTH_USERNAME "$DASH_USER"
+          reject_interpolation_chars HERMES_DASHBOARD_BASIC_AUTH_PASSWORD "$DASH_PASS"
+
           # The .env is rendered here and copied as a file so no secret ever
           # appears in a remote command line or in the host's process list.
           # Values are written UNQUOTED on purpose: this file is parsed by
@@ -158,7 +179,18 @@ jobs:
           # Idempotent. Concurrent creates from another repo's deploy lose
           # harmlessly on the `|| true`.
           docker network create poc-net 2>/dev/null || true
-          docker volume create trc-staging-hermes-memory >/dev/null
+
+          # Deliberately NOT `docker volume create`. Compose refuses to start when
+          # an external volume is missing, and that fail-closed behaviour is the
+          # whole point of declaring them external: pre-creating one here would
+          # boot the service against a silently EMPTY volume, and every smoke
+          # test below would still pass. The volume is created and populated
+          # during the Phase 2 migration, not by a deploy.
+          if ! docker volume inspect trc-staging-hermes-memory >/dev/null 2>&1; then
+            echo "the external volume trc-staging-hermes-memory does not exist on this host."
+            echo "Create and populate it during the Phase 2 migration; this deploy will not create it."
+            exit 1
+          fi
 
           # Record the rollback target. Read the digest from the IMAGE, not the
           # container: a container's inspect output has no RepoDigests key at
