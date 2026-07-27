@@ -249,6 +249,19 @@ HEREDOC_RE = re.compile(r"<<-?\s*'?[A-Za-z_][A-Za-z0-9_]*'?\s*$")
 KEYSCAN_TRUNCATE_RE = re.compile(r"ssh-keyscan\b.*(?:>|\|\s*tee\b).*known_hosts")
 
 
+# A bare substring match cannot tell "writes the key there" from "mentions it in
+# a comment", and _run_script_lines only strips FULL-line comments. Requiring a
+# write indicator on the same line keeps the ban meaningful while letting the
+# cleanup step and inline comments name the path they are avoiding.
+ID_RSA_WRITE_INDICATORS = (">", "tee", "install", "cp ", "mv ")
+
+
+def _writes_default_ssh_key(line: str) -> bool:
+    if "~/.ssh/id_rsa" not in line:
+        return False
+    return any(token in line for token in ID_RSA_WRITE_INDICATORS)
+
+
 def _docker_exec_is_interactive(line: str) -> bool:
     """True when the `docker exec` on this line passes an -i style flag.
 
@@ -519,7 +532,7 @@ def check_deploy_workflow() -> None:
     # mid-deploy with. It must live only under $RUNNER_TEMP, loaded into a
     # per-job ssh-agent.
     check(
-        not any("~/.ssh/id_rsa" in ln for ln in script_lines),
+        not any(_writes_default_ssh_key(ln) for ln in script_lines),
         "the private key must never be written to ~/.ssh/id_rsa -- this "
         "runner is shared with sibling jobs and reused across them, so a "
         "shared key file lets one job's cleanup delete the key a sibling is "
