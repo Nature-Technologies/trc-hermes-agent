@@ -1,45 +1,64 @@
 name: TRC staging deploy (hermes-agent)
 run-name: Deploy hermes-agent to Dev/Test Server
 
-# Additive and TRC-only. Does NOT build: trc-publish.yml publishes the image and
-# this rolls the configured moving tag onto the staging host.
+# Additive and TRC-only. Builds AND deploys in one run -- trc-publish.yml is
+# gone, so the tag this deploy pulls always exists by the time it pulls it.
 #
-# Runs `docker compose` from the runner against the host's Docker daemon over an
-# SSH context. Two consequences worth knowing:
-#   - the rendered .env is read by the LOCAL compose CLI and never lands on the
-#     server; values reach the containers as environment, not as a file on disk
-#   - bind-mount sources are resolved by the REMOTE daemon, so every bind path
-#     must be absolute and must already exist on the server
+# Runs on a SELF-HOSTED runner: the staging host is internal and unreachable
+# from a GitHub-hosted runner. The image is built locally on the runner (no
+# DOCKER_HOST in that step's env), pushed to GHCR, and only THEN does
+# `docker compose` talk to the staging host's daemon, over
+# `DOCKER_HOST=ssh://...` set as env: on the individual steps that need it.
+#
+# Never `docker context create`/`use` here. A context is persistent state on
+# a self-hosted runner: `create` fails "already exists" on the second run,
+# `use` repoints the runner's DEFAULT daemon for every later job on this
+# machine, and buildx binds to whichever daemon is current -- so an active
+# context would silently build the image on the deploy host instead of the
+# runner. Step-scoped DOCKER_HOST cannot leak into the build step that way.
+#
+# Consequences worth knowing:
+#   - the rendered .env.staging is read by the LOCAL compose CLI and never
+#     lands on the server; values reach the containers as environment, not
+#     as a file on disk
+#   - bind-mount sources are resolved by the REMOTE daemon, so every bind
+#     path must be absolute and must already exist on the server
+#   - this runner is PERSISTENT: it is reused by later jobs, so every secret
+#     this workflow writes to disk (the private key, .env.staging, the
+#     fingerprint temp file) is removed in the final cleanup step, which
+#     runs even when an earlier step fails
 
 on:
   workflow_dispatch:
+    inputs:
+      bootstrap:
+        description: >-
+          Create trc-shared and trc-staging-hermes-memory instead of failing
+          when they are missing, and log loudly that it did. Use only when
+          standing up a fresh host; leave false on every routine deploy.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
-  # Lets the runner authenticate to GHCR itself (see the "Log in to GHCR"
-  # step) -- packages are public today, but this makes a private package work
-  # too, with no new secret.
-  packages: read
+  packages: write
 
 concurrency:
-  group: trc-staging-deploy
+  group: deploy-staging
   cancel-in-progress: false
 
 env:
-  # The moving tag this deploy tracks, published by trc-publish.yml. Change this
-  # one line to follow a different branch tag.
-  IMAGE_TAG: dev
-  IMAGE_REPO: ghcr.io/nature-technologies/trc-hermes-agent
+  IMAGE: ghcr.io/nature-technologies/trc-hermes-agent
   COMPOSE_FILE_PATH: deploy/trc/docker-compose-staging-trc.yml
   HOST_DIR: /srv/trc/staging/hermes-agent
 
 jobs:
   deploy:
-    name: Deploy hermes-agent to staging
+    name: Build and deploy hermes-agent to staging
     if: github.repository == 'Nature-Technologies/trc-hermes-agent'
-    runs-on: ubuntu-latest
-    environment: Staging
-    timeout-minutes: 20
+    runs-on: self-hosted
+    environment: staging
+    timeout-minutes: 45
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -48,7 +67,7 @@ jobs:
         env:
           SSH_PRIVATE_KEY_DEV: ${{ secrets.SSH_PRIVATE_KEY_DEV }}
           HOST: ${{ secrets.HOST }}
-          SSH_PORT: ${{ secrets.TRC_SSH_PORT || '22' }}
+          SSH_PORT: ${{ secrets.SSH_PORT || '22' }}
         run: |
           set -eu
           # Never `set -x` in any step here: it would print secrets into the log.
@@ -58,68 +77,117 @@ jobs:
           if [ -z "$HOST" ]; then
             echo "::error::HOST is empty"; exit 1
           fi
+          install -m 700 -d ~/.ssh
           install -m 600 -D /dev/null ~/.ssh/id_rsa
           printf '%s\n' "$SSH_PRIVATE_KEY_DEV" > ~/.ssh/id_rsa
           # Trust-on-first-use: the host key is taken from the host at deploy
           # time rather than pinned. StrictHostKeyChecking stays ON, so a key
           # that changes mid-run still aborts.
-          ssh-keyscan -p "$SSH_PORT" -H "$HOST" > ~/.ssh/known_hosts 2>/dev/null
-          if [ ! -s ~/.ssh/known_hosts ]; then
-            echo "::error::ssh-keyscan returned nothing for $HOST — host unreachable or SSH closed"
-            exit 1
-          fi
+          #
+          # This runner is PERSISTENT, so ~/.ssh/known_hosts carries entries
+          # from other jobs that are not ours to delete -- scan into
+          # $RUNNER_TEMP first, never straight onto the real file.
+          ssh-keyscan -T 10 -p "$SSH_PORT" -H "$HOST" > "$RUNNER_TEMP/known_hosts"
+          # ssh-keyscan exits 0 even when nothing answered -- this is the
+          # actual reachability check, and it must fail now, not 45 minutes
+          # into the build.
+          test -s "$RUNNER_TEMP/known_hosts"
+          touch ~/.ssh/known_hosts
+          # Remove any stale entry for this host, both spellings -- keyscan
+          # writes a bare host for port 22 and `[host]:port` otherwise -- then
+          # append the fresh scan. Never truncate with `>`.
+          ssh-keygen -R "$HOST" -f ~/.ssh/known_hosts >/dev/null 2>&1 || true
+          ssh-keygen -R "[${HOST}]:${SSH_PORT}" -f ~/.ssh/known_hosts >/dev/null 2>&1 || true
+          cat "$RUNNER_TEMP/known_hosts" >> ~/.ssh/known_hosts
 
-      - name: Set up the remote Docker context
-        env:
-          HOST: ${{ secrets.HOST }}
-          USERNAME: ${{ secrets.USERNAME }}
-          SSH_PORT: ${{ secrets.TRC_SSH_PORT || '22' }}
+      - name: Log in to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: tags
         run: |
           set -eu
-          # SSH_PORT here must match the port ssh-keyscan used above, or
-          # known_hosts describes a different endpoint than the one this
-          # context actually dials.
-          docker context create trc-staging \
-            --docker "host=ssh://${USERNAME}@${HOST}:${SSH_PORT}"
-          docker context use trc-staging
+          printf 'staging=%s:staging\n' "$IMAGE" >> "$GITHUB_OUTPUT"
+          printf 'sha=%s:git-%s\n' "$IMAGE" "${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build and push
+        # NO DOCKER_HOST in this step's env -- it must build on the RUNNER,
+        # never on the deploy host. See the file header.
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.tags.outputs.staging }}
+            ${{ steps.tags.outputs.sha }}
+          build-args: |
+            HERMES_GIT_SHA=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=min
+
+      - name: Verify host preconditions
+        env:
+          DOCKER_HOST: ssh://${{ secrets.USERNAME }}@${{ secrets.HOST }}:${{ secrets.SSH_PORT || '22' }}
+        run: |
+          set -eu
           # Proves the SSH transport and the remote daemon before anything else.
           docker version --format 'remote daemon {{.Server.Version}}'
 
-      - name: Verify host preconditions
-        run: |
-          set -eu
-          # Fail closed on the external volume. Compose refuses to start when an
-          # external volume is missing, and that is the guard: creating it here
-          # would boot Hermes against a silently EMPTY volume -- no sessions, no
-          # memories, no cron -- and every smoke test below would still pass.
-          # It is created and populated during the Phase 2 migration.
-          if ! docker volume inspect trc-staging-hermes-memory >/dev/null 2>&1; then
-            echo "::error::external volume trc-staging-hermes-memory does not exist on the host. Create and populate it during the Phase 2 migration; this deploy will not create it."
+          # Fail closed on the external volume, UNLESS bootstrapping a fresh
+          # host: Compose refuses to start when an external volume is
+          # missing, and that is the guard. Creating it on a routine deploy
+          # would boot Hermes against a silently EMPTY volume -- no sessions,
+          # no memories, no cron -- with every smoke test below still passing.
+          if docker volume inspect trc-staging-hermes-memory >/dev/null 2>&1; then
+            :
+          elif [ "${{ inputs.bootstrap }}" = "true" ]; then
+            echo "::warning::bootstrap=true -- creating trc-staging-hermes-memory. It will be EMPTY. Only intended for standing up a fresh host."
+            docker volume create trc-staging-hermes-memory
+          else
+            echo "::error::external volume trc-staging-hermes-memory does not exist on the host. This deploy will not create it silently -- create and populate it (see docs/deploy/trc-staging.md), or re-dispatch with bootstrap: true on a genuinely fresh host."
             exit 1
           fi
+
           # trc-shared belongs to the trc-backend stack; this deploy never
-          # creates it.
-          if ! docker network inspect trc-shared >/dev/null 2>&1; then
-            echo "::error::external network trc-shared does not exist on the host. It is owned by the trc-backend stack."
+          # creates it, unless bootstrapping a fresh host.
+          if docker network inspect trc-shared >/dev/null 2>&1; then
+            :
+          elif [ "${{ inputs.bootstrap }}" = "true" ]; then
+            echo "::warning::bootstrap=true -- creating trc-shared on this host."
+            docker network create trc-shared
+          else
+            echo "::error::external network trc-shared does not exist on the host. It is owned by the trc-backend stack -- re-dispatch with bootstrap: true only on a genuinely fresh host."
             exit 1
           fi
-          # poc-net carries no data, so creating it is safe and idempotent.
+
+          # poc-net carries no data, so creating it is always safe and idempotent.
           docker network create poc-net 2>/dev/null || true
 
       - name: Copy Hermes config to the host
         env:
           HOST: ${{ secrets.HOST }}
           USERNAME: ${{ secrets.USERNAME }}
-          SSH_PORT: ${{ secrets.TRC_SSH_PORT || '22' }}
+          SSH_PORT: ${{ secrets.SSH_PORT || '22' }}
         run: |
           set -eu
           # config.yaml is a bind mount, and bind sources are resolved by the
-          # REMOTE daemon -- so unlike the .env, this file genuinely has to be
-          # on the server. It carries no secret (model, dashboard and MCP URL
-          # config only).
-          ssh -i ~/.ssh/id_rsa -p "$SSH_PORT" "${USERNAME}@${HOST}" \
-            "mkdir -p ${HOST_DIR}"
-          scp -i ~/.ssh/id_rsa -P "$SSH_PORT" \
+          # REMOTE daemon -- so unlike .env.staging, this file genuinely has
+          # to be on the server. It carries no secret (model, dashboard and
+          # MCP URL config only).
+          ssh -p "$SSH_PORT" "${USERNAME}@${HOST}" \
+            "mkdir -p ${HOST_DIR} /srv/trc/staging/fingerprints"
+          scp -P "$SSH_PORT" \
             deploy/trc/config.yaml \
             "${USERNAME}@${HOST}:${HOST_DIR}/config.yaml"
 
@@ -132,8 +200,8 @@ jobs:
         run: |
           set -eu
           # This file stays on the runner. The local compose CLI reads it and
-          # sends the values to the remote daemon as container environment, so
-          # no plaintext secret is ever written to the staging host.
+          # sends the values to the remote daemon as container environment,
+          # so no plaintext secret is ever written to the staging host.
 
           if [ "${#HERMES_API_KEY}" -lt 16 ]; then
             echo "::error::HERMES_API_KEY must be at least 16 characters. Below that the gateway refuses to start the API server at all, so the symptom is connection-refused on :8642, not a 401."
@@ -150,7 +218,7 @@ jobs:
 
           umask 077
           {
-            printf 'HERMES_IMAGE=%s:%s\n' "$IMAGE_REPO" "$IMAGE_TAG"
+            printf 'HERMES_IMAGE=%s:staging\n' "$IMAGE"
             printf 'OPENROUTER_API_KEY=%s\n' "$OPENROUTER_API_KEY"
             printf 'HERMES_API_KEY=%s\n' "$HERMES_API_KEY"
             printf 'HERMES_DASHBOARD_BASIC_AUTH_USERNAME=%s\n' "$DASH_USER"
@@ -164,39 +232,22 @@ jobs:
           HERMES_API_KEY: ${{ secrets.HERMES_API_KEY }}
           HOST: ${{ secrets.HOST }}
           USERNAME: ${{ secrets.USERNAME }}
-          SSH_PORT: ${{ secrets.TRC_SSH_PORT || '22' }}
+          SSH_PORT: ${{ secrets.SSH_PORT || '22' }}
         run: |
           set -eu
           # Twelve hex characters of a SHA-256 over the gateway key. Not a
           # secret and not brute-forceable; it lets the paperclip deploy detect
           # that its third copy of HERMES_API_KEY has drifted.
           printf '%s' "$HERMES_API_KEY" | sha256sum | cut -c1-12 > hermes.fpr
-          ssh -i ~/.ssh/id_rsa -p "$SSH_PORT" "${USERNAME}@${HOST}" \
-            'mkdir -p /srv/trc/staging/fingerprints'
-          scp -i ~/.ssh/id_rsa -P "$SSH_PORT" hermes.fpr \
+          scp -P "$SSH_PORT" hermes.fpr \
             "${USERNAME}@${HOST}:/srv/trc/staging/fingerprints/hermes-api-key"
-          rm -f hermes.fpr
-
-      - name: Log in to GHCR
-        # Over a remote Docker context, `docker compose pull` sends THIS
-        # runner's registry credentials to the remote daemon (X-Registry-Auth)
-        # -- the staging host never STORES a credential of its own. Its daemon
-        # does receive the GITHUB_TOKEN (via X-Registry-Auth on pull, and via
-        # /auth when this `docker login` runs under the active remote context);
-        # it simply never persists it, and the token dies with the run.
-        # Logging in here, not on the host, is what replaces the old host-side
-        # `docker login` + GHCR_READ_TOKEN secret; it works whether the package
-        # is public or private.
-        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Pull and deploy
+        env:
+          DOCKER_HOST: ssh://${{ secrets.USERNAME }}@${{ secrets.HOST }}:${{ secrets.SSH_PORT || '22' }}
         run: |
           set -eu
-          echo "deploying ${IMAGE_REPO}:${IMAGE_TAG}"
+          echo "deploying ${IMAGE}:staging"
           docker compose --env-file .env.staging -f "$COMPOSE_FILE_PATH" pull
           docker compose --env-file .env.staging -f "$COMPOSE_FILE_PATH" up -d --remove-orphans
           # Record what actually landed, so a rollback has a named target. Read
@@ -212,6 +263,8 @@ jobs:
           fi
 
       - name: Smoke test
+        env:
+          DOCKER_HOST: ssh://${{ secrets.USERNAME }}@${{ secrets.HOST }}:${{ secrets.SSH_PORT || '22' }}
         run: |
           set -eu
           ok=0
@@ -253,12 +306,12 @@ jobs:
               sys.exit(1)
           PY
 
-      - name: Remove the deploy context
+      - name: Clean up secrets on the runner
+        # if: always() -- this runner is PERSISTENT and reused by later jobs,
+        # so every secret written to disk above must be removed even when an
+        # earlier step failed.
         if: always()
         run: |
           set -eu
-          # .env.staging is the only secret this workflow ever writes to disk
-          # on the runner (never on the host). Clean it up even on failure.
-          rm -f .env.staging
-          docker context use default || true
-          docker context rm trc-staging || true
+          rm -f ~/.ssh/id_rsa .env.staging hermes.fpr
+          docker logout ghcr.io || true

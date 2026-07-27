@@ -187,20 +187,23 @@ def _enables_tracing(line: str) -> bool:
     return False
 
 
-def _step_with_run_containing(doc: dict, needle: str) -> dict | None:
-    """The first step whose `run:` script contains `needle`, or None.
+def _step_with_uses_containing(doc: dict, needle: str) -> dict | None:
+    """The first step whose `uses:` value contains `needle`, or None.
 
     Used to scope an assertion to a single step's own `env:` mapping rather
-    than the whole file: `secrets.HOST` appearing ANYWHERE (e.g. in an
-    unrelated step like the host-key scan) is not evidence that THIS step's
-    invocation actually derives from that secret.
+    than the whole file -- e.g. confirming the build step specifically has no
+    DOCKER_HOST, not just that DOCKER_HOST appears somewhere unrelated.
     """
     for job in (doc.get("jobs") or {}).values():
         for step in (job or {}).get("steps") or []:
-            script = (step or {}).get("run")
-            if script and needle in script:
+            uses = (step or {}).get("uses")
+            if uses and needle in uses:
                 return step
     return None
+
+
+def _step_env_keys(step: dict | None) -> set[str]:
+    return set((step or {}).get("env") or {})
 
 
 def _strict_mode_chars(line: str) -> set[str]:
@@ -223,6 +226,15 @@ def _strict_mode_chars(line: str) -> set[str]:
 
 
 HEREDOC_RE = re.compile(r"<<-?\s*'?[A-Za-z_][A-Za-z0-9_]*'?\s*$")
+
+# A single `>` (not `>>`) redirect of `ssh-keyscan` output straight onto
+# `known_hosts` truncates the file. `~/.ssh` persists between jobs on a
+# self-hosted runner, so other entries there are not ours to delete -- the
+# scan must land in $RUNNER_TEMP first and be merged in with `ssh-keygen -R`
+# plus `>>`. A literal `>` inside a `>>` still matches this regex, but the
+# workflow never appends raw keyscan output directly (it always goes through
+# $RUNNER_TEMP), so that combination does not arise here.
+KEYSCAN_TRUNCATE_RE = re.compile(r"ssh-keyscan.*>.*known_hosts")
 
 
 def _docker_exec_is_interactive(line: str) -> bool:
@@ -288,23 +300,42 @@ def check_deploy_workflow() -> None:
         "between a mid-run key change and a silently accepted new key",
     )
 
-    volume_creates = [
-        ln.strip()
-        for ln in script_lines
-        if re.search(r"\bdocker\s+volume\s+create\b", ln)
-    ]
-    check(
-        not volume_creates,
-        f"{volume_creates} pre-creates a volume on the host. Compose REFUSES to "
-        "start when an external volume is missing, and that fail-closed "
-        "behaviour is the entire point of declaring the volume external: "
-        "creating it here converts a loud failure into a silently EMPTY volume "
-        "and the run goes green -- Hermes boots with no sessions, memories or "
-        "cron, and every smoke test still passes. The volume is created and "
-        "populated during the Phase 2 migration, never by a deploy. "
-        "`docker network create poc-net` is fine and stays: a network carries "
-        "no data",
-    )
+    # `docker volume create` is banned UNLESS it is reachable only through a
+    # branch that tests the `bootstrap` input -- Phase 1c added a bootstrap
+    # mode that creates the external volume on a fresh host, loudly. What
+    # must never happen is a SILENT, unconditional creation: that converts
+    # Compose's fail-closed behaviour on a missing external volume into a
+    # silently EMPTY volume, with every smoke test below still passing.
+    # Checked per-step (each `run:` is one contiguous script) rather than on
+    # the flattened cross-job line list, so "bootstrap" merely appearing
+    # somewhere else in the file cannot gate a create in an unrelated step.
+    for job in (doc.get("jobs") or {}).values():
+        for step in (job or {}).get("steps") or []:
+            script = (step or {}).get("run") or ""
+            if not script:
+                continue
+            step_lines = [
+                ln for ln in script.splitlines()
+                if ln.strip() and not ln.lstrip().startswith("#")
+            ]
+            for i, ln in enumerate(step_lines):
+                if not re.search(r"\bdocker\s+volume\s+create\b", ln):
+                    continue
+                preceding = "\n".join(step_lines[:i])
+                check(
+                    "bootstrap" in preceding,
+                    f"{ln.strip()!r} pre-creates a volume on the host without "
+                    "being gated behind a check of the `bootstrap` input "
+                    "earlier in the same step. Compose REFUSES to start when "
+                    "an external volume is missing, and that fail-closed "
+                    "behaviour is the entire point of declaring the volume "
+                    "external: an unconditional create silently turns a loud "
+                    "failure into an EMPTY volume and the run goes green -- "
+                    "Hermes boots with no sessions, memories or cron, and "
+                    "every smoke test still passes. `docker network create "
+                    "poc-net` is fine and stays unconditional: a network "
+                    "carries no data",
+                )
 
     check(
         any("docker volume inspect trc-staging-hermes-memory" in ln for ln in script_lines),
@@ -314,32 +345,13 @@ def check_deploy_workflow() -> None:
         "silently empty volume with every smoke test still passing",
     )
     check(
-        any("docker context create" in ln for ln in script_lines),
-        "the deploy must run against a remote Docker context, not over an SSH "
-        "shell -- that is what keeps the rendered .env off the server",
-    )
-    # Scoped to the step that actually runs `docker context create`, not the
-    # whole file: `secrets.HOST` merely appearing somewhere else (e.g. the
-    # host-key-scan step) says nothing about where THIS step's host comes
-    # from. A file-wide scan would let someone hardcode the host right here
-    # while `secrets.HOST` stays referenced in a completely different step.
-    context_step = _step_with_run_containing(doc, "docker context create")
-    context_step_env = {
-        str(k): str(v) for k, v in ((context_step or {}).get("env") or {}).items()
-    }
-    context_step_env_text = " ".join(context_step_env.values())
-    context_step_script = (context_step or {}).get("run") or ""
-    check(
-        context_step is not None
-        and "secrets.HOST" in context_step_env_text
-        and "secrets.USERNAME" in context_step_env_text
-        and "${HOST}" in context_step_script
-        and "${USERNAME}" in context_step_script,
-        "the step that runs `docker context create` must itself source HOST "
-        "and USERNAME from the HOST and USERNAME secrets (in that step's own "
-        "`env:`) and actually reference them in its script -- not a literal "
-        "hostname, and not merely a secret referenced somewhere else in the "
-        "file",
+        not any("docker context create" in ln for ln in script_lines),
+        "`docker context create` must appear nowhere -- a context is "
+        "persistent state on a self-hosted runner: `create` fails 'already "
+        "exists' on the second run, `use` repoints the runner's default "
+        "daemon for every later job, and buildx binds to whichever daemon is "
+        "current, so an active context would build the image on the deploy "
+        "host instead of the runner. Use step-scoped DOCKER_HOST instead",
     )
     check(
         any("--env-file" in ln for ln in script_lines),
@@ -388,6 +400,85 @@ def check_deploy_workflow() -> None:
             "runs and the step exits 0; a call that is NOT heredoc-fed must "
             "NOT pass -i, or it consumes the rest of the enclosing script",
         )
+
+    # DOCKER_HOST must be scoped to individual steps, never the job. A
+    # job-level DOCKER_HOST would also apply to the build step, and buildx
+    # binds to whichever daemon is current -- so the image would build on the
+    # deploy host instead of the runner.
+    job_level_docker_host = [
+        name for name, job in (doc.get("jobs") or {}).items()
+        if "DOCKER_HOST" in set(((job or {}).get("env")) or {})
+    ]
+    check(
+        not job_level_docker_host,
+        f"DOCKER_HOST must never be set at job level (found on job(s) "
+        f"{job_level_docker_host}) -- that would apply to the build step "
+        "too, and buildx binds to whichever daemon is current, so the image "
+        "would build on the deploy host instead of the runner",
+    )
+    step_level_docker_host = [
+        step.get("name") or (step.get("run") or "")[:40]
+        for job in (doc.get("jobs") or {}).values()
+        for step in (job or {}).get("steps") or []
+        if "DOCKER_HOST" in _step_env_keys(step)
+    ]
+    check(
+        bool(step_level_docker_host),
+        "DOCKER_HOST must appear as step-level `env:` on at least one step "
+        "-- the host-precondition, deploy and smoke-test steps need it to "
+        "reach the remote daemon over SSH",
+    )
+
+    # The build step must run against the runner's OWN daemon, never the
+    # deploy host's -- it must not inherit DOCKER_HOST from anywhere.
+    build_step = _step_with_uses_containing(doc, "docker/build-push-action")
+    check(
+        build_step is not None,
+        "no step uses docker/build-push-action -- build and deploy are "
+        "unified in this workflow now that trc-publish.yml is deleted, so "
+        "the image must be built here",
+    )
+    if build_step is not None:
+        check(
+            "DOCKER_HOST" not in _step_env_keys(build_step),
+            "the docker/build-push-action step must not have DOCKER_HOST in "
+            "its own `env:` -- buildx binds to whichever daemon DOCKER_HOST "
+            "points at, so this would build the image on the deploy host "
+            "instead of the runner",
+        )
+
+    keyscan_truncates = [
+        ln.strip() for ln in script_lines
+        if KEYSCAN_TRUNCATE_RE.search(ln) and "RUNNER_TEMP" not in ln
+    ]
+    check(
+        not keyscan_truncates,
+        f"{keyscan_truncates} redirects `ssh-keyscan` output onto "
+        "known_hosts with a bare `>`, which TRUNCATES the file -- "
+        "~/.ssh/known_hosts persists between jobs on a self-hosted runner, "
+        "so entries already there are not ours to delete. Scan into "
+        "$RUNNER_TEMP first, remove any stale entry for this host with "
+        "`ssh-keygen -R`, then append (`>>`)",
+    )
+
+    cleanup_step = None
+    for job in (doc.get("jobs") or {}).values():
+        for step in (job or {}).get("steps") or []:
+            if str((step or {}).get("if", "")).strip() != "always()":
+                continue
+            script = (step or {}).get("run") or ""
+            if "id_rsa" in script and ".env.staging" in script and "docker logout" in script:
+                cleanup_step = step
+                break
+        if cleanup_step is not None:
+            break
+    check(
+        cleanup_step is not None,
+        "an `if: always()` cleanup step must exist that removes id_rsa and "
+        ".env.staging and logs out of the registry (`docker logout`) -- the "
+        "runner is persistent, so every secret this workflow writes to disk "
+        "must be removed even when an earlier step fails",
+    )
 
 
 def report() -> int:
