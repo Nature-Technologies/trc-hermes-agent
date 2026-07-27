@@ -7,18 +7,27 @@ shared external `poc-net` bridge.
 
 The deploy runs `docker compose` **from the GitHub Actions runner**, against
 the host's Docker daemon over a remote Docker context
-(`docker context create ... --docker "host=ssh://${USERNAME}@${HOST}"`). It
-never opens an interactive SSH shell on the host to run compose commands.
-Two consequences of that:
+(`docker context create ... --docker "host=ssh://${USERNAME}@${HOST}:${SSH_PORT}"`).
+It never opens an interactive SSH shell on the host to run compose commands.
+Three consequences of that:
 
 - The rendered `.env.staging` file is read by the **local** Compose CLI via
   `--env-file` and is never copied to the server. Its values reach the
   containers as container environment, sent over the Docker API through the
   SSH tunnel — there is no plaintext secret file on the staging host.
+  `.env.staging` is the only file this workflow ever writes to disk on the
+  runner, and the final `Remove the deploy context` step deletes it (with
+  `if: always()`, so a failed run still cleans up).
 - Bind-mount sources (`config.yaml`) are resolved by the **remote** daemon, so
   that path must be absolute and must already exist on the server before
   `compose up` runs. The deploy still `scp`s `config.yaml` into place for this
   reason — it is the one file that genuinely has to reach the host.
+- `docker compose pull` sends the **runner's** registry credentials to the
+  remote daemon (`X-Registry-Auth`), not the host's — the staging host never
+  authenticates to GHCR itself. The workflow logs in to `ghcr.io` on the
+  runner with the built-in `GITHUB_TOKEN` before pulling; this is what
+  replaces the old host-side `docker login` + `GHCR_READ_TOKEN` secret, and it
+  works whether the package is public (as it is today) or private.
 
 ## Host prerequisites
 
@@ -87,14 +96,14 @@ input — is how you go back.
 | `SSH_PRIVATE_KEY_DEV` | Deploy user's private key |
 | `HOST` | Staging host, used both for `ssh-keyscan` and as the Docker context target (`ssh://${USERNAME}@${HOST}`) |
 | `USERNAME` | Deploy user on the host |
-| `TRC_SSH_PORT` | Optional, defaults to 22 |
+| `TRC_SSH_PORT` | Optional, defaults to 22. Threaded through all three consumers that need it: the `ssh-keyscan` that seeds `known_hosts`, the Docker context's `ssh://` target, and the plain `ssh`/`scp` calls -- a mismatch between the first two would scan the wrong endpoint and then dial a different one |
 | `OPENROUTER_API_KEY` | |
 | `HERMES_API_KEY` | **Shared value.** Must be identical to `trc-open-webui`'s copy and to Paperclip's third copy in its instance `config.json`. Must be ≥16 characters — below that the gateway refuses to start the API server, so the symptom is connection-refused on :8642, not a 401 |
 | `HERMES_DASHBOARD_BASIC_AUTH_USERNAME`, `HERMES_DASHBOARD_BASIC_AUTH_PASSWORD` | Without these the dashboard is unreachable |
 
 `TRC_SSH_KNOWN_HOSTS` no longer exists as a secret. Host keys are **scanned at
-deploy time** (`ssh-keyscan -H "$HOST" > ~/.ssh/known_hosts`) rather than
-pinned in advance:
+deploy time** (`ssh-keyscan -p "$SSH_PORT" -H "$HOST" > ~/.ssh/known_hosts`)
+rather than pinned in advance:
 
 - This still protects against a passive attacker who cannot intercept the very
   first connection of a run — `StrictHostKeyChecking` is never disabled, so if
@@ -134,11 +143,16 @@ workflow specifically it also asserts:
 - the deploy runs against a remote Docker context (`docker context create`),
   never a raw SSH shell — that is what keeps the rendered `.env.staging` off
   the server;
-- the context target comes from the `HOST` and `USERNAME` secrets, not a
-  literal hostname;
+- specifically the step that runs `docker context create` sources its `HOST`
+  and `USERNAME` from those secrets and actually references them in its
+  script — scoped to that one step, so hardcoding the host there while
+  `secrets.HOST` is merely referenced somewhere else in the file (e.g. the
+  host-key-scan step) does not pass;
 - Compose is invoked with `--env-file`, so secret values are never
   interpolated into a shell command string;
-- `compose pull` precedes `compose up -d`, so a deploy can never silently redeploy an image already on the host;
+- `compose pull` precedes `compose up -d` (same-line `pull && up -d` counts,
+  compared by position within the line), so a deploy can never silently
+  redeploy an image already on the host;
 - no `docker volume create` (see Host prerequisites) — Compose must fail
   closed on the missing external volume, not boot against a silently empty
   one.

@@ -16,6 +16,10 @@ on:
 
 permissions:
   contents: read
+  # Lets the runner authenticate to GHCR itself (see the "Log in to GHCR"
+  # step) -- packages are public today, but this makes a private package work
+  # too, with no new secret.
+  packages: read
 
 concurrency:
   group: trc-staging-deploy
@@ -44,6 +48,7 @@ jobs:
         env:
           SSH_PRIVATE_KEY_DEV: ${{ secrets.SSH_PRIVATE_KEY_DEV }}
           HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.TRC_SSH_PORT || '22' }}
         run: |
           set -eu
           # Never `set -x` in any step here: it would print secrets into the log.
@@ -58,7 +63,7 @@ jobs:
           # Trust-on-first-use: the host key is taken from the host at deploy
           # time rather than pinned. StrictHostKeyChecking stays ON, so a key
           # that changes mid-run still aborts.
-          ssh-keyscan -H "$HOST" > ~/.ssh/known_hosts 2>/dev/null
+          ssh-keyscan -p "$SSH_PORT" -H "$HOST" > ~/.ssh/known_hosts 2>/dev/null
           if [ ! -s ~/.ssh/known_hosts ]; then
             echo "::error::ssh-keyscan returned nothing for $HOST — host unreachable or SSH closed"
             exit 1
@@ -68,10 +73,14 @@ jobs:
         env:
           HOST: ${{ secrets.HOST }}
           USERNAME: ${{ secrets.USERNAME }}
+          SSH_PORT: ${{ secrets.TRC_SSH_PORT || '22' }}
         run: |
           set -eu
+          # SSH_PORT here must match the port ssh-keyscan used above, or
+          # known_hosts describes a different endpoint than the one this
+          # context actually dials.
           docker context create trc-staging \
-            --docker "host=ssh://${USERNAME}@${HOST}"
+            --docker "host=ssh://${USERNAME}@${HOST}:${SSH_PORT}"
           docker context use trc-staging
           # Proves the SSH transport and the remote daemon before anything else.
           docker version --format 'remote daemon {{.Server.Version}}'
@@ -168,6 +177,19 @@ jobs:
             "${USERNAME}@${HOST}:/srv/trc/staging/fingerprints/hermes-api-key"
           rm -f hermes.fpr
 
+      - name: Log in to GHCR
+        # Over a remote Docker context, `docker compose pull` sends THIS
+        # runner's registry credentials to the remote daemon (X-Registry-Auth)
+        # -- the staging host never needs, and never gets, any credential of
+        # its own. Logging in here, not on the host, is what replaces the old
+        # host-side `docker login` + GHCR_READ_TOKEN secret; it works whether
+        # the package is public or private.
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Pull and deploy
         run: |
           set -eu
@@ -176,24 +198,19 @@ jobs:
           docker compose --env-file .env.staging -f "$COMPOSE_FILE_PATH" up -d --remove-orphans
           # Record what actually landed, so a rollback has a named target. Read
           # from the IMAGE, not the container: a container's inspect output has
-          # no RepoDigests key at all.
-          img="$(docker inspect --format '{{.Image}}' hermes-agent)"
-          echo "deployed digest:"
-          docker image inspect "$img" \
-            --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{else}}(no digest){{end}}'
+          # no RepoDigests key at all. Guarded: a digest record is best-effort
+          # and must never fail an otherwise-successful deploy.
+          if img="$(docker inspect --format '{{.Image}}' hermes-agent 2>/dev/null)"; then
+            echo "deployed digest:"
+            docker image inspect "$img" \
+              --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{else}}(no digest){{end}}'
+          else
+            echo "could not inspect hermes-agent for a digest record (non-fatal)"
+          fi
 
       - name: Smoke test
-        env:
-          HERMES_API_KEY: ${{ secrets.HERMES_API_KEY }}
         run: |
           set -eu
-          # The bearer header goes to curl through a 0600 file rather than argv.
-          hdr="$(mktemp)"
-          trap 'rm -f "$hdr"' EXIT
-          printf 'Authorization: Bearer %s\n' "$HERMES_API_KEY" > "$hdr"
-
-          # curl runs INSIDE the container, so :8642 is reached over the compose
-          # network and no host port needs to be open to the runner.
           ok=0
           for _ in $(seq 1 30); do
             if docker exec -i hermes-agent python3 - <<'PY'
@@ -237,5 +254,8 @@ jobs:
         if: always()
         run: |
           set -eu
+          # .env.staging is the only secret this workflow ever writes to disk
+          # on the runner (never on the host). Clean it up even on failure.
+          rm -f .env.staging
           docker context use default || true
           docker context rm trc-staging || true
