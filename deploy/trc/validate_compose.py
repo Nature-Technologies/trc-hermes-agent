@@ -146,24 +146,60 @@ def check_compose_renders() -> None:
 WORKFLOW = HERE.parents[1] / ".github" / "workflows" / "trc-staging-deploy.yml"
 
 
-def _run_script_lines(doc: dict) -> list[str]:
-    """Every executable line of every `run:` block, full-line shell comments dropped.
+def _strip_inline_comment(line: str) -> str:
+    """Drop a trailing shell comment, respecting quotes.
 
     Assertions about script behaviour cannot match the raw file text: these
     scripts document the rules they follow, so a comment saying "never set -x"
     reads as a violation and a comment saying "serialize on flock" reads as
-    compliance. Only executable lines carry either meaning.
+    compliance. Only executable lines carry either meaning -- and that cuts
+    both ways. A "must not appear" check tripping on a comment is merely
+    noisy, but a "must appear" check being SATISFIED by a comment is unsafe:
+    a comment naming `docker logout` after the real line was deleted would
+    let the cleanup-step check stay green while the secret stays on the
+    runner.
+
+    A `#` inside single or double quotes is not a comment, so quote state is
+    tracked rather than cutting at the first `#`.
     """
+    in_single = in_double = False
+    for index, char in enumerate(line):
+        if char == "'" and not in_double:
+            in_single = not in_single
+        elif char == '"' and not in_single:
+            in_double = not in_double
+        elif char == "#" and not in_single and not in_double:
+            # Only a comment when it starts a word -- `foo#bar` is not one.
+            if index == 0 or line[index - 1].isspace():
+                return line[:index]
+    return line
+
+
+def _script_lines(script: str) -> list[str]:
+    """Every executable line of a single shell script, comments dropped.
+
+    Both full-line comments and inline trailing comments (see
+    _strip_inline_comment) are removed, so every substring-based assertion
+    built on this list sees executable text only.
+    """
+    lines: list[str] = []
+    for ln in script.splitlines():
+        if not ln.strip() or ln.lstrip().startswith("#"):
+            continue
+        stripped = _strip_inline_comment(ln)
+        if stripped.strip():
+            lines.append(stripped)
+    return lines
+
+
+def _run_script_lines(doc: dict) -> list[str]:
+    """Every executable line of every `run:` block in the workflow, comments dropped."""
     lines: list[str] = []
     for job in (doc.get("jobs") or {}).values():
         for step in ((job or {}).get("steps") or []):
             script = (step or {}).get("run")
-            if not script:
-                continue
-            lines += [
-                ln for ln in script.splitlines()
-                if ln.strip() and not ln.lstrip().startswith("#")
-            ]
+            if script:
+                lines += _script_lines(script)
     return lines
 
 
@@ -249,17 +285,18 @@ HEREDOC_RE = re.compile(r"<<-?\s*'?[A-Za-z_][A-Za-z0-9_]*'?\s*$")
 KEYSCAN_TRUNCATE_RE = re.compile(r"ssh-keyscan\b.*(?:>|\|\s*tee\b).*known_hosts")
 
 
-# A bare substring match cannot tell "writes the key there" from "mentions it in
-# a comment", and _run_script_lines only strips FULL-line comments. Requiring a
-# write indicator on the same line keeps the ban meaningful while letting the
-# cleanup step and inline comments name the path they are avoiding.
-ID_RSA_WRITE_INDICATORS = (">", "tee", "install", "cp ", "mv ")
-
-
 def _writes_default_ssh_key(line: str) -> bool:
-    if "~/.ssh/id_rsa" not in line:
-        return False
-    return any(token in line for token in ID_RSA_WRITE_INDICATORS)
+    """True when `line` names ~/.ssh/id_rsa, on already comment-stripped input.
+
+    A plain substring test is safe here because _run_script_lines strips
+    inline comments at the source (see _strip_inline_comment) -- a comment
+    merely naming the path can no longer reach this function. A round-2
+    write-indicator heuristic (requiring `>`, `tee`, `install`, etc. on the
+    same line) is no longer needed and is strictly weaker: the plain test
+    also catches write forms an indicator list would miss, e.g. `dd of=` or
+    a heredoc redirected there.
+    """
+    return "~/.ssh/id_rsa" in line
 
 
 def _docker_exec_is_interactive(line: str) -> bool:
@@ -348,10 +385,7 @@ def check_deploy_workflow() -> None:
             script = (step or {}).get("run") or ""
             if not script:
                 continue
-            step_lines = [
-                ln for ln in script.splitlines()
-                if ln.strip() and not ln.lstrip().startswith("#")
-            ]
+            step_lines = _script_lines(script)
             stack: list[bool] = []
             for ln in step_lines:
                 stripped = ln.strip()
@@ -540,13 +574,19 @@ def check_deploy_workflow() -> None:
         "per-job ssh-agent instead",
     )
 
+    # Matched against comment-stripped lines, not the raw step text: the raw
+    # text has no comment-stripping at all, so a comment merely NAMING
+    # id_rsa/.env.staging/docker logout (after the real line was deleted)
+    # would satisfy this "must appear" check and leave the validator green
+    # while the secret stays on the runner -- the false-pass shape a
+    # reviewer flagged as the dangerous one.
     cleanup_step = None
     for job in (doc.get("jobs") or {}).values():
         for step in (job or {}).get("steps") or []:
             if str((step or {}).get("if", "")).strip() != "always()":
                 continue
-            script = (step or {}).get("run") or ""
-            if "id_rsa" in script and ".env.staging" in script and "docker logout" in script:
+            step_text = "\n".join(_script_lines((step or {}).get("run") or ""))
+            if "id_rsa" in step_text and ".env.staging" in step_text and "docker logout" in step_text:
                 cleanup_step = step
                 break
         if cleanup_step is not None:
