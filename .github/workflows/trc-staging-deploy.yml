@@ -180,10 +180,13 @@ jobs:
       - name: Log in to GHCR
         # Over a remote Docker context, `docker compose pull` sends THIS
         # runner's registry credentials to the remote daemon (X-Registry-Auth)
-        # -- the staging host never needs, and never gets, any credential of
-        # its own. Logging in here, not on the host, is what replaces the old
-        # host-side `docker login` + GHCR_READ_TOKEN secret; it works whether
-        # the package is public or private.
+        # -- the staging host never STORES a credential of its own. Its daemon
+        # does receive the GITHUB_TOKEN (via X-Registry-Auth on pull, and via
+        # /auth when this `docker login` runs under the active remote context);
+        # it simply never persists it, and the token dies with the run.
+        # Logging in here, not on the host, is what replaces the old host-side
+        # `docker login` + GHCR_READ_TOKEN secret; it works whether the package
+        # is public or private.
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io

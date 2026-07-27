@@ -11,8 +11,13 @@ on:
   push:
     branches: [dev, chore/new-ci]
     paths-ignore:
+      # Top level only -- NEVER '**/*.md'. The Dockerfile does `COPY --link . .`
+      # and the bundled skills ARE Markdown (skills/**/SKILL.md, synced into
+      # $HERMES_HOME/skills on every boot), so '**/*.md' would skip a push that
+      # changes image content: nothing publishes, and the next deploy silently
+      # rolls the PREVIOUS :dev image while reporting success.
       - 'docs/**'
-      - '**/*.md'
+      - '*.md'
   workflow_dispatch:
 
 permissions:

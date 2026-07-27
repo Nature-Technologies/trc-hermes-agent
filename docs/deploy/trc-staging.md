@@ -24,10 +24,13 @@ Three consequences of that:
   reason — it is the one file that genuinely has to reach the host.
 - `docker compose pull` sends the **runner's** registry credentials to the
   remote daemon (`X-Registry-Auth`), not the host's — the staging host never
-  authenticates to GHCR itself. The workflow logs in to `ghcr.io` on the
-  runner with the built-in `GITHUB_TOKEN` before pulling; this is what
-  replaces the old host-side `docker login` + `GHCR_READ_TOKEN` secret, and it
-  works whether the package is public (as it is today) or private.
+  **stores** a credential of its own. Its daemon does receive the
+  `GITHUB_TOKEN` (on pull, and via `/auth` when `docker login` runs under the
+  active remote context), but never persists it; the token dies with the run.
+  The workflow logs in to `ghcr.io` on the runner with the built-in
+  `GITHUB_TOKEN` before pulling; this is what replaces the old host-side
+  `docker login` + `GHCR_READ_TOKEN` secret, and it works whether the package
+  is public (as it is today) or private.
 
 ## Host prerequisites
 
@@ -82,21 +85,47 @@ workflow needs to change.
 1. Actions → **TRC staging deploy (hermes-agent)** → Run workflow.
 2. The workflow pulls `${IMAGE_REPO}:${IMAGE_TAG}` and deploys it.
 
-**There is no digest input.** To roll back, point `IMAGE_TAG` at a
-`sha-<short-sha>` tag for the build you want (visible in the `trc-publish.yml`
-run history or in the GHCR package's tag list) and re-run the deploy workflow.
+### Rolling back
+
+**There is no digest input.** Rolling back means pointing `IMAGE_TAG` at the
+`sha-<short-sha>` tag of the build you want (visible in the `trc-publish.yml`
+run history or in the GHCR package's tag list). Those immutable `sha-` tags
+exist precisely to make this possible — `:dev` moves, so it cannot name a
+previous build.
+
+`IMAGE_TAG` is workflow-level `env`, not a dispatch input, so changing it
+requires a **commit**. Do **not** make that commit on `dev`:
+
+> Pushing an `IMAGE_TAG` change to `dev` re-triggers `trc-publish.yml`, which
+> takes 45–60 minutes and **republishes `:dev` from the same source** — you
+> would rebuild the very image you are trying to roll away from, and overwrite
+> the tag in the process.
+
+Instead, dispatch the deploy from a throwaway branch:
+
+1. Branch off the current `dev` (name it anything that is not `dev`, e.g.
+   `rollback/2026-07-27`).
+2. Edit the one line — `IMAGE_TAG: sha-<short-sha>` — commit, and push the
+   branch. No publish is triggered, because `trc-publish.yml` only fires on
+   `dev` and `chore/new-ci`.
+3. Actions → **TRC staging deploy (hermes-agent)** → Run workflow, and select
+   **that branch** as the workflow ref (the "Use workflow from" selector). The
+   deploy is `workflow_dispatch`-only, so it runs the workflow definition from
+   whichever ref you pick, including its `IMAGE_TAG`.
+4. Delete the branch once you are done. To roll forward again, dispatch the
+   deploy from `dev` as normal.
+
 The `Pull and deploy` step still prints the digest that actually landed, so
-every run log records what is now running, but a re-dispatch — not a digest
-input — is how you go back.
+every run log records what is now running.
 
 ## Required repository secrets (environment: `Staging`)
 
 | Secret | Notes |
 |---|---|
 | `SSH_PRIVATE_KEY_DEV` | Deploy user's private key |
-| `HOST` | Staging host, used both for `ssh-keyscan` and as the Docker context target (`ssh://${USERNAME}@${HOST}`) |
+| `HOST` | Staging host, used both for `ssh-keyscan` and as the Docker context target (`ssh://${USERNAME}@${HOST}:${SSH_PORT}`) |
 | `USERNAME` | Deploy user on the host |
-| `TRC_SSH_PORT` | Optional, defaults to 22. Threaded through all three consumers that need it: the `ssh-keyscan` that seeds `known_hosts`, the Docker context's `ssh://` target, and the plain `ssh`/`scp` calls -- a mismatch between the first two would scan the wrong endpoint and then dial a different one |
+| `TRC_SSH_PORT` | Optional, defaults to 22. Threaded through all three consumers that need it: the `ssh-keyscan` that seeds `known_hosts`, the Docker context's `ssh://${USERNAME}@${HOST}:${SSH_PORT}` target, and the plain `ssh`/`scp` calls -- a mismatch between the first two would scan the wrong endpoint and then dial a different one |
 | `OPENROUTER_API_KEY` | |
 | `HERMES_API_KEY` | **Shared value.** Must be identical to `trc-open-webui`'s copy and to Paperclip's third copy in its instance `config.json`. Must be ≥16 characters — below that the gateway refuses to start the API server, so the symptom is connection-refused on :8642, not a 401 |
 | `HERMES_DASHBOARD_BASIC_AUTH_USERNAME`, `HERMES_DASHBOARD_BASIC_AUTH_PASSWORD` | Without these the dashboard is unreachable |
