@@ -334,13 +334,3 @@ jobs:
               print(f"could NOT reach app:8000/mcp over trc-shared: {exc}")
               sys.exit(1)
           PY
-
-      - name: Clean up secrets on the runner
-        # Removes the staging server's private key and the plaintext API keys
-        # from a runner shared with sibling repos' deploys. always(), because a
-        # failed deploy leaves the same files behind.
-        if: always()
-        run: |
-          set -eu
-          rm -f "$RUNNER_TEMP/id_rsa" .env.staging hermes.fpr
-          ssh-agent -k >/dev/null 2>&1 || true
