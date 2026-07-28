@@ -104,10 +104,17 @@ jobs:
     if: needs.detect.outputs.event_name == 'pull_request'
     uses: ./.github/workflows/history-check.yml
 
+  # Upstream-only governance gate. It enforces NousResearch's contributor
+  # attribution registry (contributors/emails/ + AUTHOR_MAP in
+  # scripts/release.py), which feeds upstream release notes. TRC commits are
+  # authored from @inworkglobal.com / @natureglobal.com addresses that will
+  # never be in that registry, so the gate fails on every TRC PR that touches
+  # Python — and classify_changes.py forces python=true for any .github/ change.
+  # Skipped here; all-checks-pass counts "skipped" as passing.
   contributor-check:
     name: Check contributors
     needs: detect
-    if: needs.detect.outputs.python == 'true'
+    if: github.repository == 'NousResearch/hermes-agent' && needs.detect.outputs.python == 'true'
     uses: ./.github/workflows/contributor-check.yml
 
   uv-lockfile:
@@ -146,10 +153,15 @@ jobs:
       scan: ${{ needs.detect.outputs.scan == 'true' }}
       deps: ${{ needs.detect.outputs.deps == 'true' }}
 
+  # Upstream-only governance gate. It requires a maintainer to hand-apply the
+  # `ci-reviewed` label whenever CI-sensitive files change. classify_changes.py
+  # forces ci_review=true for any .github/ change, so every TRC deploy-workflow
+  # PR demands a label that nobody in this fork applies.
+  # Skipped here; all-checks-pass counts "skipped" as passing.
   review-labels:
     name: Review label gate
     needs: [detect, supply-chain]
-    if: always() && needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.ci_review == 'true' || needs.detect.outputs.mcp_catalog == 'true' || needs.supply-chain.outputs.critical_findings == 'true')
+    if: always() && github.repository == 'NousResearch/hermes-agent' && needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.ci_review == 'true' || needs.detect.outputs.mcp_catalog == 'true' || needs.supply-chain.outputs.critical_findings == 'true')
     uses: ./.github/workflows/review-labels.yml
     with:
       ci_review: ${{ needs.detect.outputs.ci_review == 'true' }}

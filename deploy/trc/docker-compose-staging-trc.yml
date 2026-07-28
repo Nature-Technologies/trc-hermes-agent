@@ -25,6 +25,16 @@ volumes:
 services:
   hermes-agent:
     image: ${HERMES_IMAGE:?HERMES_IMAGE must be set}
+    # The deploy builds this image directly into THIS host's image store and
+    # pushes it nowhere -- see .github/workflows/trc-staging-deploy.yml. So a
+    # missing image is a broken deploy, and must fail closed and say so.
+    #
+    # Without this, Compose's default (`missing`) would reach out to the
+    # registry named in the tag. That either fails confusingly, or -- for a
+    # commit that was deployed under the older push-based scheme -- SUCCEEDS
+    # against a stale image still sitting in GHCR and silently starts code
+    # that is not what this run built.
+    pull_policy: never
     # Load-bearing: open-webui reaches this service at
     # http://hermes-agent:8642 from a *different* compose project, which
     # resolves by container name over poc-net. Renaming this breaks chat with
