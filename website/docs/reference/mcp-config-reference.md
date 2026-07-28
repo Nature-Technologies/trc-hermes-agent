@@ -60,8 +60,9 @@ mcp_servers:
 | `skip_preflight` | bool | HTTP | Bypass the fail-fast content-type probe for valid Streamable HTTP endpoints whose HEAD/GET answers a non-MCP content type (default: `false`) |
 | `tools` | mapping | both | Filtering and utility-tool policy |
 | `auth` | string | HTTP | Authentication method. Set to `oauth` to enable OAuth 2.1 with PKCE |
-| `forward_user_identity` | bool | Streamable HTTP | Forward the calling end user's identity token on every tool call (default: `false`). See [Forwarding end-user identity](#forwarding-end-user-identity) |
+| `forward_user_identity` | bool | Streamable HTTP | Forward the calling end user's identity token *and* the conversation id it arrived under, on every tool call (default: `false`). See [Forwarding end-user identity](#forwarding-end-user-identity) |
 | `user_identity_header` | string | Streamable HTTP | Outbound header name for the forwarded identity (default: `X-Hermes-End-User-Jwt`) |
+| `session_id_header` | string | Streamable HTTP | Outbound header name for the forwarded conversation id (default: `X-Hermes-Session-Id`) |
 | `sampling` | mapping | both | Server-initiated LLM request policy (see MCP guide) |
 
 ## `tools` policy keys
@@ -238,10 +239,17 @@ Notes:
 
 ## Forwarding end-user identity
 
-A single Hermes process serves many end users. An MCP server that enforces
-per-user permissions therefore needs to know which *end user* a tool call is
-being made for — not just that Hermes made it. `forward_user_identity` attaches
-the caller's identity token to every outbound tool call on that server.
+A single Hermes process serves many end users, each in many conversations. An
+MCP server that enforces per-user permissions therefore needs to know which
+*end user* a tool call is being made for — not just that Hermes made it — and,
+where it keeps per-conversation state, which conversation. `forward_user_identity`
+attaches both the caller's identity token and their conversation id to every
+outbound tool call on that server.
+
+One switch covers both on purpose. A server told who is calling but not from
+where cannot rebuild a key like `<user_id>:<chat_id>`, and the resulting
+mismatch is silent — the tool call succeeds and returns subtly wrong state. A
+second flag would make that broken configuration reachable.
 
 ```yaml
 mcp_servers:
@@ -276,17 +284,23 @@ is set: an HS256 JWT whose `sub` claim is the user id, plus `email`, `name`,
 `role`, `iss: "open-webui"`, `iat`, and `exp` (default lifetime 300s). Override
 the header name with the `HERMES_END_USER_JWT_HEADER` environment variable.
 
-**Outbound.** Hermes attaches the token verbatim to each `tools/call` request:
+The conversation id arrives the same way, on `X-OpenWebUI-Chat-Id` — Open WebUI
+sends it under the same `ENABLE_FORWARD_USER_INFO_HEADERS=true` switch. Override
+the header name with `HERMES_END_USER_CHAT_ID_HEADER`.
+
+**Outbound.** Hermes attaches both values verbatim to each `tools/call` request:
 
 ```http
 POST /mcp HTTP/1.1
 Authorization: Bearer <service credential from `headers`>
 X-Hermes-End-User-Jwt: eyJhbGciOiJIUzI1NiJ9...
+X-Hermes-Session-Id: 0f7c1a2e-9b3d-4c5f-8a1b-2d3e4f5a6b7c
 MCP-Protocol-Version: 2025-11-25
 ```
 
-The value is the raw token — no `Bearer` prefix. Rename the header with
-`user_identity_header` if the server expects something else.
+The identity value is the raw token — no `Bearer` prefix. Rename either header
+with `user_identity_header` / `session_id_header` if the server expects
+something else.
 
 `Authorization` is deliberately *not* used: it carries the MCP server's own
 service credential (from `headers`, or from OAuth 2.1 PKCE) and has
@@ -296,17 +310,20 @@ calling for.
 
 ### Guarantees
 
-- **Per-request.** The token attached to a tool call is the one from the request
-  that triggered it. It is read from a request-scoped context and armed for the
-  duration of a single `tools/call`, so concurrent users cannot observe each
-  other's tokens.
-- **No fallback.** When no identity header arrives, no identity header is sent.
-  A missing identity never resolves to a default or to another user's token.
-- **Opt-in per server.** Servers without `forward_user_identity: true` never
-  receive the token. The token is a live signed credential; this keeps it from
+- **Per-request.** The values attached to a tool call are the ones from the
+  request that triggered it. They are read from a request-scoped context and
+  armed together for the duration of a single `tools/call`, so concurrent users
+  cannot observe each other's tokens or conversations.
+- **No fallback.** When no header arrives, none is sent. A missing identity
+  never resolves to a default or to another user's token, and a missing
+  conversation id never resolves to Hermes' own session id.
+- **Opt-in per server.** Servers without `forward_user_identity: true` receive
+  neither value. The token is a live signed credential; this keeps it from
   reaching third-party MCP servers that have no business seeing it.
 - **Forward only.** Hermes never mints, re-signs, or synthesizes an identity, and
   never derives one from session state. It forwards what arrived, or nothing.
+  The same holds for the conversation id: Hermes' internal `HERMES_SESSION_CHAT_ID`
+  is a different value with a different meaning and is never substituted for it.
 - **Not verified by Hermes.** Signature verification belongs to the MCP server,
   which checks it against the shared secret and takes `sub` as the caller. Hermes
   only validates that the value is well-formed enough to sit in an HTTP header

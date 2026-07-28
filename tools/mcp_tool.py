@@ -39,16 +39,25 @@ Example config::
           Authorization: "Bearer sk-..."
         timeout: 180
         forward_user_identity: true   # attach the calling END USER's identity
-                              # token (from the inbound request) to every tool
+                              # token AND the conversation id it arrived under
+                              # (both from the inbound request) to every tool
                               # call, so a server enforcing per-user
-                              # permissions knows who it is acting for.
+                              # permissions knows who it is acting for and in
+                              # which conversation.
                               # Opt-in per server: the token is a live signed
                               # credential and must not reach servers with no
                               # business seeing it. Streamable HTTP only.
                               # Default: false.
         user_identity_header: "X-Hermes-End-User-Jwt"  # outbound header name
-                              # for the above (default shown). The value is the
-                              # token verbatim — Hermes forwards, never mints.
+                              # for the identity (default shown). The value is
+                              # the token verbatim — Hermes forwards, never
+                              # mints.
+        session_id_header: "X-Hermes-Session-Id"  # outbound header name for
+                              # the conversation id (default shown). Same
+                              # opt-in as above: one switch, because a server
+                              # given the caller but not their conversation is
+                              # the silent-mismatch case this pairing exists
+                              # to prevent.
         skip_preflight: true  # bypass the content-type probe for a valid
                               # Streamable HTTP endpoint that answers HEAD/GET
                               # with a non-MCP content type but serves real
@@ -82,10 +91,11 @@ Features:
       sampling/createMessage (text and tool-use responses)
     - Parallel tool call opt-in: per-server ``supports_parallel_tool_calls``
       flag allows concurrent execution of tools from the same server
-    - Per-request end-user identity forwarding: opt-in ``forward_user_identity``
-      attaches the inbound request's end-user token to each outbound tool call
-      (see ``_make_end_user_identity_hook``), so one shared Hermes process can
-      serve many users against a permission-enforcing MCP server
+    - Per-request caller-context forwarding: opt-in ``forward_user_identity``
+      attaches the inbound request's end-user token AND conversation id to each
+      outbound tool call (see ``_make_end_user_identity_hook``), so one shared
+      Hermes process can serve many users, in many concurrent conversations,
+      against a permission-enforcing MCP server
 
 Architecture:
     A dedicated background event loop (_mcp_loop) runs in a daemon thread.
@@ -355,6 +365,18 @@ _DEFAULT_CONNECT_TIMEOUT = 60    # seconds for initial connection per server
 # cross-origin redirect stripping attached, so service identity and end-user
 # identity stay two independent layers the server can verify separately.
 _DEFAULT_USER_IDENTITY_HEADER = "X-Hermes-End-User-Jwt"
+
+# Outbound header carrying the forwarded per-request conversation id, sent
+# alongside the identity above under the SAME ``forward_user_identity`` opt-in
+# (override the name with ``session_id_header``).
+#
+# One opt-in for both, deliberately.  A server told who the caller is but not
+# which conversation they are in is the failure mode this exists to prevent:
+# RAGnarok keys its PII-masking token namespace by ``<user_id>:<chat_id>`` at
+# two independent mask points, so a missing chat id makes the two ends key
+# differently and placeholders silently stop round-tripping.  A separate flag
+# would make that broken state configurable.
+_DEFAULT_SESSION_ID_HEADER = "X-Hermes-Session-Id"
 _MAX_RECONNECT_RETRIES = 5
 _MAX_INITIAL_CONNECT_RETRIES = 3 # retries for the very first connection attempt
 _MAX_BACKOFF_SECONDS = 60
@@ -1855,6 +1877,7 @@ class MCPServerTask:
         "_rpc_lock", "_pending_refresh_tasks",
         "_pending_call_context",
         "_forward_user_identity", "_user_identity_header", "_end_user_identity",
+        "_session_id_header", "_end_user_chat_id",
         "_lifecycle_started_at", "_last_tool_call_at",
         "_idle_timeout_seconds", "_max_lifetime_seconds", "_recycled_reason",
         "initialize_result", "_ping_unsupported",
@@ -1922,6 +1945,11 @@ class MCPServerTask:
         self._forward_user_identity: bool = False
         self._user_identity_header: str = _DEFAULT_USER_IDENTITY_HEADER
         self._end_user_identity: Optional[str] = None
+        # The conversation id rides the same opt-in, the same arming window and
+        # the same hook as the identity above — see ``_DEFAULT_SESSION_ID_HEADER``
+        # for why they are one switch and not two.
+        self._session_id_header: str = _DEFAULT_SESSION_ID_HEADER
+        self._end_user_chat_id: Optional[str] = None
         now = time.monotonic()
         self._lifecycle_started_at: float = now
         self._last_tool_call_at: float = now
@@ -2791,6 +2819,9 @@ class MCPServerTask:
         self._user_identity_header = str(
             config.get("user_identity_header") or _DEFAULT_USER_IDENTITY_HEADER
         )
+        self._session_id_header = str(
+            config.get("session_id_header") or _DEFAULT_SESSION_ID_HEADER
+        )
 
         # OAuth 2.1 PKCE: route through the central MCPOAuthManager so the
         # same provider instance is reused across reconnects, pre-flow
@@ -2945,12 +2976,15 @@ class MCPServerTask:
                 "event_hooks": {"response": [_strip_auth_on_cross_origin_redirect]},
             }
             if forward_user_identity:
-                # Per-POST injection point for the caller's identity. Enabled
-                # only here because this is the one path where Hermes owns the
-                # httpx client (mcp >= 1.24.0) and can therefore hook requests.
+                # Per-POST injection point for the caller's identity and the
+                # conversation it arrived under. Enabled only here because this
+                # is the one path where Hermes owns the httpx client
+                # (mcp >= 1.24.0) and can therefore hook requests.
                 self._forward_user_identity = True
                 client_kwargs["event_hooks"]["request"] = [
-                    _make_end_user_identity_hook(self, self._user_identity_header)
+                    _make_end_user_identity_hook(
+                        self, self._user_identity_header, self._session_id_header,
+                    )
                 ]
             if headers:
                 client_kwargs["headers"] = headers
@@ -4276,8 +4310,16 @@ def _filter_mcp_children(pids: set) -> set:
     return filtered
 
 
-def _make_end_user_identity_hook(server: Any, header_name: str):
-    """Return an httpx ``request`` hook that stamps the armed end-user identity.
+def _make_end_user_identity_hook(
+    server: Any, header_name: str, session_header_name: Optional[str] = None,
+):
+    """Return an httpx ``request`` hook that stamps the armed caller context.
+
+    Two values: the end-user identity on *header_name*, and the conversation id
+    it arrived under on *session_header_name*. Both are armed and cleared
+    together by :func:`_make_tool_handler`, so a POST carries either both or
+    neither — never a caller without their conversation, which is the shape
+    that silently breaks a namespace keyed on the pair.
 
     Why a hook rather than a header on the client: the streamable-HTTP transport
     opens ONE long-lived ``httpx.AsyncClient`` per configured server at startup
@@ -4301,6 +4343,13 @@ def _make_end_user_identity_hook(server: Any, header_name: str):
             request.headers[header_name] = token
         else:
             request.headers.pop(header_name, None)
+
+        if session_header_name:
+            chat_id = getattr(server, "_end_user_chat_id", None)
+            if chat_id:
+                request.headers[session_header_name] = chat_id
+            else:
+                request.headers.pop(session_header_name, None)
 
     return _stamp_end_user_identity
 
@@ -4657,6 +4706,29 @@ def _resolve_end_user_identity(server: Any) -> Optional[str]:
         return None
 
 
+def _resolve_end_user_chat_id(server: Any) -> Optional[str]:
+    """The current request's conversation id, if *server* opted in to it.
+
+    Gated on the same ``forward_user_identity`` flag as the identity — see
+    ``_DEFAULT_SESSION_ID_HEADER`` for why one switch covers both.
+
+    Fail-safe in the same way: any problem reading it yields ``None``, which
+    makes the call behave exactly as it did before this feature existed. It
+    must never fall back to Hermes' own session id, which the frontend has
+    never seen and which would key the MCP server's namespace to a
+    conversation that does not exist.
+    """
+    if not getattr(server, "_forward_user_identity", False):
+        return None
+    try:
+        from gateway.session_context import get_end_user_chat_id
+
+        return get_end_user_chat_id()
+    except Exception:
+        logger.debug("Could not resolve end-user chat id", exc_info=True)
+        return None
+
+
 def _mark_server_call_started(server: Any) -> None:
     """Record a user-visible MCP operation when the server supports it."""
     mark_tool_call = getattr(server, "mark_tool_call", None)
@@ -4749,6 +4821,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         # cannot be armed at all — a user's signed identity is a live credential
         # and must not reach MCP servers with no business seeing it.
         end_user_identity = _resolve_end_user_identity(server)
+        # Captured on the same thread, in the same breath, for the same reason.
+        # The MCP server pairs the two into one namespace key, so they must not
+        # be read at different points where one could be bound and the other not.
+        end_user_chat_id = _resolve_end_user_chat_id(server)
 
         async def _call():
             _mark_server_call_started(server)
@@ -4758,15 +4834,19 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # task, which doesn't inherit our contextvars) can replay
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
-                # Arm the identity for exactly this round trip. _rpc_lock is
-                # held across it, so the outbound POST that the request hook
-                # stamps is unambiguously this call's — and the finally below
-                # guarantees nothing stays armed for the next caller.
+                # Arm the identity and conversation id for exactly this round
+                # trip. _rpc_lock is held across it, so the outbound POST that
+                # the request hook stamps is unambiguously this call's — and the
+                # finally below guarantees nothing stays armed for the next
+                # caller. Both are cleared even if only one was set, so a later
+                # call can never inherit half a caller's context.
                 server._end_user_identity = end_user_identity
+                server._end_user_chat_id = end_user_chat_id
                 try:
                     result = await server.session.call_tool(tool_name, arguments=args)
                 finally:
                     server._end_user_identity = None
+                    server._end_user_chat_id = None
                     server._pending_call_context = None
             # The RPC round-trip completed — the session is demonstrably
             # healthy at the transport level (even if the tool itself

@@ -109,6 +109,27 @@ _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNS
 # no fallback.  Missing identity must never resolve to somebody else's token.
 _END_USER_IDENTITY: ContextVar = ContextVar("HERMES_END_USER_IDENTITY", default=None)
 
+# Opaque conversation id that arrived on THIS request from the frontend (Open
+# WebUI's ``X-OpenWebUI-Chat-Id``: the id of the chat the user is typing in).
+# Forwarded verbatim onto outbound MCP tool calls beside the identity above.
+#
+# Not telemetry.  RAGnarok masks PII at two points — the Open WebUI filter and
+# its own RAG pipeline — and both allocate placeholder tokens from ONE namespace
+# keyed ``<user_id>:<chat_id>``.  Drop the chat id and the two ends key
+# differently, so ``<PERSON_1>`` denotes a different person at each end and the
+# user is shown raw placeholder tokens instead of real values.  The reasoning
+# model cannot be asked to carry it instead: it invents ids when told to pass
+# one, and a wrong namespace fails silently.
+#
+# Distinct from ``_SESSION_CHAT_ID``, which the API server binds to HERMES' own
+# gateway session id — a value the frontend has never seen.  Forwarding that one
+# would be the same mismatch wearing a more convincing id.
+#
+# Same two rules as the identity: NOT in ``_VAR_MAP`` (an ``os.environ``
+# fallback in a shared process is a cross-conversation leak), and ``None`` means
+# "nothing arrived" with no default.
+_END_USER_CHAT_ID: ContextVar = ContextVar("HERMES_END_USER_CHAT_ID", default=None)
+
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
 #
@@ -176,6 +197,30 @@ def get_end_user_identity() -> Optional[str]:
 def reset_end_user_identity(token) -> None:
     """Restore the previous identity binding (token from :func:`set_end_user_identity`)."""
     _END_USER_IDENTITY.reset(token)
+
+
+def set_end_user_chat_id(chat_id: Optional[str]):
+    """Bind the frontend conversation id that arrived on this request.
+
+    Returns a reset token; pass it to :func:`reset_end_user_chat_id` in a
+    ``finally`` block so the binding cannot outlive the request.  Blank input
+    binds ``None`` — an empty chat id is no chat id, and must not be
+    distinguishable downstream from "nothing arrived".
+    """
+    return _END_USER_CHAT_ID.set((chat_id or "").strip() or None)
+
+
+def get_end_user_chat_id() -> Optional[str]:
+    """The frontend conversation id for the current request, or ``None``.
+
+    No ``os.environ`` fallback by design — see ``_END_USER_CHAT_ID``.
+    """
+    return _END_USER_CHAT_ID.get()
+
+
+def reset_end_user_chat_id(token) -> None:
+    """Restore the previous binding (token from :func:`set_end_user_chat_id`)."""
+    _END_USER_CHAT_ID.reset(token)
 
 
 def set_current_session_id(session_id: str) -> None:
