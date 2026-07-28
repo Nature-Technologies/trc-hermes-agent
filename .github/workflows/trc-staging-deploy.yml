@@ -1,52 +1,32 @@
 name: TRC staging deploy (hermes-agent)
 run-name: Deploy hermes-agent to Dev/Test Server
 
-# Additive and TRC-only. Builds AND deploys in one run -- trc-publish.yml is
-# gone, so the tag this deploy pulls always exists by the time it pulls it.
+# Builds AND deploys in one run.
 #
-# Runs on a SELF-HOSTED runner: the staging host is internal and unreachable
-# from a GitHub-hosted runner. The image is built locally on the runner (no
-# DOCKER_HOST in that step's env), pushed to GHCR, and only THEN does
-# `docker compose` talk to the staging host's daemon, over
-# `DOCKER_HOST=ssh://...` set as env: on the individual steps that need it.
+# The BUILD RUNS ON THE DEPLOY HOST, via the job-level DOCKER_HOST below --
+# same arrangement as trc-backend's deploy. buildx's default container driver
+# starts with an empty cache every dispatch, which made every deploy a cold
+# 15-45 min build; the host's daemon holds the only layer cache that persists.
+# Only the source context crosses the network, never an image.
 #
-# Never `docker context create`/`use` here. A context is persistent state on
-# a self-hosted runner: `create` fails "already exists" on the second run,
-# `use` repoints the runner's DEFAULT daemon for every later job on this
-# machine, and buildx binds to whichever daemon is current -- so an active
-# context would silently build the image on the deploy host instead of the
-# runner. Step-scoped DOCKER_HOST cannot leak into the build step that way.
+# There is no registry: `push: false` puts the image straight into the deploy
+# host's image store, which is the daemon `docker compose up -d` talks to. The
+# compose service sets `pull_policy: never` so a missing image fails closed
+# instead of silently starting a stale tag left in GHCR by the old scheme.
 #
-# Consequences worth knowing:
-#   - the rendered .env.staging is read by the LOCAL compose CLI and never
-#     lands on the server; values reach the containers as environment, not
-#     as a file on disk
-#   - bind-mount sources are resolved by the REMOTE daemon, so every bind
-#     path must be absolute and must already exist on the server
-#   - this runner is PERSISTENT and SHARED with sibling repos' deploys
-#     (trc-open-webui, paperclip), which can run concurrently on the same
-#     $HOME. THREE files in that $HOME would otherwise be shared; two of
-#     them are isolated structurally here:
-#       * the private key -- loaded into a per-job ssh-agent from a file
-#         under $RUNNER_TEMP, never ~/.ssh/id_rsa, so one job's cleanup can
-#         never delete the key a sibling job is mid-deploy with
-#       * ~/.docker/config.json -- the job-level DOCKER_CONFIG below points
-#         every docker/compose/buildx call at a per-job directory instead.
-#         Without it, this job's cleanup `docker logout ghcr.io` would strip
-#         the GHCR credential out from under a sibling repo's concurrent
-#         `docker compose pull`, and buildx state would be shared too
-#       * ~/.ssh/known_hosts -- still genuinely shared (see
-#         docs/deploy/trc-staging.md). Left shared deliberately: the merge
-#         below is non-destructive so the worst case is a redundant rescan,
-#         and it is handled by documenting a one-job-at-a-time /
-#         separate-users requirement rather than structurally
-#     Every secret this workflow writes to disk (the key, .env.staging, the
-#     fingerprint temp file, the per-job docker config) is removed and the
-#     agent killed in the final cleanup step, which runs even when an
-#     earlier step fails.
-#   - the deploy pulls the IMMUTABLE `:git-<7-char-sha>` tag this run built,
-#     not the moving `:staging` pointer -- see the "Render the environment
-#     file" step
+# ROLLBACK IS HOST-LOCAL. `:git-<7-char-sha>` tags exist only in that host's
+# image store -- a `docker image prune -a` or a host rebuild destroys every
+# rollback target. See docs/deploy/trc-staging.md before pruning there.
+#
+# Never `docker context create`/`use` here: this runner is shared with sibling
+# repos (trc-open-webui, paperclip) and `use` would repoint the default daemon
+# for their jobs too. The job-level DOCKER_HOST is scoped to this job.
+#
+# Other consequences worth knowing:
+#   - .env.staging is read by the LOCAL compose CLI and never lands on the
+#     server; values reach the containers as environment, not as a file
+#   - bind-mount sources resolve on the REMOTE daemon, so every bind path must
+#     be absolute and must already exist on the server
 
 on:
   workflow_dispatch:
@@ -61,7 +41,6 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: deploy-staging
@@ -76,42 +55,17 @@ jobs:
   deploy:
     name: Build and deploy hermes-agent to staging
     if: github.repository == 'Nature-Technologies/trc-hermes-agent'
-    # Labelled, not bare `self-hosted`, so a non-Linux runner registered
-    # later on this label set cannot pick up a job that needs docker/buildx
-    # and an OpenSSH client.
     runs-on: self-hosted
     environment: staging
     timeout-minutes: 45
-    # Per-job Docker config directory, so nothing this job does to the GHCR
-    # credential can reach a sibling repo's concurrent deploy on the same
-    # $HOME -- and vice versa. docker, docker compose, docker buildx and
-    # docker/login-action all honour DOCKER_CONFIG, so this one variable
-    # isolates both the credential store and buildx's own state.
-    #
-    # Job level is correct and is NOT the hazard a job-level DOCKER_HOST
-    # would be: DOCKER_CONFIG only says WHERE credentials live, never WHICH
-    # daemon to talk to, so it cannot redirect the build step off the runner.
-    #
-    # The path is built from `github.workspace` rather than the more obvious
-    # `runner.temp`, because the `runner` context is NOT available in
-    # `jobs.<job_id>.env` -- GitHub rejects the whole workflow with
-    # "Unrecognized named-value: 'runner'". `github.workspace` is available
-    # there, and its PARENT is used on purpose: the directory must stay
-    # OUTSIDE the `context: .` build context, or buildx would upload the GHCR
-    # credential into the image build.
     env:
-      DOCKER_CONFIG: ${{ github.workspace }}/../.trc-docker-config-${{ github.run_id }}
+      # Job-wide on purpose: the BUILD runs on the deploy server, not just the
+      # deploy. Every docker command below therefore talks to that daemon over
+      # SSH -- which is why the SSH key step must come first.
+      DOCKER_HOST: ssh://${{ secrets.USERNAME }}@${{ secrets.HOST }}:${{ secrets.SSH_PORT || '22' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Create the per-job Docker config directory
-        run: |
-          set -eu
-          # Must exist before `docker login` writes into it. 700 because it is
-          # about to hold a registry credential.
-          install -m 700 -d "$DOCKER_CONFIG"
-          echo "DOCKER_CONFIG=$DOCKER_CONFIG"
 
       - name: Write SSH key and scan the host key
         env:
@@ -121,24 +75,14 @@ jobs:
         run: |
           set -eu
           # Never `set -x` in any step here: it would print secrets into the log.
-          if [ -z "$SSH_PRIVATE_KEY_DEV" ]; then
-            echo "::error::SSH_PRIVATE_KEY_DEV is empty"; exit 1
-          fi
-          if [ -z "$HOST" ]; then
-            echo "::error::HOST is empty"; exit 1
-          fi
+          [ -n "$SSH_PRIVATE_KEY_DEV" ] || { echo "::error::SSH_PRIVATE_KEY_DEV is empty"; exit 1; }
+          [ -n "$HOST" ] || { echo "::error::HOST is empty"; exit 1; }
 
-          # The key lives ONLY under $RUNNER_TEMP -- never ~/.ssh/id_rsa --
-          # and is loaded into a per-job ssh-agent. This runner is
-          # PERSISTENT and shared with sibling repos' deploys, which can run
-          # concurrently on the same $HOME: a shared ~/.ssh/id_rsa would let
-          # one job's cleanup delete the key a sibling job is mid-deploy
-          # with. The agent's socket is exported via $GITHUB_ENV so every
-          # later step in THIS job inherits it, which authenticates both the
-          # explicit ssh/scp calls below (passed -i explicitly too, since
-          # that costs nothing and does not depend on default-identity
-          # resolution) and the ssh the Docker CLI spawns internally for
-          # DOCKER_HOST.
+          # The key lives ONLY under $RUNNER_TEMP, never ~/.ssh/id_rsa: this
+          # runner is shared with sibling deploys, and one job's cleanup must
+          # not delete a key another job is mid-deploy with. The agent socket
+          # goes into $GITHUB_ENV so later steps -- including the ssh the
+          # Docker CLI spawns for DOCKER_HOST -- inherit it.
           install -m 600 -D /dev/null "$RUNNER_TEMP/id_rsa"
           printf '%s\n' "$SSH_PRIVATE_KEY_DEV" > "$RUNNER_TEMP/id_rsa"
           eval "$(ssh-agent -a "$RUNNER_TEMP/ssh-agent.sock")" >/dev/null
@@ -148,37 +92,18 @@ jobs:
             echo "SSH_AGENT_PID=$SSH_AGENT_PID"
           } >> "$GITHUB_ENV"
 
-          # known_hosts is still genuinely SHARED across sibling jobs on
-          # this runner -- see docs/deploy/trc-staging.md, which documents
-          # that the runner must process one job at a time, and that
-          # multiple runners on one machine must run as separate users. The
-          # scan-then-append below is non-destructive, so the residual race
-          # here is low-risk (worst case: a redundant rescan), unlike the
-          # id_rsa collision above, which is a hard failure.
-          #
-          # Trust-on-first-use: the host key is taken from the host at
-          # deploy time rather than pinned. StrictHostKeyChecking stays ON,
-          # so a key that changes mid-run still aborts.
+          # Trust-on-first-use; StrictHostKeyChecking stays on, so a key that
+          # changes mid-run still aborts. keyscan exits 0 even when nothing
+          # answered, so the `test -s` is the real reachability check.
           ssh-keyscan -T 10 -p "$SSH_PORT" -H "$HOST" > "$RUNNER_TEMP/known_hosts"
-          # ssh-keyscan exits 0 even when nothing answered -- this is the
-          # actual reachability check, and it must fail now, not 45 minutes
-          # into the build.
           test -s "$RUNNER_TEMP/known_hosts"
           install -m 700 -d ~/.ssh
           touch ~/.ssh/known_hosts
-          # Remove any stale entry for this host, both spellings -- keyscan
-          # writes a bare host for port 22 and `[host]:port` otherwise -- then
-          # append the fresh scan. Never truncate with `>` or `tee`.
+          # Drop stale entries for both spellings (keyscan writes a bare host
+          # for port 22, `[host]:port` otherwise), then append. Never truncate.
           ssh-keygen -R "$HOST" -f ~/.ssh/known_hosts >/dev/null 2>&1 || true
           ssh-keygen -R "[${HOST}]:${SSH_PORT}" -f ~/.ssh/known_hosts >/dev/null 2>&1 || true
           cat "$RUNNER_TEMP/known_hosts" >> ~/.ssh/known_hosts
-
-      - name: Log in to GHCR
-        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Compute image tags
         id: tags
@@ -187,55 +112,49 @@ jobs:
           printf 'staging=%s:staging\n' "$IMAGE" >> "$GITHUB_OUTPUT"
           printf 'sha=%s:git-%s\n' "$IMAGE" "${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-
-      - name: Build and push
-        # NO DOCKER_HOST in this step's env -- it must build on the RUNNER,
-        # never on the deploy host. See the file header.
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/amd64
-          push: true
-          tags: |
-            ${{ steps.tags.outputs.staging }}
-            ${{ steps.tags.outputs.sha }}
-          build-args: |
-            HERMES_GIT_SHA=${{ github.sha }}
-          labels: |
-            org.opencontainers.image.revision=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=min
-
+      # Runs BEFORE the build: the build happens on this host, so free disk and
+      # a reachable daemon are preconditions of the build itself. A full disk
+      # must fail in seconds, not 28 minutes in.
       - name: Verify host preconditions
         env:
-          DOCKER_HOST: ssh://${{ secrets.USERNAME }}@${{ secrets.HOST }}:${{ secrets.SSH_PORT || '22' }}
           BOOTSTRAP: ${{ inputs.bootstrap }}
+          HOST: ${{ secrets.HOST }}
+          USERNAME: ${{ secrets.USERNAME }}
+          SSH_PORT: ${{ secrets.SSH_PORT || '22' }}
         run: |
           set -eu
-          # A workflow_dispatch boolean renders as exactly `true` or `false`.
-          # Read through an env: binding and validated here rather than
-          # spliced as `${{ inputs.bootstrap }}` straight into the shell text
-          # below: the same form is used in every step of all three repos'
-          # deploys, so there is one place to reason about and no expression
-          # interpolation inside a test.
           case "$BOOTSTRAP" in
             true|false) ;;
-            *)
-              echo "::error::bootstrap must be true or false, got '$BOOTSTRAP'"
-              exit 1 ;;
+            *) echo "::error::bootstrap must be true or false, got '$BOOTSTRAP'"; exit 1 ;;
           esac
 
           # Proves the SSH transport and the remote daemon before anything else.
           docker version --format 'remote daemon {{.Server.Version}}'
 
-          # Fail closed on the external volume, UNLESS bootstrapping a fresh
-          # host: Compose refuses to start when an external volume is
-          # missing, and that is the guard. Creating it on a routine deploy
-          # would boot Hermes against a silently EMPTY volume -- no sessions,
-          # no memories, no cron -- with every smoke test below still passing.
+          # BuildKit's out-of-space failures name everything except the cause.
+          # Thresholds match trc-backend's deploy.
+          avail=$(ssh -o BatchMode=yes -i "$RUNNER_TEMP/id_rsa" -p "$SSH_PORT" \
+            "${USERNAME}@${HOST}" \
+            'df --output=avail -B1 /var/lib/docker 2>/dev/null | tail -1') || avail=""
+          case "$avail" in
+            ''|*[!0-9]*)
+              echo "::warning::Could not read free space on the deploy host - check df -h manually." ;;
+            *)
+              gb=$((avail / 1000000000))
+              if [ "$avail" -lt 10000000000 ]; then
+                echo "::error::Only ${gb} GB free on the deploy host. A cold build needs more than that and fails obscurely when it runs out. See docs/deploy/trc-staging.md for what is safe to prune - note that pruning images also destroys rollback targets."
+                exit 1
+              elif [ "$avail" -lt 25000000000 ]; then
+                echo "::warning::${gb} GB free on the deploy host - enough for a cached build, tight for a cold one."
+              else
+                echo "OK - ${gb} GB free on the deploy host."
+              fi ;;
+          esac
+
+          # Fail closed on the external volume unless bootstrapping: creating it
+          # on a routine deploy would boot Hermes against a silently EMPTY
+          # volume -- no sessions, no memories, no cron -- with every smoke test
+          # below still passing.
           if docker volume inspect trc-staging-hermes-memory >/dev/null 2>&1; then
             :
           elif [ "$BOOTSTRAP" = "true" ]; then
@@ -246,27 +165,50 @@ jobs:
             exit 1
           fi
 
-          # trc-shared belongs to the trc-backend stack; this deploy never
-          # creates it, unless bootstrapping a fresh host.
+          # trc-shared belongs to the trc-backend stack; never created here
+          # except when bootstrapping. `|| true` because a concurrent bootstrap
+          # from a sibling repo can win the race, and "already exists" is the
+          # desired end state anyway.
           if docker network inspect trc-shared >/dev/null 2>&1; then
             :
           elif [ "$BOOTSTRAP" = "true" ]; then
             echo "::warning::bootstrap=true -- creating trc-shared on this host."
-            # `|| true` for the same reason poc-net's create has it: two
-            # bootstrap dispatches (this repo and open-webui) can reach this
-            # line concurrently, and the loser of that race would otherwise
-            # fail the deploy on an "already exists" that is the desired end
-            # state anyway. stderr is deliberately NOT suppressed here, unlike
-            # poc-net's create -- a genuine failure on a bootstrap path should
-            # still be visible in the log.
             docker network create trc-shared || true
           else
             echo "::error::external network trc-shared does not exist on the host. It is owned by the trc-backend stack -- re-dispatch with bootstrap: true only on a genuinely fresh host."
             exit 1
           fi
 
-          # poc-net carries no data, so creating it is always safe and idempotent.
+          # poc-net carries no data, so creating it is always safe.
           docker network create poc-net 2>/dev/null || true
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          # The remote daemon's own builder, reached through DOCKER_HOST. The
+          # default container driver would start empty on every dispatch, which
+          # is the failure this whole arrangement exists to avoid.
+          driver: docker
+
+      - name: Build the image on the deploy server
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile
+          # No registry: built straight into the deploy host's image store.
+          push: false
+          tags: |
+            ${{ steps.tags.outputs.staging }}
+            ${{ steps.tags.outputs.sha }}
+          build-args: |
+            HERMES_GIT_SHA=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+          # No `platforms`: build native to the server, or buildx silently
+          # switches on QEMU emulation. No cache-from/to: the daemon's own
+          # layer store is the cache now. No attestations: they force a
+          # manifest list and an extra export pass for nothing.
+          provenance: false
 
       - name: Copy Hermes config to the host
         env:
@@ -275,10 +217,8 @@ jobs:
           SSH_PORT: ${{ secrets.SSH_PORT || '22' }}
         run: |
           set -eu
-          # config.yaml is a bind mount, and bind sources are resolved by the
-          # REMOTE daemon -- so unlike .env.staging, this file genuinely has
-          # to be on the server. It carries no secret (model, dashboard and
-          # MCP URL config only).
+          # Bind sources resolve on the REMOTE daemon, so unlike .env.staging
+          # this file genuinely has to be on the server. It carries no secret.
           ssh -i "$RUNNER_TEMP/id_rsa" -p "$SSH_PORT" "${USERNAME}@${HOST}" \
             "mkdir -p ${HOST_DIR} /srv/trc/staging/fingerprints"
           scp -i "$RUNNER_TEMP/id_rsa" -P "$SSH_PORT" \
@@ -291,21 +231,15 @@ jobs:
           HERMES_API_KEY: ${{ secrets.HERMES_API_KEY }}
           DASH_USER: ${{ secrets.HERMES_DASHBOARD_BASIC_AUTH_USERNAME }}
           DASH_PASS: ${{ secrets.HERMES_DASHBOARD_BASIC_AUTH_PASSWORD }}
-          # The IMMUTABLE tag this run built, not the moving `:staging`
-          # pointer -- so the deploy runs exactly what this run built, and
-          # "what is running" is unambiguous. `:staging` is still pushed
-          # above (Build and push) as a human-readable pointer, but nothing
-          # in this workflow ever deploys it. For rollback, edit this one
-          # line on a throwaway branch to hardcode an older `:git-<7>` tag
-          # instead of this dynamic expression -- see
-          # docs/deploy/trc-staging.md.
+          # The immutable tag this run built, not the moving `:staging` pointer.
+          # To roll back, hardcode an older `:git-<7>` tag here on a throwaway
+          # branch -- but only tags still present in the host's image store.
           DEPLOY_IMAGE: ${{ steps.tags.outputs.sha }}
         run: |
           set -eu
-          # This file stays on the runner. The local compose CLI reads it and
-          # sends the values to the remote daemon as container environment,
-          # so no plaintext secret is ever written to the staging host.
-
+          # Stays on the runner: the local compose CLI reads it and sends the
+          # values as container environment, so no plaintext secret is ever
+          # written to the staging host.
           if [ "${#HERMES_API_KEY}" -lt 16 ]; then
             echo "::error::HERMES_API_KEY must be at least 16 characters. Below that the gateway refuses to start the API server at all, so the symptom is connection-refused on :8642, not a 401."
             exit 1
@@ -338,40 +272,29 @@ jobs:
           SSH_PORT: ${{ secrets.SSH_PORT || '22' }}
         run: |
           set -eu
-          # Twelve hex characters of a SHA-256 over the gateway key. Not a
-          # secret and not brute-forceable; it lets the paperclip deploy detect
-          # that its third copy of HERMES_API_KEY has drifted.
+          # Twelve hex chars of a SHA-256 over the gateway key. Not a secret;
+          # it lets the paperclip deploy detect that its copy has drifted.
           printf '%s' "$HERMES_API_KEY" | sha256sum | cut -c1-12 > hermes.fpr
           scp -i "$RUNNER_TEMP/id_rsa" -P "$SSH_PORT" hermes.fpr \
             "${USERNAME}@${HOST}:/srv/trc/staging/fingerprints/hermes-api-key"
 
-      - name: Pull and deploy
-        env:
-          DOCKER_HOST: ssh://${{ secrets.USERNAME }}@${{ secrets.HOST }}:${{ secrets.SSH_PORT || '22' }}
+      - name: Deploy
         run: |
           set -eu
-          # Read the tag back from .env.staging rather than recomputing it,
-          # so this log line can never drift from what actually gets
-          # deployed -- including on a rollback dispatch that hardcoded a
-          # different tag in the "Render the environment file" step.
+          # Read the tag back from .env.staging so this line can never drift
+          # from what actually gets deployed.
           echo "deploying $(grep '^HERMES_IMAGE=' .env.staging | cut -d= -f2-)"
-          docker compose --env-file .env.staging -f "$COMPOSE_FILE_PATH" pull
+          # No `pull`: the build already put the image in this daemon's store.
           docker compose --env-file .env.staging -f "$COMPOSE_FILE_PATH" up -d --remove-orphans
-          # Record what actually landed, so a rollback has a named target. Read
-          # from the IMAGE, not the container: a container's inspect output has
-          # no RepoDigests key at all. Guarded: a digest record is best-effort
-          # and must never fail an otherwise-successful deploy.
+          # Best-effort record of what landed. "(no digest)" is expected now --
+          # RepoDigests is only set for images that went through a registry.
           if img="$(docker inspect --format '{{.Image}}' hermes-agent 2>/dev/null)"; then
-            echo "deployed digest:"
-            docker image inspect "$img" \
-              --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{else}}(no digest){{end}}'
+            echo "deployed image id: $img"
           else
-            echo "could not inspect hermes-agent for a digest record (non-fatal)"
+            echo "could not inspect hermes-agent for a record (non-fatal)"
           fi
 
       - name: Smoke test
-        env:
-          DOCKER_HOST: ssh://${{ secrets.USERNAME }}@${{ secrets.HOST }}:${{ secrets.SSH_PORT || '22' }}
         run: |
           set -eu
           ok=0
@@ -400,7 +323,6 @@ jobs:
 
           # trc-shared reachability. Assert the REQUEST SUCCEEDS, not that it
           # returns 200 -- an MCP endpoint may answer a bare GET with 405/406.
-          # What is under test is DNS plus routing to the backend.
           docker exec -i hermes-agent python3 - <<'PY'
           import sys, urllib.error, urllib.request
           try:
@@ -414,20 +336,11 @@ jobs:
           PY
 
       - name: Clean up secrets on the runner
-        # if: always() -- this runner is PERSISTENT and reused by later jobs,
-        # so every secret written to disk above must be removed, and the
-        # per-job ssh-agent killed, even when an earlier step failed --
-        # including a failure before the agent ever started (ssh-agent -k
-        # and the rm's are all best-effort for exactly that reason).
+        # Removes the staging server's private key and the plaintext API keys
+        # from a runner shared with sibling repos' deploys. always(), because a
+        # failed deploy leaves the same files behind.
         if: always()
         run: |
           set -eu
           rm -f "$RUNNER_TEMP/id_rsa" .env.staging hermes.fpr
           ssh-agent -k >/dev/null 2>&1 || true
-          # Both of these now act ONLY on this job's own DOCKER_CONFIG
-          # directory, never on the shared ~/.docker/config.json -- which is
-          # exactly why the logout is safe to keep: before DOCKER_CONFIG was
-          # isolated, this line stripped the GHCR credential out from under a
-          # sibling repo's concurrent `docker compose pull`.
-          docker logout ghcr.io || true
-          rm -rf "$DOCKER_CONFIG"
