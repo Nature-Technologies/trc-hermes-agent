@@ -23,8 +23,11 @@ run-name: Deploy hermes-agent to Dev/Test Server
 # for their jobs too. The job-level DOCKER_HOST is scoped to this job.
 #
 # Other consequences worth knowing:
-#   - .env.staging is read by the LOCAL compose CLI and never lands on the
-#     server; values reach the containers as environment, not as a file
+#   - no env file is written anywhere. The Deploy step binds the secrets as its
+#     own `env:`, and Compose resolves the compose file's ${...} references from
+#     that process environment -- so no secret touches disk on the runner or the
+#     server, and nothing is dotenv-parsed, which means a `$`, backtick or `#`
+#     in a value is taken literally instead of interpolated or truncated
 #   - bind-mount sources resolve on the REMOTE daemon, so every bind path must
 #     be absolute and must already exist on the server
 
@@ -217,52 +220,14 @@ jobs:
           SSH_PORT: ${{ secrets.SSH_PORT || '22' }}
         run: |
           set -eu
-          # Bind sources resolve on the REMOTE daemon, so unlike .env.staging
-          # this file genuinely has to be on the server. It carries no secret.
+          # Bind sources resolve on the REMOTE daemon, so this file genuinely
+          # has to be on the server -- unlike the secrets, which the Deploy step
+          # passes as process environment. It carries no secret itself.
           ssh -i "$RUNNER_TEMP/id_rsa" -p "$SSH_PORT" "${USERNAME}@${HOST}" \
             "mkdir -p ${HOST_DIR} /srv/trc/staging/fingerprints"
           scp -i "$RUNNER_TEMP/id_rsa" -P "$SSH_PORT" \
             deploy/trc/config.yaml \
             "${USERNAME}@${HOST}:${HOST_DIR}/config.yaml"
-
-      - name: Render the environment file
-        env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          HERMES_API_KEY: ${{ secrets.HERMES_API_KEY }}
-          DASH_USER: ${{ secrets.HERMES_DASHBOARD_BASIC_AUTH_USERNAME }}
-          DASH_PASS: ${{ secrets.HERMES_DASHBOARD_BASIC_AUTH_PASSWORD }}
-          # The immutable tag this run built, not the moving `:staging` pointer.
-          # To roll back, hardcode an older `:git-<7>` tag here on a throwaway
-          # branch -- but only tags still present in the host's image store.
-          DEPLOY_IMAGE: ${{ steps.tags.outputs.sha }}
-        run: |
-          set -eu
-          # Stays on the runner: the local compose CLI reads it and sends the
-          # values as container environment, so no plaintext secret is ever
-          # written to the staging host.
-          if [ "${#HERMES_API_KEY}" -lt 16 ]; then
-            echo "::error::HERMES_API_KEY must be at least 16 characters. Below that the gateway refuses to start the API server at all, so the symptom is connection-refused on :8642, not a 401."
-            exit 1
-          fi
-          for name in OPENROUTER_API_KEY HERMES_API_KEY DASH_USER DASH_PASS; do
-            eval "value=\${$name}"
-            case "$value" in
-              *'$'*|*'`'*|*'#'*)
-                echo "::error::$name contains \$, a backtick or #, which Compose mangles when interpolating the env file"
-                exit 1 ;;
-            esac
-          done
-
-          umask 077
-          {
-            printf 'HERMES_IMAGE=%s\n' "$DEPLOY_IMAGE"
-            printf 'OPENROUTER_API_KEY=%s\n' "$OPENROUTER_API_KEY"
-            printf 'HERMES_API_KEY=%s\n' "$HERMES_API_KEY"
-            printf 'HERMES_DASHBOARD_BASIC_AUTH_USERNAME=%s\n' "$DASH_USER"
-            printf 'HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=%s\n' "$DASH_PASS"
-            printf 'HERMES_BIND=127.0.0.1\n'
-            printf 'HERMES_CONFIG_PATH=%s/config.yaml\n' "$HOST_DIR"
-          } > .env.staging
 
       - name: Publish the shared-key fingerprint
         env:
@@ -279,13 +244,30 @@ jobs:
             "${USERNAME}@${HOST}:/srv/trc/staging/fingerprints/hermes-api-key"
 
       - name: Deploy
+        # Compose resolves the compose file's ${...} references from THIS
+        # process environment. No env file is written, on the runner or the
+        # server, so no secret ever touches disk -- and because nothing is
+        # parsed as dotenv, values are taken literally: a `$`, backtick or `#`
+        # in a password survives instead of being interpolated or truncated.
+        env:
+          # The immutable tag this run built, not the moving `:staging`
+          # pointer. To roll back, hardcode an older `:git-<7>` tag here on a
+          # throwaway branch -- but only one still in the host's image store.
+          HERMES_IMAGE: ${{ steps.tags.outputs.sha }}
+          HERMES_BIND: 127.0.0.1
+          # Absolute path on the SERVER: the bind source is resolved by the
+          # remote daemon. "Copy Hermes config to the host" put it there.
+          HERMES_CONFIG_PATH: ${{ env.HOST_DIR }}/config.yaml
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          HERMES_API_KEY: ${{ secrets.HERMES_API_KEY }}
+          HERMES_DASHBOARD_BASIC_AUTH_USERNAME: ${{ secrets.HERMES_DASHBOARD_BASIC_AUTH_USERNAME }}
+          HERMES_DASHBOARD_BASIC_AUTH_PASSWORD: ${{ secrets.HERMES_DASHBOARD_BASIC_AUTH_PASSWORD }}
         run: |
           set -eu
-          # Read the tag back from .env.staging so this line can never drift
-          # from what actually gets deployed.
-          echo "deploying $(grep '^HERMES_IMAGE=' .env.staging | cut -d= -f2-)"
+          echo "deploying $HERMES_IMAGE"
           # No `pull`: the build already put the image in this daemon's store.
-          docker compose --env-file .env.staging -f "$COMPOSE_FILE_PATH" up -d --remove-orphans
+          # No `--env-file`: see the note above.
+          docker compose -f "$COMPOSE_FILE_PATH" up -d --remove-orphans
           # Best-effort record of what landed. "(no digest)" is expected now --
           # RepoDigests is only set for images that went through a registry.
           if img="$(docker inspect --format '{{.Image}}' hermes-agent 2>/dev/null)"; then

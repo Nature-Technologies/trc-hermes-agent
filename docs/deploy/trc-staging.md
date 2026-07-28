@@ -6,51 +6,56 @@ and `paperclip` deploy themselves the same way, and all three attach to the
 shared external `poc-net` bridge.
 
 **Build and deploy are one workflow, one dispatch.** There is no separate
-publish step any more — `trc-publish.yml` is gone. The workflow builds the
-image on the runner, pushes it to GHCR, and then rolls it out to the staging
-host in the same run, so the tag the deploy pulls always exists by the time it
-pulls it.
+publish step any more — `trc-publish.yml` is gone.
 
-The workflow runs on a **self-hosted runner** (`runs-on: [self-hosted,
-linux]` — labelled, not bare `self-hosted`, so a non-Linux runner registered
-later on this label set cannot pick up a job that needs docker/buildx and an
-OpenSSH client), because the staging host is internal and unreachable from a
-GitHub-hosted runner. The build step runs with no special Docker
-configuration — it builds and pushes using the runner's own local daemon.
-Only the three later steps that actually need to reach the staging host —
-`Verify host preconditions`, `Pull and deploy`, `Smoke test` — set
-`DOCKER_HOST: ssh://…` in their own **step-level** `env:`. That scoping is
-deliberate and never a workflow-level or job-level `env:`, and never a
-`docker context`:
+**The build runs on the deploy host, and there is no registry.** The workflow
+runs on a **self-hosted runner** (`runs-on: self-hosted`) because the staging
+host is internal and unreachable from a GitHub-hosted runner — but the runner
+only orchestrates. `DOCKER_HOST: ssh://…` is set at **job level**, so every
+`docker` call in the job, *including the build*, reaches the staging host's
+daemon. `docker/build-push-action` runs with `push: false`, putting the image
+straight into that host's image store — the same store `docker compose up -d`
+reads. Only the source context crosses the network, never an image.
 
-- A `docker context` is *persistent state* on a self-hosted runner. `docker
-  context create` fails with "already exists" on the second run against the
-  same runner, and `docker context use` repoints that runner's **default**
-  daemon for every later job that lands on it — including unrelated jobs from
-  other workflows.
-- `docker buildx` binds to whichever daemon is *current*. An active context
-  (or a job-level `DOCKER_HOST`) would silently build the image **on the
-  deploy host** instead of the runner.
-- A step-level `env: DOCKER_HOST: …` cannot leak into the build step, because
-  it is set only on the steps that declare it.
+This is the same arrangement `trc-backend`'s deploy uses, and the reason is
+caching:
 
-Three consequences of the remote-daemon design worth knowing:
+- buildx's default `docker-container` driver starts with an **empty cache on
+  every dispatch**, so nothing carries over between runs. The workflow uses
+  `driver: docker` instead, which uses the daemon's own layer store.
+- The previous design papered over this with `cache-from/to: type=gha`, which
+  round-trips multi-GB layers to GitHub's cache service against a 10 GB
+  per-repo LRU shared with every other workflow in this repo — so it mostly
+  missed, and a cold build of this image is 15-45 min.
+- The deploy host's daemon is the only Docker state here that genuinely
+  persists, so its layer store is where the cache belongs.
 
-- The rendered `.env.staging` file is read by the **local** Compose CLI via
-  `--env-file` and is never copied to the server. Its values reach the
-  containers as container environment, sent over the Docker API through the
-  SSH tunnel — there is no plaintext secret file on the staging host. This is
-  still true under the self-hosted runner: the runner is not the deploy host,
-  so nothing changes about where the file lands.
+Never a `docker context`, even now that the build is meant to run on the host.
+A context is *persistent state* on a self-hosted runner: `docker context
+create` fails "already exists" on the second run, and `docker context use`
+repoints that runner's **default** daemon for every later job that lands on
+it — including the sibling repos' deploys, which expect the local daemon. The
+job-level `DOCKER_HOST` is scoped to this job and cannot leak that way.
+
+Consequences of the remote-daemon design worth knowing:
+
+- **No env file is written anywhere.** The `Deploy` step binds the application
+  secrets as its own `env:`, and Compose resolves the compose file's `${…}`
+  references from that process environment. No secret reaches disk on the
+  runner *or* the server. It also means nothing is dotenv-parsed, so a `$`,
+  backtick or `#` in a value is taken literally rather than interpolated or
+  truncated — see "Secret charset" below.
 - Bind-mount sources (`config.yaml`) are resolved by the **remote** daemon, so
   that path must be absolute and must already exist on the server before
   `compose up` runs. The deploy still `scp`s `config.yaml` into place for this
   reason — it is the one file that genuinely has to reach the host.
-- `docker compose pull` sends the **runner's** registry credentials to the
-  remote daemon (`X-Registry-Auth`), not the host's — the staging host never
-  **stores** a credential of its own. The workflow logs in to `ghcr.io` on the
-  runner with the built-in `GITHUB_TOKEN` before pulling; this works whether
-  the package is public (as it is today) or private.
+- **No registry credential is involved at all.** Nothing is pushed and, because
+  the compose service sets `pull_policy: never`, nothing is pulled. The
+  workflow holds no `packages: write` permission and never logs in to `ghcr.io`.
+- The build now consumes CPU, RAM and **disk** on the staging server, alongside
+  the running services. `Verify host preconditions` therefore runs **before**
+  the build and checks free space, so a full disk fails in seconds rather than
+  ~28 minutes in.
 
 **The runner is persistent and SHARED.** Unlike a GitHub-hosted runner, this
 machine is reused by later jobs — including `trc-open-webui` and `paperclip`'s
@@ -68,28 +73,19 @@ genuinely shared:
   `$RUNNER_TEMP` is scoped to the individual job. The agent authenticates both
   the explicit `ssh`/`scp` calls (which also pass `-i "$RUNNER_TEMP/id_rsa"`
   explicitly, redundantly with the agent, since that costs nothing) and the
-  `ssh` the Docker CLI spawns internally for `DOCKER_HOST`. The key file and
-  the agent are both removed in the final `Clean up secrets on the runner`
-  step, which runs with `if: always()` — including the path where an earlier
-  step failed before the agent ever started.
-- **`~/.docker/config.json` is a hard collision too, and is likewise
-  structurally isolated.** The deploy job sets `DOCKER_CONFIG` as **job-level**
-  `env:`, pointing at a per-job directory outside the build context, and creates
-  it before `docker login`. Every `docker`, `docker compose`, `docker buildx`
-  and `docker/login-action` call in the job honours that variable, so the GHCR
-  credential and buildx's state both live in job-private scratch space. Without
-  it the final cleanup step's `docker logout ghcr.io` would strip the GHCR
-  credential out from under a sibling repo's concurrent `docker compose pull` —
-  which is exactly why the logout is safe to keep now: it can only touch this
-  job's own directory, which the cleanup then deletes outright.
+  `ssh` the Docker CLI spawns internally for `DOCKER_HOST`.
 
-  Note that job-level here is correct and is **not** the hazard a job-level
-  `DOCKER_HOST` would be. `DOCKER_CONFIG` says only *where credentials live*,
-  never *which daemon to talk to*, so unlike `DOCKER_HOST` it cannot redirect
-  the build step off the runner. (It is built from `github.workspace` rather
-  than the more obvious `runner.temp` because the `runner` context is not
-  available in `jobs.<job_id>.env` — GitHub rejects the whole workflow with
-  "Unrecognized named-value: 'runner'".)
+  **The key file and the agent outlive the job.** There is no cleanup step —
+  it was removed deliberately. `$RUNNER_TEMP` is cleared when that runner
+  starts its next job, so the window is bounded, but between deploys the key
+  sits on disk and an `ssh-agent` holds it decrypted in memory. If a cleanup
+  step is ever reintroduced, the validator requires it be `if: always()` and
+  run `ssh-agent -k` — deleting the key *file* does not unload the key.
+- **`~/.docker/config.json` no longer needs isolating.** The job previously set
+  a per-job `DOCKER_CONFIG` so its `docker logout ghcr.io` could not strip the
+  GHCR credential out from under a sibling repo's concurrent `docker compose
+  pull`. With no registry in this deploy there is no credential to protect and
+  no logout to perform, so `DOCKER_CONFIG` was dropped along with the login.
 - **`~/.ssh/known_hosts` is still genuinely shared, and that is left as a
   documented operational requirement rather than fixed structurally** — the
   risk is lower (worst case under a race is a redundant rescan, not a hard
@@ -104,9 +100,10 @@ genuinely shared:
   parallelize trc-hermes-agent, trc-open-webui and paperclip deploys), each
   runner must run as a **separate OS user** so they do not share `$HOME` and
   therefore do not share `~/.ssh/known_hosts`.
-- Every other secret this workflow writes to disk on the runner —
-  `.env.staging`, the `hermes.fpr` fingerprint temp file — is likewise
-  removed in the final cleanup step.
+- No application secret is written to disk at all any more. `.env.staging` is
+  gone; the `Deploy` step passes those values to Compose as process
+  environment. The only files the run leaves behind are the SSH key above and
+  `hermes.fpr`, which is a non-secret 12-hex-character digest.
 
 ## Host prerequisites
 
@@ -175,9 +172,9 @@ runner **must run as a separate OS user**, so they do not share `$HOME` and
 therefore do not share `~/.ssh/known_hosts`. The private key itself does not
 have this constraint: it lives under the job-scoped `$RUNNER_TEMP`, so two
 jobs on the same runner user cannot collide over it even if this requirement
-is violated. Neither does `~/.docker/config.json`, which the job-level
-`DOCKER_CONFIG` moves into a per-job directory. **`known_hosts` is the only
-genuinely shared file left**, which is why this requirement is about that file
+is violated. Neither does `~/.docker/config.json`: this job no longer logs in
+to any registry, so it never writes one. **`known_hosts` is the only genuinely
+shared file left**, which is why this requirement is about that file
 specifically.
 
 ### Phase 2 preconditions
@@ -193,73 +190,76 @@ is for a fresh host with no prior data to migrate).
 
 ## Running a deploy
 
-The workflow builds and publishes two tags on every dispatch, but they play
-different roles:
+The workflow applies two tags on every dispatch, **both only in the staging
+host's local image store** — neither is pushed anywhere:
 
 - `ghcr.io/nature-technologies/trc-hermes-agent:staging` — a **moving**
-  pointer, overwritten by every run. Pushed for human convenience (e.g.
-  browsing the GHCR package), but **nothing in this workflow ever deploys
-  it.**
+  pointer, overwritten by every run. Kept as a human-readable "what landed
+  last" marker, but **nothing in this workflow ever deploys it.**
 - `ghcr.io/nature-technologies/trc-hermes-agent:git-<7-char-sha>` — an
   **immutable** tag naming the exact commit that was built. **This is what
-  gets deployed.** The `Render the environment file` step sets
-  `DEPLOY_IMAGE: ${{ steps.tags.outputs.sha }}` in its own `env:` and writes
-  that value into `.env.staging` as `HERMES_IMAGE`, so the deploy runs exactly
-  what this run built — "what is running" is unambiguous, and never depends on
-  `:staging` having been overwritten by a later, unrelated run between build
-  and deploy.
+  gets deployed.** The `Deploy` step sets
+  `HERMES_IMAGE: ${{ steps.tags.outputs.sha }}` in its own `env:`, so the
+  deploy runs exactly what this run built — never whatever `:staging` happens
+  to point at.
+
+The `ghcr.io/…` prefix is now just a name. It is a local tag string; no
+registry is contacted.
 
 1. Actions → **TRC staging deploy (hermes-agent)** → Run workflow.
 2. Leave `bootstrap` unchecked (default `false`) unless this is the first
    deploy to a brand-new host.
-3. The workflow builds the image from the checked-out ref, pushes both tags,
-   and deploys the `:git-<7-char-sha>` one it just pushed.
-
-The `Pull and deploy` step logs the deployed tag by reading it back out of
-`.env.staging` (`grep '^HERMES_IMAGE=' .env.staging`) rather than
-recomputing it, so the log line can never drift from what is actually
-running — including under the rollback override below.
+3. The workflow builds the image from the checked-out ref directly into the
+   staging host's image store, then deploys the `:git-<7-char-sha>` tag.
 
 ### Rolling back
 
+> **Rollback is host-local now.** The `:git-<sha>` tags exist **only** in that
+> host's image store. A `docker image prune -a` there, or a host rebuild,
+> destroys every rollback target, and there is no offsite copy. Check what is
+> actually available before planning a rollback:
+> `docker image ls 'ghcr.io/nature-technologies/trc-hermes-agent'`.
+
 **There is no digest input.** Because every routine deploy already runs the
 immutable tag it just built, rolling back to an *older* build means
-re-dispatching the workflow from a branch where the **`Render the environment
-file`** step — not `Pull and deploy` — has its `DEPLOY_IMAGE` env line
-hardcoded to an older tag instead of the dynamic
+re-dispatching from a branch where the **`Deploy`** step has its
+`HERMES_IMAGE` env line hardcoded to an older tag instead of the dynamic
 `${{ steps.tags.outputs.sha }}` expression:
 
 1. Branch off the current `dev` (name it anything that is not `dev`, e.g.
    `rollback/2026-07-27`).
 2. In `.github/workflows/trc-staging-deploy.yml` on that branch, find the
-   `Render the environment file` step and change its
-   `DEPLOY_IMAGE: ${{ steps.tags.outputs.sha }}` line to a hardcoded
-   `DEPLOY_IMAGE: ghcr.io/nature-technologies/trc-hermes-agent:git-<short-sha>`
-   — pick the short sha from a previous run's logs or the GHCR package's tag
-   list. Commit and push the branch.
+   `Deploy` step and change its `HERMES_IMAGE: ${{ steps.tags.outputs.sha }}`
+   line to a hardcoded
+   `HERMES_IMAGE: ghcr.io/nature-technologies/trc-hermes-agent:git-<short-sha>`
+   — pick a short sha that `docker image ls` on the host confirms is still
+   present. Commit and push the branch.
 3. Actions → **TRC staging deploy (hermes-agent)** → Run workflow, and select
    **that branch** as the workflow ref (the "Use workflow from" selector). The
    deploy is `workflow_dispatch`-only, so it runs the workflow definition from
    whichever ref you pick.
-4. Delete the branch once you are done. To roll forward again, dispatch the
-   deploy from `dev` as normal, which builds fresh and deploys its own new
-   `:git-<sha>`.
+4. Delete the branch once you are done. To roll forward again, dispatch from
+   `dev` as normal, which builds fresh and deploys its own new `:git-<sha>`.
 
-Because build and deploy are unified, a rollback dispatch **still rebuilds and
-pushes fresh `:staging`/`:git-<newsha>` tags from that branch's source** — but
-with `DEPLOY_IMAGE` hardcoded as above, the deploy step itself pulls and runs
-the specific **older** tag you named, not the one it just built. A plain
-re-dispatch from an old branch, without that edit, is not itself a rollback —
+Because build and deploy are unified, a rollback dispatch **still rebuilds**
+from that branch's source and re-tags `:staging` — but with `HERMES_IMAGE`
+hardcoded as above, `up -d` starts the specific **older** tag you named. A
+plain re-dispatch from an old branch, without that edit, is not a rollback —
 it would build and deploy a fresh image from old source under a new sha.
 
-The `Pull and deploy` step still prints the digest that actually landed, so
-every run log records what is now running.
+Note that `pull_policy: never` makes a mistyped or pruned tag **fail closed**
+with a clear error, rather than reaching out to GHCR and starting a stale image
+left over from the retired push-based scheme.
 
 ## Required repository secrets (environment: `staging`)
 
-The environment name is lowercase `staging` — GitHub Actions matches
-environment names case-sensitively, so a `Staging` environment's secrets will
-not resolve here.
+The workflow declares `environment: staging` in lowercase. GitHub matches
+environment names **case-insensitively**, so an environment named `Staging`
+resolves against it correctly — that is the observed behaviour on this repo,
+where the environment is `Staging` and its secrets resolve normally. The
+validator still pins the workflow's spelling to lowercase `staging` for
+consistency across the three TRC deploys, not because a different case would
+break.
 
 | Secret | Notes |
 |---|---|
@@ -288,15 +288,28 @@ Trust-on-first-use has the same trade-off it always did:
   against. This is a deliberate trade against the operational cost of
   maintaining a pinned-key secret in step with any host-key rotation.
 
-Every secret rendered into `.env.staging` is charset-guarded: the workflow
-rejects any value containing `$`, a backtick or `#`. Compose's `env_file` parser
-interpolates the first two and treats `#` as a comment, so such a value would
-reach the container as a *different* string with nothing erroring — a mangled
-`HERMES_API_KEY` looks like a 401, a mangled dashboard password like a wrong
-password. `openssl rand -hex 32` never produces any of them. `.env.staging`
-itself is written on the runner and passed to Compose with `--env-file`; it is
-never copied to the host, and it is deleted by the final cleanup step even
-when an earlier step in the run fails.
+### Secret charset
+
+**Secrets may now contain any characters, including `$`, backticks and `#`.**
+
+This used to be guarded. Secrets were rendered into `.env.staging` and passed
+to Compose with `--env-file`, which made Compose parse them as **dotenv** — and
+dotenv interpolates `$`, treats a backtick as shell-adjacent, and truncates at
+a ` #`. Such a value reached the container as a *different* string with nothing
+erroring: a mangled `HERMES_API_KEY` looks like a 401, a mangled dashboard
+password like a wrong password. The workflow therefore rejected those
+characters up front.
+
+The `Deploy` step now binds the secrets as its own `env:` and lets Compose
+resolve the compose file's `${…}` references from the **process environment**.
+Nothing is dotenv-parsed, so values are taken literally and the guard is
+unnecessary — it was removed along with the file. This is also why no secret
+touches disk on the runner or the server any more.
+
+`HERMES_API_KEY` must still be **≥16 characters**; below that the gateway
+refuses to start the API server, which surfaces as connection-refused on
+`:8642` rather than a 401. That is no longer asserted before the deploy, so it
+shows up in the `Smoke test` step instead.
 
 ## Editing Hermes config
 
@@ -315,9 +328,10 @@ workflow specifically it also asserts:
 - the job requests the **`self-hosted`** runner label (all three `runs-on`
   spellings understood: scalar, list, and the `{group, labels}` mapping) —
   `ubuntu-latest` cannot reach the internal staging host at all;
-- `environment` is exactly **`staging`**, lowercase — GitHub matches
-  environment names case-sensitively, so `Staging` resolves no secrets and
-  every one of them arrives as the empty string;
+- `environment` is exactly **`staging`**, lowercase — pinned for consistency
+  across the three TRC deploys. GitHub itself matches environment names
+  case-insensitively, so this is a house-style assertion, not a correctness
+  one;
 - **every** `DOCKER_HOST` value references both `secrets.HOST` and
   `secrets.USERNAME`, so a literal host cannot be substituted. Of the three
   assertions above this is the one that catches a **silent** failure: a
@@ -330,18 +344,21 @@ workflow specifically it also asserts:
   and `[host]:port` spellings), and an append (`>>`) onto
   `~/.ssh/known_hosts`. The "never truncate" rule below is negative-only, and
   on its own it passes a workflow that has no host-key handling at all;
-- the `if: always()` cleanup step runs `ssh-agent -k` — deleting the key file
-  does not unload the key, and a leaked agent keeps it decrypted in memory on
-  this persistent runner, one more per dispatch;
 - `docker context create` appears **nowhere** in the workflow;
-- `DOCKER_HOST` appears only as **step-level** `env:`, never at workflow or
-  job level — either would apply to the build step too;
-- `DOCKER_HOST` is present, specifically, on each of the `Verify host
-  preconditions`, `Pull and deploy` and `Smoke test` steps by name — not just
-  "at least one step has it" (which would let it silently go missing from any
-  one of the three while the others stay green);
-- the step running `docker/build-push-action` has no `DOCKER_HOST` in its own
-  `env:` — it must build on the runner, not the deploy host;
+- `DOCKER_HOST` is set at **job level** — the build must reach the deploy
+  host's daemon, and only a job-level binding covers the build step. This is
+  the **inverse** of the old rule, which banned it above step level to keep the
+  build on the runner;
+- `DOCKER_HOST` is **not** set at workflow level, and **no step overrides it**
+  — a step-scoped value that differed would silently send just that step to
+  another daemon;
+- the `docker/build-push-action` step sets **`push: false`** and does **not**
+  set `platforms` — the image goes straight into the deploy host's store, and
+  naming an architecture the host does not have silently enables QEMU
+  emulation;
+- if any step removes `id_rsa`, it must be `if: always()` and must run
+  `ssh-agent -k` — deleting the key file does not unload the key. (There is no
+  cleanup step today; this fires only if one is reintroduced.);
 - no line writes raw `ssh-keyscan` output directly onto `known_hosts` outside
   `$RUNNER_TEMP`, whether via a bare `>` or piped through `tee` — either
   bypasses the `ssh-keygen -R` stale-entry removal on a file that persists
@@ -349,20 +366,21 @@ workflow specifically it also asserts:
 - the private key is never written to `~/.ssh/id_rsa` anywhere in the
   workflow — only under `$RUNNER_TEMP`, so sibling jobs on the same runner
   can never collide over it;
-- an `if: always()` cleanup step exists that removes `id_rsa` and
-  `.env.staging` and runs `docker logout` (which is now confined to this job's
-  own `DOCKER_CONFIG` directory, and cannot strip a sibling job's credential);
 - `docker volume create` is only reachable from inside a branch whose
   **enclosing** `if`/`elif` condition tests the `bootstrap` input — checked
   with an if/elif/else/fi-aware scan, not merely "does `bootstrap` appear
   earlier in the step", so an unconditional create placed *after* that
   branch's `fi` (i.e. no longer actually gated by anything) is still
   rejected;
-- Compose is invoked with `--env-file`, so secret values are never
-  interpolated into a shell command string;
-- `compose pull` precedes `compose up -d` (same-line `pull && up -d` counts,
-  compared by position within the line), so a deploy can never silently
-  redeploy an image already on the host;
+- Compose is **not** invoked with `--env-file`, and no step reads or writes a
+  `.env.staging` file — secrets reach Compose through the `Deploy` step's
+  `env:`, so nothing hits disk and nothing is dotenv-parsed. Also the inverse
+  of the old rule;
+- **`compose pull` does not appear.** The build puts the image in the host's
+  store, so a pull would either fail or resurrect a stale GHCR tag from the
+  retired push-based scheme. Again the inverse of the old rule;
+- the compose service sets **`pull_policy: never`**, so a missing or mistyped
+  image tag fails closed instead of falling back to the registry;
 - every heredoc-fed `docker exec` passes `-i`, and no `docker exec` that is
   *not* heredoc-fed passes `-i` — a heredoc without `-i` gets no stdin, so the
   smoke test's body never runs and the step still exits 0.

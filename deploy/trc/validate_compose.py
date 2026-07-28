@@ -375,9 +375,9 @@ def check_deploy_workflow() -> None:
     These are properties a generic YAML linter cannot know about: that the
     deploy runs against a remote Docker context (never a raw SSH shell) using
     the HOST/USERNAME secrets, that the external volume is verified rather
-    than pre-created, that compose is invoked with --env-file so secrets never
-    hit a shell command string, that a pull always precedes `up -d`, and the
-    ways this workflow could otherwise leak or weaken credentials.
+    than pre-created, that no env file is written so secrets never hit disk,
+    that the image is built on the deploy host and never pushed or pulled,
+    and the ways this workflow could otherwise leak or weaken credentials.
     """
     check(WORKFLOW.is_file(), f"missing {WORKFLOW}")
     if not WORKFLOW.is_file():
@@ -542,31 +542,34 @@ def check_deploy_workflow() -> None:
         "current, so an active context would build the image on the deploy "
         "host instead of the runner. Use step-scoped DOCKER_HOST instead",
     )
+    # Inverted from the old contract. Secrets used to be rendered into
+    # .env.staging and passed with --env-file; they are now bound as the Deploy
+    # step's own `env:` and resolved by Compose from the process environment.
+    # That is strictly safer -- no secret reaches disk on the runner OR the
+    # server -- and it also stops Compose dotenv-parsing the values, which used
+    # to interpolate a `$` and truncate at a `#`, silently mangling a password.
     check(
-        any("--env-file" in ln for ln in script_lines),
-        "compose must be invoked with --env-file so secret values are never "
-        "interpolated into a shell command string",
+        not any("--env-file" in ln for ln in script_lines),
+        "compose must NOT be invoked with --env-file -- secrets are bound as "
+        "the Deploy step's `env:` and resolved from the process environment, "
+        "so nothing is written to disk and no value is dotenv-parsed (a `$` "
+        "would be interpolated and a `#` would truncate the value)",
     )
-    # (line index, character offset within the line) rather than just a line
-    # index: two tuples compare lexicographically, so this also gets a
-    # same-line `docker compose pull && docker compose up -d` right -- with
-    # line index alone, both halves share one index and `min(...) < min(...)`
-    # would compare `i < i` and always be False, even though `pull` runs
-    # first.
-    pull_positions = [
-        (i, ln.find(" pull"))
-        for i, ln in enumerate(script_lines)
-        if "compose" in ln and " pull" in ln
-    ]
-    up_positions = [
-        (i, ln.find("up -d"))
-        for i, ln in enumerate(script_lines)
-        if "compose" in ln and "up -d" in ln
-    ]
     check(
-        bool(pull_positions) and bool(up_positions) and min(pull_positions) < min(up_positions),
-        "`compose pull` must precede `compose up -d`, or a deploy can silently "
-        "run a stale image already present on the host",
+        not any(".env.staging" in ln for ln in script_lines),
+        "no step may write or read a .env.staging file -- secrets reach "
+        "Compose through the Deploy step's `env:`, never through disk",
+    )
+    # `compose pull` is now forbidden, the exact inverse of the old rule. The
+    # image is built straight into the deploy host's image store and pushed
+    # nowhere, so a pull can only either fail or -- for a commit deployed under
+    # the old push-based scheme -- succeed against a stale tag still sitting in
+    # GHCR and start code that is not what this run built.
+    check(
+        not any("compose" in ln and " pull" in ln for ln in script_lines),
+        "`compose pull` must not appear -- the build puts the image directly "
+        "in the deploy host's store, so a pull would either fail or resurrect "
+        "a stale GHCR tag from the retired push-based scheme",
     )
 
     # The defect class that has cost this project the most, shipped twice in
@@ -590,47 +593,44 @@ def check_deploy_workflow() -> None:
             "NOT pass -i, or it consumes the rest of the enclosing script",
         )
 
-    # DOCKER_HOST must be scoped to individual steps, never the workflow or
-    # the job. Either would also apply to the build step, and buildx binds to
-    # whichever daemon is current -- so the image would build on the deploy
-    # host instead of the runner.
+    # INVERTED from the old contract, deliberately. DOCKER_HOST used to be
+    # banned above step level so the build would stay on the runner. The build
+    # now runs ON THE DEPLOY HOST on purpose: buildx's container driver starts
+    # with an empty cache every dispatch, so the host daemon's layer store is
+    # the only cache that survives, and a cold build of this image is 15-45
+    # min. Job level is what makes every docker call -- including the build --
+    # reach that daemon.
     job_level_docker_host = [
         name for name, job in (doc.get("jobs") or {}).items()
         if "DOCKER_HOST" in set(((job or {}).get("env")) or {})
     ]
-    non_step_docker_host = job_level_docker_host + (
-        ["workflow"] if "DOCKER_HOST" in set(doc.get("env") or {}) else []
+    check(
+        bool(job_level_docker_host),
+        "DOCKER_HOST must be set at JOB level -- the build runs on the deploy "
+        "host so its daemon's layer cache survives between dispatches, and "
+        "only a job-level binding reaches the build step",
     )
     check(
-        not non_step_docker_host,
-        f"DOCKER_HOST must never be set at workflow or job level (found on "
-        f"{non_step_docker_host}) -- either would apply to the build step "
-        "too, and buildx binds to whichever daemon is current, so the image "
-        "would build on the deploy host instead of the runner",
+        "DOCKER_HOST" not in set(doc.get("env") or {}),
+        "DOCKER_HOST must not be set at WORKFLOW level -- keep it on the job "
+        "so its scope is visible next to the steps it governs",
     )
-    # "At least one step has it" is not enough: dropping DOCKER_HOST from
-    # any ONE of these three specifically would silently redirect that
-    # step's docker/compose calls to the runner's own daemon instead of the
-    # deploy host's, while every other DOCKER_HOST-bearing step stays green.
-    # Each is asserted by name.
-    for step_name in ("Verify host preconditions", "Pull and deploy", "Smoke test"):
-        named_step = _step_by_name(doc, step_name)
-        check(
-            named_step is not None,
-            f"no step named {step_name!r} -- expected one of the steps that "
-            "must run against the deploy host's daemon",
-        )
-        if named_step is not None:
+    # No step may override the job-level value. A step-scoped DOCKER_HOST that
+    # differs would send just that step to a different daemon -- the silent
+    # failure the old step-scoped design was itself trying to prevent.
+    for job in (doc.get("jobs") or {}).values():
+        for step in (job or {}).get("steps") or []:
             check(
-                "DOCKER_HOST" in _step_env_keys(named_step),
-                f"the {step_name!r} step must have DOCKER_HOST in its own "
-                "`env:` -- without it this step's docker/compose calls would "
-                "silently run against the runner's own daemon instead of the "
-                "deploy host's",
+                "DOCKER_HOST" not in _step_env_keys(step),
+                f"the {str((step or {}).get('name', '?'))!r} step overrides "
+                "DOCKER_HOST in its own `env:` -- it is set once at job level "
+                "so every docker call reaches the same daemon; a step-level "
+                "override would silently redirect only that step",
             )
 
-    # The build step must run against the runner's OWN daemon, never the
-    # deploy host's -- it must not inherit DOCKER_HOST from anywhere.
+    # The build must produce the image in the deploy host's store and push it
+    # nowhere. `push: true` would reintroduce the registry round-trip this
+    # design removed, and would need a registry credential on the runner again.
     build_step = _step_with_uses_containing(doc, "docker/build-push-action")
     check(
         build_step is not None,
@@ -640,11 +640,18 @@ def check_deploy_workflow() -> None:
     )
     if build_step is not None:
         check(
-            "DOCKER_HOST" not in _step_env_keys(build_step),
-            "the docker/build-push-action step must not have DOCKER_HOST in "
-            "its own `env:` -- buildx binds to whichever daemon DOCKER_HOST "
-            "points at, so this would build the image on the deploy host "
-            "instead of the runner",
+            (build_step.get("with") or {}).get("push") in (False, "false"),
+            "the docker/build-push-action step must set `push: false` -- the "
+            "image is built straight into the deploy host's image store and "
+            "there is no registry in this deploy any more",
+        )
+        check(
+            "platforms" not in (build_step.get("with") or {}),
+            "the docker/build-push-action step must not set `platforms` -- "
+            "the build is native to the deploy host, and naming an "
+            "architecture it does not have silently switches on QEMU "
+            "emulation, which is far slower than the cold build this design "
+            "exists to avoid",
         )
 
     keyscan_truncates = [
@@ -738,44 +745,36 @@ def check_deploy_workflow() -> None:
         "per-job ssh-agent instead",
     )
 
-    # Matched against comment-stripped lines, not the raw step text: the raw
-    # text has no comment-stripping at all, so a comment merely NAMING
-    # id_rsa/.env.staging/docker logout (after the real line was deleted)
-    # would satisfy this "must appear" check and leave the validator green
-    # while the secret stays on the runner -- the false-pass shape a
-    # reviewer flagged as the dangerous one.
-    cleanup_step = None
+    # The cleanup step was removed by decision, so this no longer asserts one
+    # exists. What it still enforces is the property that made cleanup matter
+    # least: application secrets never reach disk at all now -- they are bound
+    # as the Deploy step's `env:` rather than rendered into a file. The old
+    # rule also named `.env.staging` and `docker logout`, neither of which
+    # exists any more.
+    #
+    # $RUNNER_TEMP/id_rsa and the ssh-agent DO still outlive the job. If a
+    # cleanup step is reintroduced, it must be `if: always()` and must run
+    # `ssh-agent -k`: deleting the key file does not unload the key, and a
+    # leaked agent holds it decrypted in memory on a persistent runner.
     for job in (doc.get("jobs") or {}).values():
         for step in (job or {}).get("steps") or []:
-            if str((step or {}).get("if", "")).strip() != "always()":
-                continue
             step_text = "\n".join(_script_lines((step or {}).get("run") or ""))
-            if "id_rsa" in step_text and ".env.staging" in step_text and "docker logout" in step_text:
-                cleanup_step = step
-                break
-        if cleanup_step is not None:
-            break
-    check(
-        cleanup_step is not None,
-        "an `if: always()` cleanup step must exist that removes id_rsa and "
-        ".env.staging and logs out of the registry (`docker logout`) -- the "
-        "runner is persistent, so every secret this workflow writes to disk "
-        "must be removed even when an earlier step fails",
-    )
-    if cleanup_step is not None:
-        # Killing the agent was ungated. Deleting $RUNNER_TEMP/id_rsa does not
-        # unload the key: a leaked ssh-agent keeps the DECRYPTED private key in
-        # memory on a persistent runner, reachable by anything that can guess
-        # or read the socket path, for as long as that agent lives -- and a new
-        # one is started on every dispatch.
-        check(
-            "ssh-agent -k" in "\n".join(_script_lines(cleanup_step.get("run") or "")),
-            "the `if: always()` cleanup step must run `ssh-agent -k` -- "
-            "removing the key FILE does not unload the key, and a leaked agent "
-            "holds the decrypted private key in memory on this persistent "
-            "runner until the machine reboots, with one more leaked per "
-            "dispatch",
-        )
+            if "id_rsa" not in step_text or "rm " not in step_text:
+                continue
+            check(
+                str((step or {}).get("if", "")).strip() == "always()",
+                f"the {str((step or {}).get('name', '?'))!r} step removes "
+                "id_rsa but is not `if: always()` -- a run that fails earlier "
+                "would leave the deploy host's private key on this persistent "
+                "runner",
+            )
+            check(
+                "ssh-agent -k" in step_text,
+                f"the {str((step or {}).get('name', '?'))!r} step removes the "
+                "key file but does not run `ssh-agent -k` -- removing the FILE "
+                "does not unload the key, and a leaked agent holds it "
+                "decrypted in memory until the machine reboots",
+            )
 
 
 def report() -> int:
@@ -864,6 +863,20 @@ def main() -> int:
                 f"service {svc!r} declares depends_on {dep!r}, which is not in "
                 "this compose project -- depends_on cannot cross projects",
             )
+
+        # The deploy builds this image into the host's store and pushes it
+        # nowhere, so a missing image is a broken deploy and must fail closed.
+        # Compose's default (`missing`) would instead reach out to the registry
+        # named in the tag -- which for a commit deployed under the retired
+        # push-based scheme SUCCEEDS against a stale GHCR image and silently
+        # starts code that is not what the run built.
+        check(
+            spec.get("pull_policy") == "never",
+            f"service {svc!r} must set `pull_policy: never` -- the image is "
+            "built locally on the deploy host and pushed nowhere, so without "
+            "this Compose would fall back to the registry and could start a "
+            "stale tag left over from the old push-based scheme",
+        )
 
     check_env_example_declares_every_reference()
     check_compose_renders()
