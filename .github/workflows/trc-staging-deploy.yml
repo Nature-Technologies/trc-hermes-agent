@@ -225,9 +225,29 @@ jobs:
           # passes as process environment. It carries no secret itself.
           ssh -i "$RUNNER_TEMP/id_rsa" -p "$SSH_PORT" "${USERNAME}@${HOST}" \
             "mkdir -p ${HOST_DIR} /srv/trc/staging/fingerprints"
+
+          # Upload BESIDE the target and rename over it -- never scp straight
+          # onto it. The container boots as root and docker/stage2-hook.sh
+          # chowns $HERMES_HOME/config.yaml to hermes:hermes (UID 10000) mode
+          # 640; that path is THIS file, bind-mounted, so the chown lands on
+          # the host inode. From the first deploy onward the SSH user can no
+          # longer open it for writing and a plain scp dies with
+          # "dest open: Permission denied" -- every run, permanently.
+          #
+          # rename(2) needs write on the DIRECTORY, which the deploy user owns,
+          # so it succeeds whatever the old file's owner is, and it leaves the
+          # previous config in place if the upload fails.
+          #
+          # It does replace the inode, so a container that is NOT recreated
+          # keeps reading the old file. Routine deploys are safe -- HERMES_IMAGE
+          # carries this run's :git-<sha>, so Compose always recreates. A
+          # re-dispatch of an ALREADY-deployed sha that only changes config.yaml
+          # will not; force it with `docker compose up -d --force-recreate`.
           scp -i "$RUNNER_TEMP/id_rsa" -P "$SSH_PORT" \
             deploy/trc/config.yaml \
-            "${USERNAME}@${HOST}:${HOST_DIR}/config.yaml"
+            "${USERNAME}@${HOST}:${HOST_DIR}/config.yaml.new"
+          ssh -i "$RUNNER_TEMP/id_rsa" -p "$SSH_PORT" "${USERNAME}@${HOST}" \
+            "mv -f ${HOST_DIR}/config.yaml.new ${HOST_DIR}/config.yaml"
 
       - name: Publish the shared-key fingerprint
         env:
