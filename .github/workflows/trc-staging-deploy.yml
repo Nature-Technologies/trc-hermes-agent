@@ -274,7 +274,7 @@ jobs:
           # pointer. To roll back, hardcode an older `:git-<7>` tag here on a
           # throwaway branch -- but only one still in the host's image store.
           HERMES_IMAGE: ${{ steps.tags.outputs.sha }}
-          HERMES_BIND: 127.0.0.1
+          HERMES_BIND: 0.0.0.0
           # Absolute path on the SERVER: the bind source is resolved by the
           # remote daemon. "Copy Hermes config to the host" put it there.
           HERMES_CONFIG_PATH: ${{ env.HOST_DIR }}/config.yaml
