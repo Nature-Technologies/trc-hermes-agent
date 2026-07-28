@@ -46,7 +46,7 @@ services:
     ports:
       # Loopback by default: only in-network services need these.
       - "${HERMES_BIND:-127.0.0.1}:8642:8642"
-      - "${HERMES_BIND:-127.0.0.1}:9119:9119"
+      - "${HERMES_BIND:-0.0.0.0}:9119:9119"
     environment:
       OPENROUTER_API_KEY: "${OPENROUTER_API_KEY}"
       HERMES_YOLO_MODE: "true"
