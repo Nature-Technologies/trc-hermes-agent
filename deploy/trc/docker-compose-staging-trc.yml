@@ -44,9 +44,22 @@ services:
     networks: [poc-net, trc-shared]
     restart: unless-stopped
     ports:
-      # Loopback by default: only in-network services need these.
-      - "${HERMES_BIND:-127.0.0.1}:8642:8642"
-      - "${HERMES_BIND:-0.0.0.0}:9119:9119"
+      # Two variables on purpose, one per publisher. The gateway and the
+      # dashboard have different exposure needs, and a single HERMES_BIND could
+      # not express that: the differing DEFAULTS made it look like it could, but
+      # the moment a value was set it applied to BOTH lines -- so publishing the
+      # dashboard to the LAN silently published the LLM gateway with it.
+      #
+      # 8642 is the OpenAI-compatible gateway. open-webui reaches it over
+      # poc-net by container name, which does not go through a published port at
+      # all, so publishing it past loopback buys nothing and exposes a
+      # bearer-token endpoint to the network.
+      - "${HERMES_API_BIND:-127.0.0.1}:8642:8642"
+      # 9119 is the operator dashboard, gated by HTTP basic auth. Published
+      # wider in staging so operators reach it without an SSH tunnel. Both
+      # defaults are loopback deliberately: an unset variable must fail closed,
+      # never publish to every interface.
+      - "${HERMES_DASHBOARD_BIND:-127.0.0.1}:9119:9119"
     environment:
       OPENROUTER_API_KEY: "${OPENROUTER_API_KEY}"
       HERMES_YOLO_MODE: "true"

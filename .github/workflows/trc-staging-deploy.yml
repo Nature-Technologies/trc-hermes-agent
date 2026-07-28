@@ -274,7 +274,12 @@ jobs:
           # pointer. To roll back, hardcode an older `:git-<7>` tag here on a
           # throwaway branch -- but only one still in the host's image store.
           HERMES_IMAGE: ${{ steps.tags.outputs.sha }}
-          HERMES_BIND: 0.0.0.0
+          # Per publisher, not one value for both -- see the ports block in the
+          # compose file. The gateway stays on loopback (open-webui reaches it
+          # over poc-net by container name, so 8642 never needs publishing);
+          # only the basic-auth-gated dashboard goes to every interface.
+          HERMES_API_BIND: 127.0.0.1
+          HERMES_DASHBOARD_BIND: 0.0.0.0
           # Absolute path on the SERVER: the bind source is resolved by the
           # remote daemon. "Copy Hermes config to the host" put it there.
           HERMES_CONFIG_PATH: ${{ env.HOST_DIR }}/config.yaml
