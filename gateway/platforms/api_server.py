@@ -1173,17 +1173,30 @@ def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
 def _derive_chat_session_id(
     system_prompt: Optional[str],
     first_user_message: str,
+    chat_id: Optional[str] = None,
 ) -> str:
-    """Derive a stable session ID from the conversation's first user message.
+    """Derive a stable session ID for one frontend conversation.
 
-    OpenAI-compatible frontends (Open WebUI, LibreChat, etc.) send the full
-    conversation history with every request.  The system prompt and first user
-    message are constant across all turns of the same conversation, so hashing
-    them produces a deterministic session ID that lets the API server reuse
-    the same Hermes session (and therefore the same Docker container sandbox
-    directory) across turns.
+    When the frontend tells us which conversation this is (Open WebUI's
+    ``X-OpenWebUI-Chat-Id``), that id alone is the seed. Chat ids are UUIDs and
+    unique across users, so one chat maps to exactly one Hermes session and two
+    chats never share one -- even when they open with identical text.
+
+    Identity is deliberately NOT in the seed. Hermes does not verify the identity
+    JWT (the MCP server owns verification), so seeding on its ``sub`` would derive
+    a session id from an unverified caller-supplied claim; and that JWT carries a
+    short expiry, so seeding on the token itself would rotate mid-conversation
+    and split one thread into many.
+
+    Without a chat id -- any other OpenAI-compatible client -- fall back to
+    hashing the system prompt plus the first user message, which is constant
+    across turns of one conversation. That was the ONLY strategy before, and it
+    collides: two conversations opening with the same words produce the same id,
+    and because the Open WebUI filter masks that first message, a PII-free opener
+    is byte-identical across users. Keeping it as a fallback preserves behaviour
+    for clients that cannot do better; it is not a good key.
     """
-    seed = f"{system_prompt or ''}\n{first_user_message}"
+    seed = chat_id if chat_id else f"{system_prompt or ''}\n{first_user_message}"
     digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
     return f"api-{digest}"
 
@@ -3908,16 +3921,23 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
                 history = []
         else:
-            # Derive a stable session ID from the conversation fingerprint so
-            # that consecutive messages from the same Open WebUI (or similar)
-            # conversation map to the same Hermes session.  The first user
-            # message + system prompt are constant across all turns.
+            # Derive a stable session ID so that consecutive messages from the
+            # same Open WebUI (or similar) conversation map to the same Hermes
+            # session. Prefer the frontend's own chat id (Open WebUI's
+            # X-OpenWebUI-Chat-Id, bound per-request onto session_context) --
+            # it is a UUID, unique across chats and users, so it can't collide.
+            # Fall back to fingerprinting the system prompt + first user
+            # message only for clients that send no chat id; that fingerprint
+            # is constant across turns of one conversation but collides
+            # whenever two different conversations open with identical text.
             first_user = ""
             for cm in conversation_messages:
                 if cm.get("role") == "user":
                     first_user = cm.get("content", "")
                     break
-            session_id = _derive_chat_session_id(system_prompt, first_user)
+            session_id = _derive_chat_session_id(
+                system_prompt, first_user, chat_id=get_end_user_chat_id(),
+            )
             # history already set from request body above
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
