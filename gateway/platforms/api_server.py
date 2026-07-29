@@ -113,6 +113,42 @@ def _sanitize_end_user_jwt(raw: Optional[str]) -> Optional[str]:
     return value
 
 
+# Inbound headers carrying the frontend conversation id and turn id. Open WebUI
+# sends both when ENABLE_FORWARD_USER_INFO_HEADERS is on; their names are
+# overridable there, so mirror that flexibility here.
+_END_USER_CHAT_ID_HEADER = (
+    os.environ.get("HERMES_END_USER_CHAT_ID_HEADER", "").strip()
+    or "X-OpenWebUI-Chat-Id"
+)
+_END_USER_REQUEST_ID_HEADER = (
+    os.environ.get("HERMES_END_USER_REQUEST_ID_HEADER", "").strip()
+    or "X-OpenWebUI-Message-Id"
+)
+
+# Same DROP-don't-sanitize rule as the identity above: the value is re-emitted as
+# an outbound header, and a partially-stripped chat id is not this caller's chat
+# id, it is somebody's. Open WebUI sends UUIDs; 200 bytes is far above that.
+_MAX_END_USER_CTX_LEN = 200
+_END_USER_CTX_ALLOWED = re.compile(r"^[A-Za-z0-9._~:@-]+$")
+
+
+def _sanitize_end_user_ctx(raw: Optional[str], header_name: str) -> Optional[str]:
+    """Return a forwardable conversation/turn id, or ``None``. Never raises."""
+    if not raw:
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+    if len(value) > _MAX_END_USER_CTX_LEN or not _END_USER_CTX_ALLOWED.match(value):
+        logger.warning(
+            "Ignoring malformed %s header (%d bytes): not a forwardable id; "
+            "this request proceeds without it",
+            header_name, len(value),
+        )
+        return None
+    return value
+
+
 def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> list[str]:
     if smart_denied:
         return ["once", "deny"]
@@ -136,7 +172,11 @@ from gateway.platforms.base import (
 )
 from agent.redact import redact_sensitive_text
 from gateway.readiness import collect_runtime_readiness
-from gateway.session_context import get_end_user_identity
+from gateway.session_context import (
+    get_end_user_chat_id,
+    get_end_user_identity,
+    get_end_user_request_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1133,17 +1173,30 @@ def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
 def _derive_chat_session_id(
     system_prompt: Optional[str],
     first_user_message: str,
+    chat_id: Optional[str] = None,
 ) -> str:
-    """Derive a stable session ID from the conversation's first user message.
+    """Derive a stable session ID for one frontend conversation.
 
-    OpenAI-compatible frontends (Open WebUI, LibreChat, etc.) send the full
-    conversation history with every request.  The system prompt and first user
-    message are constant across all turns of the same conversation, so hashing
-    them produces a deterministic session ID that lets the API server reuse
-    the same Hermes session (and therefore the same Docker container sandbox
-    directory) across turns.
+    When the frontend tells us which conversation this is (Open WebUI's
+    ``X-OpenWebUI-Chat-Id``), that id alone is the seed. Chat ids are UUIDs and
+    unique across users, so one chat maps to exactly one Hermes session and two
+    chats never share one -- even when they open with identical text.
+
+    Identity is deliberately NOT in the seed. Hermes does not verify the identity
+    JWT (the MCP server owns verification), so seeding on its ``sub`` would derive
+    a session id from an unverified caller-supplied claim; and that JWT carries a
+    short expiry, so seeding on the token itself would rotate mid-conversation
+    and split one thread into many.
+
+    Without a chat id -- any other OpenAI-compatible client -- fall back to
+    hashing the system prompt plus the first user message, which is constant
+    across turns of one conversation. That was the ONLY strategy before, and it
+    collides: two conversations opening with the same words produce the same id,
+    and because the Open WebUI filter masks that first message, a PII-free opener
+    is byte-identical across users. Keeping it as a fallback preserves behaviour
+    for clients that cannot do better; it is not a good key.
     """
-    seed = f"{system_prompt or ''}\n{first_user_message}"
+    seed = chat_id if chat_id else f"{system_prompt or ''}\n{first_user_message}"
     digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
     return f"api-{digest}"
 
@@ -1796,31 +1849,58 @@ class APIServerAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _make_end_user_identity_middleware():
-        """Bind the inbound end-user identity token to this request's context.
+        """Bind the inbound end-user identity, conversation id and turn id to
+        this request's context.
 
-        Request-scoped by construction: the ContextVar is set per aiohttp task
+        Request-scoped by construction: each ContextVar is set per aiohttp task
         and reset when the handler returns, so one shared process serving many
-        users can never hand user B the token that arrived with user A's
-        request. Concurrent requests each get their own task-local binding.
+        users can never hand user B the identity, chat id or turn id that
+        arrived with user A's request. Concurrent requests each get their own
+        task-local binding.
 
-        The token is consumed downstream by the MCP client, which forwards it
-        verbatim on outbound tool calls so a permission-enforcing MCP server
-        learns the real caller. Hermes never mints or synthesizes an identity —
-        no inbound header means no identity, not a default one.
+        The identity token is consumed downstream by the MCP client, which
+        forwards it verbatim on outbound tool calls so a permission-enforcing
+        MCP server learns the real caller. The chat id is consumed the same
+        way to key RAGnarok's PII-masking namespace. Hermes never mints or
+        synthesizes any of these — no inbound header means no value, not a
+        default one.
+
+        All three are bound by one middleware on purpose: a deployment that
+        carries the identity but not the chat id is precisely the failure this
+        pairing prevents — RAGnarok would key its masking namespace off a bare
+        user id instead of ``<user_id>:<chat_id>``, and the two independent
+        mask points would allocate placeholder tokens from different
+        namespaces.
         """
 
         @web.middleware
         async def end_user_identity_middleware(request: "web.Request", handler):
             from gateway.session_context import (
+                reset_end_user_chat_id,
                 reset_end_user_identity,
+                reset_end_user_request_id,
+                set_end_user_chat_id,
                 set_end_user_identity,
+                set_end_user_request_id,
             )
 
             token = _sanitize_end_user_jwt(request.headers.get(_END_USER_JWT_HEADER))
+            chat_id = _sanitize_end_user_ctx(
+                request.headers.get(_END_USER_CHAT_ID_HEADER),
+                _END_USER_CHAT_ID_HEADER,
+            )
+            request_id = _sanitize_end_user_ctx(
+                request.headers.get(_END_USER_REQUEST_ID_HEADER),
+                _END_USER_REQUEST_ID_HEADER,
+            )
             reset_token = set_end_user_identity(token)
+            reset_chat = set_end_user_chat_id(chat_id)
+            reset_req = set_end_user_request_id(request_id)
             try:
                 return await handler(request)
             finally:
+                reset_end_user_request_id(reset_req)
+                reset_end_user_chat_id(reset_chat)
                 reset_end_user_identity(reset_token)
 
         return end_user_identity_middleware
@@ -3841,16 +3921,23 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
                 history = []
         else:
-            # Derive a stable session ID from the conversation fingerprint so
-            # that consecutive messages from the same Open WebUI (or similar)
-            # conversation map to the same Hermes session.  The first user
-            # message + system prompt are constant across all turns.
+            # Derive a stable session ID so that consecutive messages from the
+            # same Open WebUI (or similar) conversation map to the same Hermes
+            # session. Prefer the frontend's own chat id (Open WebUI's
+            # X-OpenWebUI-Chat-Id, bound per-request onto session_context) --
+            # it is a UUID, unique across chats and users, so it can't collide.
+            # Fall back to fingerprinting the system prompt + first user
+            # message only for clients that send no chat id; that fingerprint
+            # is constant across turns of one conversation but collides
+            # whenever two different conversations open with identical text.
             first_user = ""
             for cm in conversation_messages:
                 if cm.get("role") == "user":
                     first_user = cm.get("content", "")
                     break
-            session_id = _derive_chat_session_id(system_prompt, first_user)
+            session_id = _derive_chat_session_id(
+                system_prompt, first_user, chat_id=get_end_user_chat_id(),
+            )
             # history already set from request body above
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
@@ -5834,16 +5921,26 @@ class APIServerAdapter(BasePlatformAdapter):
         # and re-establish it inside _run() (task-local, so concurrent requests
         # never observe each other's identity).
         request_end_user_identity = get_end_user_identity()
+        # The conversation and turn ids make the same hop for the same reason:
+        # ContextVars do not follow run_in_executor threads.
+        request_end_user_chat_id = get_end_user_chat_id()
+        request_end_user_request_id = get_end_user_request_id()
 
         def _run():
             from gateway.session_context import (
                 clear_session_vars,
+                reset_end_user_chat_id,
                 reset_end_user_identity,
+                reset_end_user_request_id,
+                set_end_user_chat_id,
                 set_end_user_identity,
+                set_end_user_request_id,
             )
 
             with self._profile_scope(request_profile):
                 identity_token = set_end_user_identity(request_end_user_identity)
+                chat_id_token = set_end_user_chat_id(request_end_user_chat_id)
+                request_id_token = set_end_user_request_id(request_end_user_request_id)
                 tokens = self._bind_api_server_session(
                     chat_id=session_id or "",
                     session_key=gateway_session_key or session_id or "",
@@ -5991,6 +6088,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 finally:
                     clear_session_vars(tokens)
+                    reset_end_user_request_id(request_id_token)
+                    reset_end_user_chat_id(chat_id_token)
                     reset_end_user_identity(identity_token)
 
         self._activate_admitted_request()

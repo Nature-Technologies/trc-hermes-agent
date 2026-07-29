@@ -60,8 +60,10 @@ mcp_servers:
 | `skip_preflight` | bool | HTTP | Bypass the fail-fast content-type probe for valid Streamable HTTP endpoints whose HEAD/GET answers a non-MCP content type (default: `false`) |
 | `tools` | mapping | both | Filtering and utility-tool policy |
 | `auth` | string | HTTP | Authentication method. Set to `oauth` to enable OAuth 2.1 with PKCE |
-| `forward_user_identity` | bool | Streamable HTTP | Forward the calling end user's identity token on every tool call (default: `false`). See [Forwarding end-user identity](#forwarding-end-user-identity) |
+| `forward_user_identity` | bool | Streamable HTTP | Forward the calling end user's identity token *and* the conversation and turn ids it arrived under, on every tool call (default: `false`). See [Forwarding end-user identity](#forwarding-end-user-identity) |
 | `user_identity_header` | string | Streamable HTTP | Outbound header name for the forwarded identity (default: `X-Hermes-End-User-Jwt`) |
+| `chat_id_header` | string | Streamable HTTP | Outbound header name for the forwarded conversation id (default: `X-Hermes-Chat-Id`). **Leave at the default for RAGnarok** — see [Header names the server must agree on](#header-names-the-server-must-agree-on) |
+| `request_id_header` | string | Streamable HTTP | Outbound header name for the forwarded turn id (default: `X-Hermes-Request-Id`). **Leave at the default for RAGnarok** — see [Header names the server must agree on](#header-names-the-server-must-agree-on) |
 | `sampling` | mapping | both | Server-initiated LLM request policy (see MCP guide) |
 
 ## `tools` policy keys
@@ -276,6 +278,15 @@ is set: an HS256 JWT whose `sub` claim is the user id, plus `email`, `name`,
 `role`, `iss: "open-webui"`, `iat`, and `exp` (default lifetime 300s). Override
 the header name with the `HERMES_END_USER_JWT_HEADER` environment variable.
 
+The conversation id arrives the same way, on `X-OpenWebUI-Chat-Id`, and the turn
+id on `X-OpenWebUI-Message-Id` — Open WebUI sends both under the same
+`ENABLE_FORWARD_USER_INFO_HEADERS` switch. Override the names with
+`HERMES_END_USER_CHAT_ID_HEADER` and `HERMES_END_USER_REQUEST_ID_HEADER`.
+
+One switch covers all three on purpose. A server told who is calling but not from
+where cannot rebuild a key like `<user_id>:<chat_id>`, and the resulting mismatch
+is silent — the tool call succeeds and returns subtly wrong state.
+
 **Outbound.** Hermes attaches the token verbatim to each `tools/call` request:
 
 ```http
@@ -293,6 +304,28 @@ service credential (from `headers`, or from OAuth 2.1 PKCE) and has
 cross-origin-redirect stripping attached. Keeping them separate lets the server
 verify two independent things — which service is calling, and which user it is
 calling for.
+
+### Header names the server must agree on
+
+A header name is a contract between two processes, and only one side of it lives
+in this config. Renaming a header here changes what Hermes *sends*; it does not
+change what the server *reads*.
+
+For the RAGnarok integration specifically:
+
+- **`chat_id_header` and `request_id_header` must stay at their defaults**
+  (`X-Hermes-Chat-Id`, `X-Hermes-Request-Id`). RAGnarok hardcodes both names.
+  Changing either here is not a customisation — it is a break: the chat id
+  simply never arrives, and under `ENFORCE_VERIFIED_IDENTITY` RAGnarok answers
+  every query with a structured "no conversation id on this request" error
+  rather than masking under a namespace it cannot trust. Changing them requires
+  a matching change on the server side.
+- **`user_identity_header`** is the one that is genuinely negotiable: RAGnarok
+  reads its name from its own `IDENTITY_HEADER` setting, so the two can be moved
+  together.
+
+The keys stay configurable for MCP servers that expect other names. Just do not
+point them somewhere RAGnarok is not listening.
 
 ### Guarantees
 

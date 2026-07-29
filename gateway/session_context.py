@@ -109,6 +109,27 @@ _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNS
 # no fallback.  Missing identity must never resolve to somebody else's token.
 _END_USER_IDENTITY: ContextVar = ContextVar("HERMES_END_USER_IDENTITY", default=None)
 
+# Opaque conversation id that arrived on THIS request from the frontend (Open
+# WebUI's ``X-OpenWebUI-Chat-Id``: the id of the chat the user is typing in).
+#
+# Not telemetry.  RAGnarok masks PII at two points and both allocate placeholder
+# tokens from ONE namespace keyed ``<user_id>:<chat_id>``.  Drop the chat id and
+# the two ends key differently, so ``<PERSON_1>`` denotes a different person at
+# each end and the user is shown raw placeholder tokens instead of real values.
+#
+# Distinct from ``_SESSION_CHAT_ID``, which is Hermes' OWN gateway session id --
+# a value the frontend has never seen.
+#
+# Same two rules as the identity: NOT in ``_VAR_MAP`` (an ``os.environ`` fallback
+# in a shared process is a cross-conversation leak), and ``None`` means "nothing
+# arrived" with no default.
+_END_USER_CHAT_ID: ContextVar = ContextVar("HERMES_END_USER_CHAT_ID", default=None)
+
+# Open WebUI's message id for the turn in flight.  Carried only so one turn can
+# be followed across Open WebUI, Hermes and RAGnarok in the logs; nothing
+# behavioural depends on it.
+_END_USER_REQUEST_ID: ContextVar = ContextVar("HERMES_END_USER_REQUEST_ID", default=None)
+
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
 #
@@ -176,6 +197,41 @@ def get_end_user_identity() -> Optional[str]:
 def reset_end_user_identity(token) -> None:
     """Restore the previous identity binding (token from :func:`set_end_user_identity`)."""
     _END_USER_IDENTITY.reset(token)
+
+
+def set_end_user_chat_id(chat_id: Optional[str]):
+    """Bind the frontend conversation id that arrived on this request.
+
+    Returns a reset token; pass it to :func:`reset_end_user_chat_id` in a
+    ``finally`` block so the binding cannot outlive the request.  Blank input
+    binds ``None`` -- an empty chat id is no chat id.
+    """
+    return _END_USER_CHAT_ID.set((chat_id or "").strip() or None)
+
+
+def get_end_user_chat_id() -> Optional[str]:
+    """The frontend conversation id for the current request, or ``None``."""
+    return _END_USER_CHAT_ID.get()
+
+
+def reset_end_user_chat_id(token) -> None:
+    """Restore the previous binding (token from :func:`set_end_user_chat_id`)."""
+    _END_USER_CHAT_ID.reset(token)
+
+
+def set_end_user_request_id(request_id: Optional[str]):
+    """Bind the frontend turn id that arrived on this request."""
+    return _END_USER_REQUEST_ID.set((request_id or "").strip() or None)
+
+
+def get_end_user_request_id() -> Optional[str]:
+    """The frontend turn id for the current request, or ``None``."""
+    return _END_USER_REQUEST_ID.get()
+
+
+def reset_end_user_request_id(token) -> None:
+    """Restore the previous binding."""
+    _END_USER_REQUEST_ID.reset(token)
 
 
 def set_current_session_id(session_id: str) -> None:
@@ -287,6 +343,10 @@ def clear_session_vars(tokens: list) -> None:
     # An end-user identity is strictly request-scoped: a finished handler must
     # not leave one visible to whatever runs next in this context.
     _END_USER_IDENTITY.set(None)
+    # Same request-scoping reason as the identity above: the chat/turn id must
+    # not outlive this handler either.
+    _END_USER_CHAT_ID.set(None)
+    _END_USER_REQUEST_ID.set(None)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -339,6 +399,11 @@ def reset_session_vars() -> None:
     # spawned from a context where a concurrent request had bound its end-user
     # identity would otherwise forward THAT user's token on its MCP tool calls.
     _END_USER_IDENTITY.set(None)
+    # Cleared for the same inheritance-leak reason as the identity above: an
+    # inherited chat id would mask the spawned task's output under the wrong
+    # conversation's namespace.
+    _END_USER_CHAT_ID.set(None)
+    _END_USER_REQUEST_ID.set(None)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
