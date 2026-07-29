@@ -343,6 +343,10 @@ def clear_session_vars(tokens: list) -> None:
     # An end-user identity is strictly request-scoped: a finished handler must
     # not leave one visible to whatever runs next in this context.
     _END_USER_IDENTITY.set(None)
+    # Same request-scoping reason as the identity above: the chat/turn id must
+    # not outlive this handler either.
+    _END_USER_CHAT_ID.set(None)
+    _END_USER_REQUEST_ID.set(None)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -395,6 +399,11 @@ def reset_session_vars() -> None:
     # spawned from a context where a concurrent request had bound its end-user
     # identity would otherwise forward THAT user's token on its MCP tool calls.
     _END_USER_IDENTITY.set(None)
+    # Cleared for the same inheritance-leak reason as the identity above: an
+    # inherited chat id would mask the spawned task's output under the wrong
+    # conversation's namespace.
+    _END_USER_CHAT_ID.set(None)
+    _END_USER_REQUEST_ID.set(None)
     try:
         from agent.runtime_cwd import clear_session_cwd
 

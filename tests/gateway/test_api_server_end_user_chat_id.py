@@ -19,7 +19,13 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.platforms.api_server import APIServerAdapter
-from gateway.session_context import get_end_user_chat_id, get_end_user_request_id
+from gateway.session_context import (
+    clear_session_vars,
+    get_end_user_chat_id,
+    get_end_user_request_id,
+    set_end_user_chat_id,
+    set_end_user_request_id,
+)
 
 CHAT_A = "0f7c1a2e-9b3d-4c5f-8a1b-2d3e4f5a6b7c"
 CHAT_B = "3a9d5e71-2c4b-4f8a-9e0d-1b2c3d4e5f60"
@@ -142,3 +148,27 @@ def test_illegal_chat_id_is_dropped_not_sanitized(bad):
 
     _run(_drive())
     assert seen == [(None, None)]
+
+
+def test_clear_session_vars_zeroes_chat_and_request_ids():
+    """clear_session_vars must not leave a stale chat/turn id for whatever
+    task-spawning code runs next in this context.
+
+    Mirrors the guarantee ``clear_session_vars`` already gives the end-user
+    identity token: a task spawned from a context where a concurrent request
+    had bound its chat id would otherwise mask that spawned task's output
+    under the WRONG conversation's namespace.
+    """
+
+    async def _drive():
+        set_end_user_chat_id(CHAT_A)
+        set_end_user_request_id(MSG_A)
+        assert get_end_user_chat_id() == CHAT_A
+        assert get_end_user_request_id() == MSG_A
+
+        clear_session_vars([])
+
+        assert get_end_user_chat_id() is None
+        assert get_end_user_request_id() is None
+
+    _run(_drive())
