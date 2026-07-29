@@ -366,6 +366,13 @@ _DEFAULT_USER_IDENTITY_HEADER = "X-Hermes-End-User-Jwt"
 # points, so a missing chat id makes the two ends key differently and
 # placeholders silently stop round-tripping. A separate flag would make that
 # broken state configurable.
+#
+# The override exists for MCP servers that expect other names; for RAGnarok both
+# must stay at the defaults below, because it hardcodes them on its side. Renaming
+# here changes only what Hermes SENDS, so the chat id stops arriving and — under
+# ENFORCE_VERIFIED_IDENTITY — every query comes back as a structured "no
+# conversation id on this request" error. Changing them needs a server-side change
+# to match.
 _DEFAULT_CHAT_ID_HEADER = "X-Hermes-Chat-Id"
 _DEFAULT_REQUEST_ID_HEADER = "X-Hermes-Request-Id"
 _MAX_RECONNECT_RETRIES = 5

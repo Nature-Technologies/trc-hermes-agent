@@ -62,8 +62,8 @@ mcp_servers:
 | `auth` | string | HTTP | Authentication method. Set to `oauth` to enable OAuth 2.1 with PKCE |
 | `forward_user_identity` | bool | Streamable HTTP | Forward the calling end user's identity token *and* the conversation and turn ids it arrived under, on every tool call (default: `false`). See [Forwarding end-user identity](#forwarding-end-user-identity) |
 | `user_identity_header` | string | Streamable HTTP | Outbound header name for the forwarded identity (default: `X-Hermes-End-User-Jwt`) |
-| `chat_id_header` | string | Streamable HTTP | Outbound header name for the forwarded conversation id (default: `X-Hermes-Chat-Id`) |
-| `request_id_header` | string | Streamable HTTP | Outbound header name for the forwarded turn id (default: `X-Hermes-Request-Id`) |
+| `chat_id_header` | string | Streamable HTTP | Outbound header name for the forwarded conversation id (default: `X-Hermes-Chat-Id`). **Leave at the default for RAGnarok** — see [Header names the server must agree on](#header-names-the-server-must-agree-on) |
+| `request_id_header` | string | Streamable HTTP | Outbound header name for the forwarded turn id (default: `X-Hermes-Request-Id`). **Leave at the default for RAGnarok** — see [Header names the server must agree on](#header-names-the-server-must-agree-on) |
 | `sampling` | mapping | both | Server-initiated LLM request policy (see MCP guide) |
 
 ## `tools` policy keys
@@ -304,6 +304,28 @@ service credential (from `headers`, or from OAuth 2.1 PKCE) and has
 cross-origin-redirect stripping attached. Keeping them separate lets the server
 verify two independent things — which service is calling, and which user it is
 calling for.
+
+### Header names the server must agree on
+
+A header name is a contract between two processes, and only one side of it lives
+in this config. Renaming a header here changes what Hermes *sends*; it does not
+change what the server *reads*.
+
+For the RAGnarok integration specifically:
+
+- **`chat_id_header` and `request_id_header` must stay at their defaults**
+  (`X-Hermes-Chat-Id`, `X-Hermes-Request-Id`). RAGnarok hardcodes both names.
+  Changing either here is not a customisation — it is a break: the chat id
+  simply never arrives, and under `ENFORCE_VERIFIED_IDENTITY` RAGnarok answers
+  every query with a structured "no conversation id on this request" error
+  rather than masking under a namespace it cannot trust. Changing them requires
+  a matching change on the server side.
+- **`user_identity_header`** is the one that is genuinely negotiable: RAGnarok
+  reads its name from its own `IDENTITY_HEADER` setting, so the two can be moved
+  together.
+
+The keys stay configurable for MCP servers that expect other names. Just do not
+point them somewhere RAGnarok is not listening.
 
 ### Guarantees
 
