@@ -113,6 +113,42 @@ def _sanitize_end_user_jwt(raw: Optional[str]) -> Optional[str]:
     return value
 
 
+# Inbound headers carrying the frontend conversation id and turn id. Open WebUI
+# sends both when ENABLE_FORWARD_USER_INFO_HEADERS is on; their names are
+# overridable there, so mirror that flexibility here.
+_END_USER_CHAT_ID_HEADER = (
+    os.environ.get("HERMES_END_USER_CHAT_ID_HEADER", "").strip()
+    or "X-OpenWebUI-Chat-Id"
+)
+_END_USER_REQUEST_ID_HEADER = (
+    os.environ.get("HERMES_END_USER_REQUEST_ID_HEADER", "").strip()
+    or "X-OpenWebUI-Message-Id"
+)
+
+# Same DROP-don't-sanitize rule as the identity above: the value is re-emitted as
+# an outbound header, and a partially-stripped chat id is not this caller's chat
+# id, it is somebody's. Open WebUI sends UUIDs; 200 bytes is far above that.
+_MAX_END_USER_CTX_LEN = 200
+_END_USER_CTX_ALLOWED = re.compile(r"^[A-Za-z0-9._~:@-]+$")
+
+
+def _sanitize_end_user_ctx(raw: Optional[str], header_name: str) -> Optional[str]:
+    """Return a forwardable conversation/turn id, or ``None``. Never raises."""
+    if not raw:
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+    if len(value) > _MAX_END_USER_CTX_LEN or not _END_USER_CTX_ALLOWED.match(value):
+        logger.warning(
+            "Ignoring malformed %s header (%d bytes): not a forwardable id; "
+            "this request proceeds without it",
+            header_name, len(value),
+        )
+        return None
+    return value
+
+
 def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> list[str]:
     if smart_denied:
         return ["once", "deny"]
@@ -136,7 +172,11 @@ from gateway.platforms.base import (
 )
 from agent.redact import redact_sensitive_text
 from gateway.readiness import collect_runtime_readiness
-from gateway.session_context import get_end_user_identity
+from gateway.session_context import (
+    get_end_user_chat_id,
+    get_end_user_identity,
+    get_end_user_request_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1796,31 +1836,58 @@ class APIServerAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _make_end_user_identity_middleware():
-        """Bind the inbound end-user identity token to this request's context.
+        """Bind the inbound end-user identity, conversation id and turn id to
+        this request's context.
 
-        Request-scoped by construction: the ContextVar is set per aiohttp task
+        Request-scoped by construction: each ContextVar is set per aiohttp task
         and reset when the handler returns, so one shared process serving many
-        users can never hand user B the token that arrived with user A's
-        request. Concurrent requests each get their own task-local binding.
+        users can never hand user B the identity, chat id or turn id that
+        arrived with user A's request. Concurrent requests each get their own
+        task-local binding.
 
-        The token is consumed downstream by the MCP client, which forwards it
-        verbatim on outbound tool calls so a permission-enforcing MCP server
-        learns the real caller. Hermes never mints or synthesizes an identity —
-        no inbound header means no identity, not a default one.
+        The identity token is consumed downstream by the MCP client, which
+        forwards it verbatim on outbound tool calls so a permission-enforcing
+        MCP server learns the real caller. The chat id is consumed the same
+        way to key RAGnarok's PII-masking namespace. Hermes never mints or
+        synthesizes any of these — no inbound header means no value, not a
+        default one.
+
+        All three are bound by one middleware on purpose: a deployment that
+        carries the identity but not the chat id is precisely the failure this
+        pairing prevents — RAGnarok would key its masking namespace off a bare
+        user id instead of ``<user_id>:<chat_id>``, and the two independent
+        mask points would allocate placeholder tokens from different
+        namespaces.
         """
 
         @web.middleware
         async def end_user_identity_middleware(request: "web.Request", handler):
             from gateway.session_context import (
+                reset_end_user_chat_id,
                 reset_end_user_identity,
+                reset_end_user_request_id,
+                set_end_user_chat_id,
                 set_end_user_identity,
+                set_end_user_request_id,
             )
 
             token = _sanitize_end_user_jwt(request.headers.get(_END_USER_JWT_HEADER))
+            chat_id = _sanitize_end_user_ctx(
+                request.headers.get(_END_USER_CHAT_ID_HEADER),
+                _END_USER_CHAT_ID_HEADER,
+            )
+            request_id = _sanitize_end_user_ctx(
+                request.headers.get(_END_USER_REQUEST_ID_HEADER),
+                _END_USER_REQUEST_ID_HEADER,
+            )
             reset_token = set_end_user_identity(token)
+            reset_chat = set_end_user_chat_id(chat_id)
+            reset_req = set_end_user_request_id(request_id)
             try:
                 return await handler(request)
             finally:
+                reset_end_user_request_id(reset_req)
+                reset_end_user_chat_id(reset_chat)
                 reset_end_user_identity(reset_token)
 
         return end_user_identity_middleware
@@ -5834,16 +5901,26 @@ class APIServerAdapter(BasePlatformAdapter):
         # and re-establish it inside _run() (task-local, so concurrent requests
         # never observe each other's identity).
         request_end_user_identity = get_end_user_identity()
+        # The conversation and turn ids make the same hop for the same reason:
+        # ContextVars do not follow run_in_executor threads.
+        request_end_user_chat_id = get_end_user_chat_id()
+        request_end_user_request_id = get_end_user_request_id()
 
         def _run():
             from gateway.session_context import (
                 clear_session_vars,
+                reset_end_user_chat_id,
                 reset_end_user_identity,
+                reset_end_user_request_id,
+                set_end_user_chat_id,
                 set_end_user_identity,
+                set_end_user_request_id,
             )
 
             with self._profile_scope(request_profile):
                 identity_token = set_end_user_identity(request_end_user_identity)
+                chat_id_token = set_end_user_chat_id(request_end_user_chat_id)
+                request_id_token = set_end_user_request_id(request_end_user_request_id)
                 tokens = self._bind_api_server_session(
                     chat_id=session_id or "",
                     session_key=gateway_session_key or session_id or "",
@@ -5991,6 +6068,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 finally:
                     clear_session_vars(tokens)
+                    reset_end_user_request_id(request_id_token)
+                    reset_end_user_chat_id(chat_id_token)
                     reset_end_user_identity(identity_token)
 
         self._activate_admitted_request()
