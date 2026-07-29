@@ -4847,6 +4847,19 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         end_user_chat_id = _resolve_end_user_chat_id(server)
         end_user_request_id = _resolve_end_user_request_id(server)
 
+        # One line per hop, so a broken metadata chain is visible without a
+        # debugger. Identities, presence flags and names only -- never the token
+        # itself and never the tool arguments (invariant 1).
+        logger.info(
+            "hop=hermes.mcp req=%s chat=%s server=%s tool=%s jwt=%s chat_hdr=%s",
+            end_user_request_id or "-",
+            end_user_chat_id or "-",
+            server_name,
+            tool_name,
+            "yes" if end_user_identity else "no",
+            "yes" if end_user_chat_id else "no",
+        )
+
         async def _call():
             _mark_server_call_started(server)
             async with server._rpc_lock:
