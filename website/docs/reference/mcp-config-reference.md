@@ -60,8 +60,10 @@ mcp_servers:
 | `skip_preflight` | bool | HTTP | Bypass the fail-fast content-type probe for valid Streamable HTTP endpoints whose HEAD/GET answers a non-MCP content type (default: `false`) |
 | `tools` | mapping | both | Filtering and utility-tool policy |
 | `auth` | string | HTTP | Authentication method. Set to `oauth` to enable OAuth 2.1 with PKCE |
-| `forward_user_identity` | bool | Streamable HTTP | Forward the calling end user's identity token on every tool call (default: `false`). See [Forwarding end-user identity](#forwarding-end-user-identity) |
+| `forward_user_identity` | bool | Streamable HTTP | Forward the calling end user's identity token *and* the conversation and turn ids it arrived under, on every tool call (default: `false`). See [Forwarding end-user identity](#forwarding-end-user-identity) |
 | `user_identity_header` | string | Streamable HTTP | Outbound header name for the forwarded identity (default: `X-Hermes-End-User-Jwt`) |
+| `chat_id_header` | string | Streamable HTTP | Outbound header name for the forwarded conversation id (default: `X-Hermes-Chat-Id`) |
+| `request_id_header` | string | Streamable HTTP | Outbound header name for the forwarded turn id (default: `X-Hermes-Request-Id`) |
 | `sampling` | mapping | both | Server-initiated LLM request policy (see MCP guide) |
 
 ## `tools` policy keys
@@ -275,6 +277,15 @@ each request to the API server. Open WebUI sends this when
 is set: an HS256 JWT whose `sub` claim is the user id, plus `email`, `name`,
 `role`, `iss: "open-webui"`, `iat`, and `exp` (default lifetime 300s). Override
 the header name with the `HERMES_END_USER_JWT_HEADER` environment variable.
+
+The conversation id arrives the same way, on `X-OpenWebUI-Chat-Id`, and the turn
+id on `X-OpenWebUI-Message-Id` — Open WebUI sends both under the same
+`ENABLE_FORWARD_USER_INFO_HEADERS` switch. Override the names with
+`HERMES_END_USER_CHAT_ID_HEADER` and `HERMES_END_USER_REQUEST_ID_HEADER`.
+
+One switch covers all three on purpose. A server told who is calling but not from
+where cannot rebuild a key like `<user_id>:<chat_id>`, and the resulting mismatch
+is silent — the tool call succeeds and returns subtly wrong state.
 
 **Outbound.** Hermes attaches the token verbatim to each `tools/call` request:
 
