@@ -40,6 +40,7 @@ Requires:
 """
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import errno
 import hashlib
 import hmac
@@ -245,6 +246,10 @@ _STATUS_HINTS_QUESTION_CHARS = 2000
 # Fire-and-forget hint tasks are held here so the event loop cannot garbage-collect
 # them mid-flight; each removes itself when done.
 _STATUS_HINT_TASKS: set = set()
+# A dedicated pool so a slow or retrying hints call can never occupy a default-executor
+# worker that the agent or the writer's 0.5 s queue poll needs — a saturated hints pool
+# only delays hints (the canned lines stand in), never the answer stream.
+_STATUS_HINTS_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="status-hints")
 
 
 def _question_text(user_message) -> str:
@@ -281,7 +286,10 @@ def _status_hints_enabled(cfg: dict) -> bool:
 
         return is_truthy_value(cfg.get("enabled"), default=True)
     except Exception:
-        return cfg.get("enabled", True) is not False
+        # A kill switch must fail closed: if the truthy helper is unavailable, treat the
+        # feature as off rather than silently on.
+        logger.debug("status_hints: is_truthy_value unavailable; disabling (fail closed)")
+        return False
 
 
 def _cfg_number(cfg: dict, key: str, default: float) -> float:
@@ -4325,7 +4333,7 @@ class APIServerAdapter(BasePlatformAdapter):
             loop = asyncio.get_running_loop()
             try:
                 lines = await asyncio.wait_for(
-                    loop.run_in_executor(None, _generate_status_hints, question_text, max_lines, hints_timeout),
+                    loop.run_in_executor(_STATUS_HINTS_EXECUTOR, _generate_status_hints, question_text, max_lines, hints_timeout),
                     timeout=hints_timeout + 1.0,
                 )
             except Exception as exc:

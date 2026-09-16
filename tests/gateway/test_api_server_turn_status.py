@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import queue
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -196,3 +197,27 @@ def test_a_hung_side_call_still_delivers_empty_hints_within_the_bound():
 
     asyncio.run(run())
     assert ("__hints__", []) in _drain(q)
+
+
+def test_status_hints_runs_on_a_dedicated_executor():
+    from concurrent.futures import ThreadPoolExecutor
+
+    assert isinstance(srv._STATUS_HINTS_EXECUTOR, ThreadPoolExecutor)
+    # a saturated hints pool must never be the default pool the writer/agent share
+    assert srv._STATUS_HINTS_EXECUTOR._thread_name_prefix == "status-hints"
+
+
+def test_status_hints_disabled_when_truthy_helper_unavailable(monkeypatch):
+    # Fail closed: if is_truthy_value cannot be imported, the feature is OFF, not on.
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _boom(name, *a, **k):
+        if name == "utils":
+            raise ImportError("simulated")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", _boom)
+    assert srv._status_hints_enabled({"enabled": True}) is False
+    assert srv._status_hints_enabled({"enabled": "false"}) is False

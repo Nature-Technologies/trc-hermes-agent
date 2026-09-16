@@ -36,6 +36,8 @@ STATUS_TEXT_RE = re.compile("^[A-Za-z][A-Za-z ,.\x27\u2019\\-]{6,88}\u2026?\\Z")
 # Hermes registers MCP tools as ``mcp__<server>__<tool>``; these four are the ones that
 # search TRC's records. Anything else — ``ingest_document`` included — is "other".
 DATA_TOOL_PREFIX = "mcp__ragnarok__"
+# These four names mirror the backend's `mcp__ragnarok__` tool registry; a data tool
+# added there but not here reads as "other" (no hints, trace hidden) until this set grows.
 DATA_TOOLS = frozenset({"query", "list_entities", "generate_report", "find_relationships"})
 
 READING_LINE = "Reading your question…"
@@ -136,10 +138,10 @@ def sanitize_lines(raw, max_lines: int) -> list[str]:
         key = line.casefold()
         if key in seen:
             continue
-        seen.add(key)
-        out.append(line + "…")
         if len(out) >= max(0, int(max_lines)):
             break
+        seen.add(key)
+        out.append(line + "…")
     return out
 
 

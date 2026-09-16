@@ -78,6 +78,7 @@ auxiliary:
     enabled: true
     provider: "auto"
     model: ""
+    reasoning_effort: "none"
     timeout: 5
     max_lines: 4
     cadence_seconds: 6

@@ -93,3 +93,7 @@ def test_every_survivor_matches_the_regex():
     raw = json.dumps(["Looking through recent statements", "Checking the agreement terms"])
     for line in sanitize_lines(raw, 4):
         assert STATUS_TEXT_RE.match(line)
+
+
+def test_max_lines_zero_returns_nothing():
+    assert sanitize_lines(json.dumps(["Looking through recent statements"]), 0) == []
