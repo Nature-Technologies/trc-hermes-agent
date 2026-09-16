@@ -101,9 +101,15 @@ def test_the_regex_admits_a_typographic_apostrophe():
 
 def test_the_status_regex_is_byte_exact():
     # Pinned against an escaped literal so an editor normalising quotes cannot pass silently.
-    assert STATUS_TEXT_RE.pattern == "^[A-Za-z][A-Za-z ,.'\u2019\\-]{6,88}\u2026?$"
+    assert STATUS_TEXT_RE.pattern == "^[A-Za-z][A-Za-z ,.\x27\u2019\\-]{6,88}\u2026?\\Z"
     assert STATUS_TEXT_RE.match("Checking the client's file\u2026")
     assert STATUS_TEXT_RE.match("Checking the client\u2019s file\u2026")
+
+
+def test_the_regex_admits_no_trailing_newline():
+    # `$` would match before a final newline; `\Z` does not.
+    assert not STATUS_TEXT_RE.match("Searching TRC records…\n")
+    assert not STATUS_TEXT_RE.match("A" * 20 + "\n")
 
 
 # --- the timeline ------------------------------------------------------------------
