@@ -4081,6 +4081,8 @@ class APIServerAdapter(BasePlatformAdapter):
         if stream:
             import queue as _q
             _stream_q: _q.Queue = _q.Queue()
+            # Interim status line for Open WebUI turns -- None for every other client.
+            turn_status = self._start_turn_status(_stream_q, user_message)
 
             def _on_delta(delta):
                 # Filter out None — the agent fires stream_delta_callback(None)
@@ -4171,6 +4173,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 request, completion_id, model_name, created, _stream_q,
                 agent_task, agent_ref, session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                turn_status=turn_status,
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
@@ -4343,13 +4346,19 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
         created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
-        gateway_session_key: str = None,
+        gateway_session_key: str = None, *, turn_status=None,
     ) -> "web.StreamResponse":
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
         If the client disconnects mid-stream (network drop, browser tab close),
         the agent is interrupted via ``agent.interrupt()`` so it stops making
         LLM API calls, and the asyncio task wrapper is cancelled.
+
+        ``turn_status`` (a ``turn_status.TurnStatus``, or None) is the interim status
+        line for Open WebUI turns. The writer is its single consumer: ``("__status__",
+        payload)`` items are written as status chunks, tool-progress items and content
+        strings feed it, the 0.5 s idle branch ticks it, and its terminal frame is
+        written before the finish chunk so a shimmer is never left on screen.
         """
         import queue as _q
 
@@ -4383,6 +4392,12 @@ class APIServerAdapter(BasePlatformAdapter):
             await response.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
             last_activity = time.monotonic()
 
+            # Helper — write one status payload as a stock Open WebUI frame.
+            async def _emit_status(payload):
+                chunk = status_chunk(completion_id, model, created, payload)
+                await response.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                return time.monotonic()
+
             # Helper — route a queue item to the correct SSE event.
             async def _emit(item):
                 """Write a single queue item to the SSE stream.
@@ -4393,19 +4408,41 @@ class APIServerAdapter(BasePlatformAdapter):
                 frontends can display them without storing the markers in
                 conversation history.  See #6972 for the original event,
                 #16588 for the ``toolCallId``/``status`` lifecycle fields.
+                ``("__status__", payload)`` and ``("__hints__", lines)`` belong
+                to the interim status line (``turn_status``): the first is
+                written as a status chunk, the second only feeds the machine.
                 """
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
                     event_data = json.dumps(item[1])
                     await response.write(
                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
                     )
-                else:
-                    content_chunk = {
-                        "id": completion_id, "object": "chat.completion.chunk",
-                        "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
-                    }
-                    await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                    stamp = time.monotonic()
+                    if turn_status is not None:
+                        payload = item[1] if isinstance(item[1], dict) else {}
+                        tool_name = str(payload.get("tool", ""))
+                        if payload.get("status") == "running":
+                            for p in turn_status.on_tool_start(tool_name):
+                                stamp = await _emit_status(p)
+                        elif payload.get("status") == "completed":
+                            for p in turn_status.on_tool_complete(tool_name):
+                                stamp = await _emit_status(p)
+                    return stamp
+                if isinstance(item, tuple) and len(item) == 2 and item[0] == "__status__":
+                    return await _emit_status(item[1])
+                if isinstance(item, tuple) and len(item) == 2 and item[0] == "__hints__":
+                    if turn_status is not None:
+                        turn_status.on_hints(item[1])
+                    return time.monotonic()
+                if turn_status is not None and isinstance(item, str) and item:
+                    for p in turn_status.on_content():
+                        await _emit_status(p)
+                content_chunk = {
+                    "id": completion_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
+                }
+                await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
                 return time.monotonic()
 
             # Stream content chunks as they arrive from the agent
@@ -4414,6 +4451,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 try:
                     delta = await loop.run_in_executor(None, lambda: stream_q.get(timeout=0.5))
                 except _q.Empty:
+                    if turn_status is not None:
+                        for p in turn_status.on_tick():
+                            last_activity = await _emit_status(p)
                     if agent_task.done():
                         # Drain any remaining items
                         while True:
@@ -4472,6 +4512,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 finish_reason = "error"
             else:
                 finish_reason = "stop"
+
+            # The interim status line's terminal frame goes before the finish chunk, on
+            # error ends too, so nothing is left shimmering above the message.
+            if turn_status is not None:
+                for p in turn_status.on_end():
+                    await _emit_status(p)
 
             # Finish chunk
             finish_chunk = {
