@@ -29,7 +29,7 @@ from typing import Callable, Optional
 # digit, a link, an address or a bracket cannot match. MIRRORED, character for
 # character, in trc-backend/integrations/openwebui/filter.py (`_STATUS_TEXT_RE`): change
 # both together.
-STATUS_TEXT_RE = re.compile("^[A-Za-z][A-Za-z ,.'’\\-]{6,88}…?$")
+STATUS_TEXT_RE = re.compile("^[A-Za-z][A-Za-z ,.\x27’’\\-]{6,88}…?$")
 
 # Hermes registers MCP tools as ``mcp__<server>__<tool>``; these four are the ones that
 # search TRC's records. Anything else — ``ingest_document`` included — is "other".
@@ -85,6 +85,60 @@ def status_chunk(completion_id: str, model: str, created: int, payload: dict) ->
         "choices": [],
         "event": {"type": "status", "data": dict(payload)},
     }
+
+
+_BULLET_RE = re.compile(r"^(?:[-*•]\s*|\d+[.)]\s*)")
+_EDGE_QUOTES = "\"'“”‘’`"
+_FENCE_RE = re.compile(r"^```[A-Za-z]*\s*|\s*```$")
+
+
+def _candidate_lines(raw) -> list[str]:
+    """A JSON array of strings if that is what the model returned, else its lines."""
+    text = _FENCE_RE.sub("", str(raw or "").strip()).strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, list):
+        return [item for item in parsed if isinstance(item, str)]
+    return text.splitlines()
+
+
+def _normalize_line(candidate: str) -> Optional[str]:
+    line = " ".join(candidate.split())
+    line = _BULLET_RE.sub("", line).strip().strip(_EDGE_QUOTES).strip()
+    line = line.rstrip(".… ")
+    if not STATUS_TEXT_RE.match(line):
+        return None
+    return line
+
+
+def sanitize_lines(raw, max_lines: int) -> list[str]:
+    """Turn the hints model's reply into at most ``max_lines`` safe status lines.
+
+    Lenient on shape (a JSON array, a fenced array, or plain lines with bullets and
+    quotes), strict on content: a line survives only if it matches ``STATUS_TEXT_RE``
+    before the ellipsis is added — so a token, a digit, a date, a link, an address or a
+    bracket cannot. Survivors are deduplicated case-insensitively and get a trailing
+    ellipsis so every rotating line reads the same way. Zero survivors is a legitimate
+    answer: the caller falls back to the canned lines.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for candidate in _candidate_lines(raw):
+        line = _normalize_line(candidate)
+        if line is None:
+            continue
+        key = line.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(line + "…")
+        if len(out) >= max(0, int(max_lines)):
+            break
+    return out
 
 
 class TurnStatus:
