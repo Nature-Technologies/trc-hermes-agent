@@ -1721,6 +1721,22 @@ DEFAULT_CONFIG = {
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
             "language": "",
         },
+        # Interim status lines for Open WebUI turns: a bounded side-call that turns the
+        # user's (masked) question into up to `max_lines` activity lines shown above the
+        # answer while the tool runs. `enabled: false` emits no status frames at all.
+        # Spec: trc-backend docs/superpowers/specs/2026-09-16-interim-status-while-answering-design.md
+        "status_hints": {
+            "enabled": True,
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 5,            # seconds; the agent never waits on this call
+            "extra_body": {},
+            "reasoning_effort": "",  # per-task thinking level; empty = provider default
+            "max_lines": 4,          # hint lines kept per turn
+            "cadence_seconds": 6,    # minimum spacing between rotating lines
+        },
         "memory_query_rewrite": {
             "provider": "auto",
             "model": "",

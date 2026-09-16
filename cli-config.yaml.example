@@ -618,6 +618,18 @@ prompt_caching:
 #     timeout: 30
 #     language: ""           # empty = match the user's language; or e.g. "English"
 #
+#   # Interim status lines shown above the answer in Open WebUI while a tool runs.
+#   # One small call per turn over the (masked) user question; lines are sanitized
+#   # to plain text and never enter the session. Pick a model whose data-retention
+#   # terms match your main model's. `enabled: false` emits no status frames.
+#   status_hints:
+#     enabled: true
+#     provider: "auto"
+#     model: ""
+#     timeout: 5             # seconds; the agent never waits on this call
+#     max_lines: 4           # hint lines kept per turn
+#     cadence_seconds: 6     # minimum spacing between rotating lines
+#
 #   # Session search — summarizes matching past sessions
 #   session_search:
 #     provider: "auto"
