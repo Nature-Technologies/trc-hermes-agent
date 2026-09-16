@@ -309,7 +309,7 @@ def set_session_vars(
     return tokens
 
 
-def clear_session_vars(tokens: list = ()) -> None:
+def clear_session_vars(tokens: list) -> None:
     """Mark session context variables as explicitly cleared.
 
     Sets all variables to ``""`` so that ``get_session_env`` returns an empty

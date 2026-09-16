@@ -28,9 +28,9 @@ def _adapter():
 
 @pytest.fixture(autouse=True)
 def _clean_context():
-    clear_session_vars()
+    clear_session_vars([])
     yield
-    clear_session_vars()
+    clear_session_vars([])
 
 
 def _drain(q):
