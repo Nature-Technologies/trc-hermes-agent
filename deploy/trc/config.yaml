@@ -69,3 +69,16 @@ mcp_servers:
 # fallback_model:
 #   provider: openrouter
 #   model: anthropic/claude-sonnet-4
+
+auxiliary:
+  # Interim status line above the answer in Open WebUI (trc-backend spec
+  # 2026-09-16-interim-status-while-answering-design.md). The side-call sees only the
+  # masked question; choose a model whose retention terms match the reasoning model's.
+  status_hints:
+    enabled: true
+    provider: "auto"
+    model: ""
+    reasoning_effort: "none"
+    timeout: 5
+    max_lines: 4
+    cadence_seconds: 6

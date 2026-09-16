@@ -40,6 +40,7 @@ Requires:
 """
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import errno
 import hashlib
 import hmac
@@ -177,6 +178,7 @@ from gateway.session_context import (
     get_end_user_identity,
     get_end_user_request_id,
 )
+from gateway.platforms.turn_status import TurnStatus, sanitize_lines, status_chunk
 
 logger = logging.getLogger(__name__)
 
@@ -213,6 +215,127 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+
+# ---------------------------------------------------------------------------
+# Interim status line for Open WebUI turns (gateway/platforms/turn_status.py).
+#
+# Spec: trc-backend docs/superpowers/specs/2026-09-16-interim-status-while-answering-design.md
+# ---------------------------------------------------------------------------
+
+# Verbatim from the spec (S5). The model sees only the last user message, already
+# masked by the Open WebUI filter, and must describe activity -- never a finding.
+_STATUS_HINTS_PROMPT = (
+    "You write short progress lines that a user sees while a search over their firm's "
+    "confidential records is running. You are given only the user's question. Some parts "
+    "of it are masked as placeholders in angle brackets; you do not know what they stand "
+    "for.\n\n"
+    "Write up to 4 lines. Each line is 4 to 10 words, present progressive, describing an "
+    "activity the search is plausibly doing for this question (for example \"Looking "
+    "through recent account statements\"). Rules:\n"
+    "- Never state a result, a fact, a name, a number, a date, an amount, or anything in "
+    "angle brackets. Refer to masked items generically (\"the client you asked about\", "
+    "\"the account\").\n"
+    "- Letters and spaces only, with commas, periods, apostrophes and hyphens; no digits, "
+    "quotes, brackets, links or emoji.\n"
+    "- Do not answer the question. Do not repeat it.\n"
+    "Reply with a JSON array of strings and nothing else."
+)
+_STATUS_HINTS_MAX_TOKENS = 160
+_STATUS_HINTS_QUESTION_CHARS = 2000
+
+# Fire-and-forget hint tasks are held here so the event loop cannot garbage-collect
+# them mid-flight; each removes itself when done.
+_STATUS_HINT_TASKS: set = set()
+# A dedicated pool so a slow or retrying hints call can never occupy a default-executor
+# worker that the agent or the writer's 0.5 s queue poll needs — a saturated hints pool
+# only delays hints (the canned lines stand in), never the answer stream.
+_STATUS_HINTS_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="status-hints")
+
+
+def _question_text(user_message) -> str:
+    """The text of the last user message -- a string, or the text parts of a list."""
+    if isinstance(user_message, str):
+        text = user_message
+    elif isinstance(user_message, list):
+        text = "\n".join(
+            part.get("text", "")
+            for part in user_message
+            if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str)
+        )
+    else:
+        return ""
+    return text.strip()[:_STATUS_HINTS_QUESTION_CHARS]
+
+
+def _status_hints_config() -> dict:
+    """``auxiliary.status_hints`` from config, or {} when unavailable."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly() or {}
+        task = ((config.get("auxiliary") or {}).get("status_hints")) or {}
+        return task if isinstance(task, dict) else {}
+    except Exception:
+        logger.debug("status_hints: config unreadable; using defaults", exc_info=True)
+        return {}
+
+
+def _status_hints_enabled(cfg: dict) -> bool:
+    try:
+        from utils import is_truthy_value
+
+        return is_truthy_value(cfg.get("enabled"), default=True)
+    except Exception:
+        # A kill switch must fail closed: if the truthy helper is unavailable, treat the
+        # feature as off rather than silently on.
+        logger.debug("status_hints: is_truthy_value unavailable; disabling (fail closed)")
+        return False
+
+
+def _cfg_number(cfg: dict, key: str, default: float) -> float:
+    try:
+        value = float(cfg.get(key, default))
+    except (TypeError, ValueError):
+        return float(default)
+    return value if value >= 0 else float(default)
+
+
+def _call_status_hints_model(*, messages: list, max_tokens: int, timeout: float):
+    """The one place the side-call touches the provider -- patched in tests."""
+    from agent.auxiliary_client import call_llm
+
+    return call_llm(task="status_hints", messages=messages, max_tokens=max_tokens, timeout=timeout)
+
+
+def _generate_status_hints(question_text: str, max_lines: int, timeout: float) -> list[str]:
+    """Blocking. Up to ``max_lines`` sanitized activity lines, or [] on ANY failure.
+
+    Runs in an executor; the agent never waits on it. A failure is a debug line naming
+    the exception type, never the text -- the caller falls back to the canned lines.
+    Think blocks are stripped first: a reasoning model's scratchpad is plain prose that
+    would otherwise sail through the sanitizer as "hints".
+    """
+    from agent.agent_runtime_helpers import strip_think_blocks
+
+    messages = [
+        {"role": "system", "content": _STATUS_HINTS_PROMPT},
+        {"role": "user", "content": question_text},
+    ]
+    try:
+        response = _call_status_hints_model(
+            messages=messages, max_tokens=_STATUS_HINTS_MAX_TOKENS, timeout=timeout,
+        )
+        content = response.choices[0].message.content or ""
+    except Exception as exc:
+        logger.debug("status_hints: side-call failed (%s); canned lines will be used", type(exc).__name__)
+        return []
+    try:
+        return sanitize_lines(strip_think_blocks(None, content), max_lines)
+    except Exception as exc:
+        logger.debug("status_hints: sanitizer failed (%s)", type(exc).__name__)
+        return []
+
+
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
 _COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 
@@ -3966,6 +4089,8 @@ class APIServerAdapter(BasePlatformAdapter):
         if stream:
             import queue as _q
             _stream_q: _q.Queue = _q.Queue()
+            # Interim status line for Open WebUI turns -- None for every other client.
+            turn_status = self._start_turn_status(_stream_q, user_message)
 
             def _on_delta(delta):
                 # Filter out None — the agent fires stream_delta_callback(None)
@@ -4056,6 +4181,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 request, completion_id, model_name, created, _stream_q,
                 agent_task, agent_ref, session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                turn_status=turn_status,
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
@@ -4174,16 +4300,73 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return web.json_response(response_data, headers=response_headers)
 
+    def _start_turn_status(self, stream_q, user_message):
+        """The interim status machine for this turn, or None when it does not apply.
+
+        Applies only to a request that carried Open WebUI's chat-id header (the CLI,
+        the dashboard and other clients see no new frames) and only while
+        ``auxiliary.status_hints.enabled`` is true. Puts the reading frame on the queue
+        at once and starts the bounded hints side-call; the result arrives on the same
+        queue as ``("__hints__", lines)`` so the writer is the machine's one consumer.
+        The agent starts regardless of any of this.
+        """
+        if not get_end_user_chat_id():
+            return None
+        cfg = _status_hints_config()
+        if not _status_hints_enabled(cfg):
+            return None
+        turn_status = TurnStatus(
+            clock=time.monotonic,
+            cadence_seconds=_cfg_number(cfg, "cadence_seconds", 6.0),
+            max_lines=int(_cfg_number(cfg, "max_lines", 4)),
+        )
+        for payload in turn_status.on_request():
+            stream_q.put(("__status__", payload))
+
+        question_text = _question_text(user_message)
+        if not question_text:
+            return turn_status
+        hints_timeout = _cfg_number(cfg, "timeout", 5.0)
+        max_lines = turn_status.max_lines
+
+        async def _deliver_hints():
+            loop = asyncio.get_running_loop()
+            try:
+                lines = await asyncio.wait_for(
+                    loop.run_in_executor(_STATUS_HINTS_EXECUTOR, _generate_status_hints, question_text, max_lines, hints_timeout),
+                    timeout=hints_timeout + 1.0,
+                )
+            except Exception as exc:
+                logger.debug("status_hints: not delivered (%s)", type(exc).__name__)
+                lines = []
+            stream_q.put(("__hints__", list(lines or [])))
+
+        try:
+            task = asyncio.ensure_future(_deliver_hints())
+        except RuntimeError:
+            # No running loop (a synchronous caller): the line still works, canned only.
+            stream_q.put(("__hints__", []))
+            return turn_status
+        _STATUS_HINT_TASKS.add(task)
+        task.add_done_callback(_STATUS_HINT_TASKS.discard)
+        return turn_status
+
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
         created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
-        gateway_session_key: str = None,
+        gateway_session_key: str = None, *, turn_status=None,
     ) -> "web.StreamResponse":
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
         If the client disconnects mid-stream (network drop, browser tab close),
         the agent is interrupted via ``agent.interrupt()`` so it stops making
         LLM API calls, and the asyncio task wrapper is cancelled.
+
+        ``turn_status`` (a ``turn_status.TurnStatus``, or None) is the interim status
+        line for Open WebUI turns. The writer is its single consumer: ``("__status__",
+        payload)`` items are written as status chunks, tool-progress items and content
+        strings feed it, the 0.5 s idle branch ticks it, and its terminal frame is
+        written before the finish chunk so a shimmer is never left on screen.
         """
         import queue as _q
 
@@ -4217,6 +4400,12 @@ class APIServerAdapter(BasePlatformAdapter):
             await response.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
             last_activity = time.monotonic()
 
+            # Helper — write one status payload as a stock Open WebUI frame.
+            async def _emit_status(payload):
+                chunk = status_chunk(completion_id, model, created, payload)
+                await response.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                return time.monotonic()
+
             # Helper — route a queue item to the correct SSE event.
             async def _emit(item):
                 """Write a single queue item to the SSE stream.
@@ -4227,19 +4416,41 @@ class APIServerAdapter(BasePlatformAdapter):
                 frontends can display them without storing the markers in
                 conversation history.  See #6972 for the original event,
                 #16588 for the ``toolCallId``/``status`` lifecycle fields.
+                ``("__status__", payload)`` and ``("__hints__", lines)`` belong
+                to the interim status line (``turn_status``): the first is
+                written as a status chunk, the second only feeds the machine.
                 """
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
                     event_data = json.dumps(item[1])
                     await response.write(
                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
                     )
-                else:
-                    content_chunk = {
-                        "id": completion_id, "object": "chat.completion.chunk",
-                        "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
-                    }
-                    await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                    stamp = time.monotonic()
+                    if turn_status is not None:
+                        payload = item[1] if isinstance(item[1], dict) else {}
+                        tool_name = str(payload.get("tool", ""))
+                        if payload.get("status") == "running":
+                            for p in turn_status.on_tool_start(tool_name):
+                                stamp = await _emit_status(p)
+                        elif payload.get("status") == "completed":
+                            for p in turn_status.on_tool_complete(tool_name):
+                                stamp = await _emit_status(p)
+                    return stamp
+                if isinstance(item, tuple) and len(item) == 2 and item[0] == "__status__":
+                    return await _emit_status(item[1])
+                if isinstance(item, tuple) and len(item) == 2 and item[0] == "__hints__":
+                    if turn_status is not None:
+                        turn_status.on_hints(item[1])
+                    return time.monotonic()
+                if turn_status is not None and isinstance(item, str) and item:
+                    for p in turn_status.on_content():
+                        await _emit_status(p)
+                content_chunk = {
+                    "id": completion_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
+                }
+                await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
                 return time.monotonic()
 
             # Stream content chunks as they arrive from the agent
@@ -4248,6 +4459,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 try:
                     delta = await loop.run_in_executor(None, lambda: stream_q.get(timeout=0.5))
                 except _q.Empty:
+                    if turn_status is not None:
+                        for p in turn_status.on_tick():
+                            last_activity = await _emit_status(p)
                     if agent_task.done():
                         # Drain any remaining items
                         while True:
@@ -4306,6 +4520,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 finish_reason = "error"
             else:
                 finish_reason = "stop"
+
+            # The interim status line's terminal frame goes before the finish chunk, on
+            # error ends too, so nothing is left shimmering above the message.
+            if turn_status is not None:
+                for p in turn_status.on_end():
+                    await _emit_status(p)
 
             # Finish chunk
             finish_chunk = {

@@ -317,6 +317,16 @@ shows up in the `Smoke test` step instead.
 deploy, so it is git-managed: **editing it on the server is overwritten by the
 next deploy.** Change it here and re-dispatch.
 
+`auxiliary.status_hints` drives the status line Open WebUI shows above an answer while
+a tool runs (one small side-call per turn over the masked question; sanitized to plain
+text; the filter in `trc-backend` polices it again). `enabled: false` is the kill
+switch — no status frames are emitted at all. The model here sees nothing the reasoning
+model does not already see — only the last masked question — so it must meet the same
+retention terms; leave `model` empty for the auxiliary default on the same OpenRouter
+account. `provider: auto` resolves to that main model, so `reasoning_effort: "none"` is
+set to stop a reasoning model spending the token budget on thinking; pin a small
+non-reasoning model instead if hints stay empty.
+
 ## Checks
 
 `deploy/trc/validate_compose.py` asserts the invariants that make three
