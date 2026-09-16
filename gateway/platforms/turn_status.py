@@ -29,7 +29,7 @@ from typing import Callable, Optional
 # digit, a link, an address or a bracket cannot match. MIRRORED, character for
 # character, in trc-backend/integrations/openwebui/filter.py (`_STATUS_TEXT_RE`): change
 # both together.
-STATUS_TEXT_RE = re.compile(r"^[A-Za-z][A-Za-z ,.''\-]{6,88}…?$")
+STATUS_TEXT_RE = re.compile("^[A-Za-z][A-Za-z ,.'’\\-]{6,88}…?$")
 
 # Hermes registers MCP tools as ``mcp__<server>__<tool>``; these four are the ones that
 # search TRC's records. Anything else — ``ingest_document`` included — is "other".

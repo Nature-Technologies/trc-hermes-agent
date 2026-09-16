@@ -93,6 +93,12 @@ def test_every_fixed_line_matches_the_regex():
         assert STATUS_TEXT_RE.match(line), line
 
 
+def test_the_regex_admits_a_typographic_apostrophe():
+    # U+2019 sits in the allowlist beside the ASCII apostrophe; the filter mirror has both.
+    assert STATUS_TEXT_RE.match("Searching the firm’s records…")
+    assert STATUS_TEXT_RE.match("Checking the client's file…")
+
+
 # --- the timeline ------------------------------------------------------------------
 
 
