@@ -177,6 +177,7 @@ from gateway.session_context import (
     get_end_user_identity,
     get_end_user_request_id,
 )
+from gateway.platforms.turn_status import TurnStatus, sanitize_lines, status_chunk
 
 logger = logging.getLogger(__name__)
 
@@ -213,6 +214,120 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+
+# ---------------------------------------------------------------------------
+# Interim status line for Open WebUI turns (gateway/platforms/turn_status.py).
+#
+# Spec: trc-backend docs/superpowers/specs/2026-09-16-interim-status-while-answering-design.md
+# ---------------------------------------------------------------------------
+
+# Verbatim from the spec (S5). The model sees only the last user message, already
+# masked by the Open WebUI filter, and must describe activity -- never a finding.
+_STATUS_HINTS_PROMPT = (
+    "You write short progress lines that a user sees while a search over their firm's "
+    "confidential records is running. You are given only the user's question. Some parts "
+    "of it are masked as placeholders in angle brackets; you do not know what they stand "
+    "for.\n\n"
+    "Write up to 4 lines. Each line is 4 to 10 words, present progressive, describing an "
+    "activity the search is plausibly doing for this question (for example \"Looking "
+    "through recent account statements\"). Rules:\n"
+    "- Never state a result, a fact, a name, a number, a date, an amount, or anything in "
+    "angle brackets. Refer to masked items generically (\"the client you asked about\", "
+    "\"the account\").\n"
+    "- Letters and spaces only, with commas, periods, apostrophes and hyphens; no digits, "
+    "quotes, brackets, links or emoji.\n"
+    "- Do not answer the question. Do not repeat it.\n"
+    "Reply with a JSON array of strings and nothing else."
+)
+_STATUS_HINTS_MAX_TOKENS = 160
+_STATUS_HINTS_QUESTION_CHARS = 2000
+
+# Fire-and-forget hint tasks are held here so the event loop cannot garbage-collect
+# them mid-flight; each removes itself when done.
+_STATUS_HINT_TASKS: set = set()
+
+
+def _question_text(user_message) -> str:
+    """The text of the last user message -- a string, or the text parts of a list."""
+    if isinstance(user_message, str):
+        text = user_message
+    elif isinstance(user_message, list):
+        text = "\n".join(
+            part.get("text", "")
+            for part in user_message
+            if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str)
+        )
+    else:
+        return ""
+    return text.strip()[:_STATUS_HINTS_QUESTION_CHARS]
+
+
+def _status_hints_config() -> dict:
+    """``auxiliary.status_hints`` from config, or {} when unavailable."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly() or {}
+        task = ((config.get("auxiliary") or {}).get("status_hints")) or {}
+        return task if isinstance(task, dict) else {}
+    except Exception:
+        logger.debug("status_hints: config unreadable; using defaults", exc_info=True)
+        return {}
+
+
+def _status_hints_enabled(cfg: dict) -> bool:
+    try:
+        from utils import is_truthy_value
+
+        return is_truthy_value(cfg.get("enabled"), default=True)
+    except Exception:
+        return cfg.get("enabled", True) is not False
+
+
+def _cfg_number(cfg: dict, key: str, default: float) -> float:
+    try:
+        value = float(cfg.get(key, default))
+    except (TypeError, ValueError):
+        return float(default)
+    return value if value >= 0 else float(default)
+
+
+def _call_status_hints_model(*, messages: list, max_tokens: int, timeout: float):
+    """The one place the side-call touches the provider -- patched in tests."""
+    from agent.auxiliary_client import call_llm
+
+    return call_llm(task="status_hints", messages=messages, max_tokens=max_tokens, timeout=timeout)
+
+
+def _generate_status_hints(question_text: str, max_lines: int, timeout: float) -> list[str]:
+    """Blocking. Up to ``max_lines`` sanitized activity lines, or [] on ANY failure.
+
+    Runs in an executor; the agent never waits on it. A failure is a debug line naming
+    the exception type, never the text -- the caller falls back to the canned lines.
+    Think blocks are stripped first: a reasoning model's scratchpad is plain prose that
+    would otherwise sail through the sanitizer as "hints".
+    """
+    from agent.agent_runtime_helpers import strip_think_blocks
+
+    messages = [
+        {"role": "system", "content": _STATUS_HINTS_PROMPT},
+        {"role": "user", "content": question_text},
+    ]
+    try:
+        response = _call_status_hints_model(
+            messages=messages, max_tokens=_STATUS_HINTS_MAX_TOKENS, timeout=timeout,
+        )
+        content = response.choices[0].message.content or ""
+    except Exception as exc:
+        logger.debug("status_hints: side-call failed (%s); canned lines will be used", type(exc).__name__)
+        return []
+    try:
+        return sanitize_lines(strip_think_blocks(None, content), max_lines)
+    except Exception as exc:
+        logger.debug("status_hints: sanitizer failed (%s)", type(exc).__name__)
+        return []
+
+
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
 _COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 
@@ -4173,6 +4288,57 @@ class APIServerAdapter(BasePlatformAdapter):
                 response_headers["X-Hermes-Error"] = _redact_api_error_text(err_msg, limit=200)
 
         return web.json_response(response_data, headers=response_headers)
+
+    def _start_turn_status(self, stream_q, user_message):
+        """The interim status machine for this turn, or None when it does not apply.
+
+        Applies only to a request that carried Open WebUI's chat-id header (the CLI,
+        the dashboard and other clients see no new frames) and only while
+        ``auxiliary.status_hints.enabled`` is true. Puts the reading frame on the queue
+        at once and starts the bounded hints side-call; the result arrives on the same
+        queue as ``("__hints__", lines)`` so the writer is the machine's one consumer.
+        The agent starts regardless of any of this.
+        """
+        if not get_end_user_chat_id():
+            return None
+        cfg = _status_hints_config()
+        if not _status_hints_enabled(cfg):
+            return None
+        turn_status = TurnStatus(
+            clock=time.monotonic,
+            cadence_seconds=_cfg_number(cfg, "cadence_seconds", 6.0),
+            max_lines=int(_cfg_number(cfg, "max_lines", 4)),
+        )
+        for payload in turn_status.on_request():
+            stream_q.put(("__status__", payload))
+
+        question_text = _question_text(user_message)
+        if not question_text:
+            return turn_status
+        hints_timeout = _cfg_number(cfg, "timeout", 5.0)
+        max_lines = turn_status.max_lines
+
+        async def _deliver_hints():
+            loop = asyncio.get_running_loop()
+            try:
+                lines = await asyncio.wait_for(
+                    loop.run_in_executor(None, _generate_status_hints, question_text, max_lines, hints_timeout),
+                    timeout=hints_timeout + 1.0,
+                )
+            except Exception as exc:
+                logger.debug("status_hints: not delivered (%s)", type(exc).__name__)
+                lines = []
+            stream_q.put(("__hints__", list(lines or [])))
+
+        try:
+            task = asyncio.ensure_future(_deliver_hints())
+        except RuntimeError:
+            # No running loop (a synchronous caller): the line still works, canned only.
+            stream_q.put(("__hints__", []))
+            return turn_status
+        _STATUS_HINT_TASKS.add(task)
+        task.add_done_callback(_STATUS_HINT_TASKS.discard)
+        return turn_status
 
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
