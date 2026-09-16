@@ -96,7 +96,14 @@ def test_every_fixed_line_matches_the_regex():
 def test_the_regex_admits_a_typographic_apostrophe():
     # U+2019 sits in the allowlist beside the ASCII apostrophe; the filter mirror has both.
     assert STATUS_TEXT_RE.match("Searching the firm’s records…")
-    assert STATUS_TEXT_RE.match("Checking the client's file…")
+    assert STATUS_TEXT_RE.match("Checking the client’s file…")
+
+
+def test_the_status_regex_is_byte_exact():
+    # Pinned against an escaped literal so an editor normalising quotes cannot pass silently.
+    assert STATUS_TEXT_RE.pattern == "^[A-Za-z][A-Za-z ,.'\u2019\\-]{6,88}\u2026?$"
+    assert STATUS_TEXT_RE.match("Checking the client's file\u2026")
+    assert STATUS_TEXT_RE.match("Checking the client\u2019s file\u2026")
 
 
 # --- the timeline ------------------------------------------------------------------
