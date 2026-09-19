@@ -56,7 +56,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
@@ -1291,6 +1291,43 @@ def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
     from hashlib import sha256
     subset = {k: body.get(k) for k in keys}
     return sha256(repr(subset).encode("utf-8")).hexdigest()
+
+
+def choose_history(
+    body_history: List[Dict[str, Any]],
+    stored_history: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """Pick the history to run this turn on. Returns `(history, diverged)`.
+
+    **The stored history wins unless the client's is SHORTER** (H3). The
+    request body is the frontend's RENDERING of the conversation — user text and the
+    assistant paragraphs it displayed — and carries no tool calls or tool results,
+    because the frontend never saw them. Measured on staging: turn 3's request contained
+    none of turn 2's `mcp__ragnarok__query` calls or results, so the model was asked to
+    "dig in" to documents it could not see it had retrieved, and re-ran the same search.
+    Our own session file held all of them; this path just never read it.
+
+    **The client wins when its history is SHORTER**, and that is the whole reason this is
+    a function rather than an assignment. A user who deletes or regenerates a message in
+    Open WebUI sends fewer turns on purpose; replaying our longer record would resurrect
+    text they removed. Counted in USER turns, because that is what a person deletes — an
+    assistant message count also moves with tool-call bookkeeping that never had a turn
+    of its own.
+
+    `diverged` is True exactly in that case, for the caller to log. An empty stored
+    history (a first turn) is not divergence; it is the ordinary case and the body wins
+    silently.
+    """
+    if not stored_history:
+        return body_history, False
+    # Normally these are EQUAL: the body's history excludes the live message, and the
+    # turn now running has not been persisted yet. The stored record differs only by the
+    # tool calls and tool results the frontend never saw — which is the whole point.
+    body_turns = sum(1 for m in body_history if m.get("role") == "user")
+    stored_turns = sum(1 for m in stored_history if m.get("role") == "user")
+    if stored_turns <= body_turns:
+        return stored_history, False
+    return body_history, True
 
 
 def _derive_chat_session_id(
@@ -4061,7 +4098,44 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id = _derive_chat_session_id(
                 system_prompt, first_user, chat_id=get_end_user_chat_id(),
             )
-            # history already set from request body above
+            # H3: prefer OUR stored history over the body's, when we have one.
+            #
+            # The body is the frontend's rendering of the conversation: user text and
+            # the assistant paragraphs it displayed. It contains no tool calls and no
+            # tool results, because the frontend never saw them. Measured on staging:
+            # turn 2's request carried both `mcp__ragnarok__query` calls and their
+            # results (they were in the same request), and turn 3's carried none of
+            # them — only the rendered paragraph. The model was asked to "dig in" to
+            # documents it could no longer see it had ever retrieved, and its only
+            # visible move was to re-run the same search. Our own session file had all
+            # four tool calls the whole time; this path just never read it.
+            #
+            # Guarded rather than unconditional. The store is authoritative only while
+            # it AGREES with the client about how many turns have happened: a user who
+            # deletes or regenerates a message in Open WebUI makes the body shorter,
+            # and replaying our longer history would resurrect text they removed. In
+            # that case the body wins and the divergence is logged.
+            if get_end_user_chat_id():
+                stored = []
+                try:
+                    db = await self._ensure_session_db_async()
+                    if db is not None:
+                        stored = await asyncio.to_thread(
+                            db.get_messages_as_conversation, session_id
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "H3: could not load stored history for %s: %s — using the "
+                        "request body's history", session_id, e,
+                    )
+                    stored = []
+                history, diverged = choose_history(history, stored)
+                if diverged:
+                    logger.warning(
+                        "H3: the request body's history is shorter than the stored "
+                        "session's for %s — using the body (a deleted or regenerated "
+                        "message in the client)", session_id,
+                    )
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
