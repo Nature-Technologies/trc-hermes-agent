@@ -58,6 +58,9 @@ first doubles the cost of one request.
   N", never "there are N".
 - `status: "timeout"` means the search ran out of time, not that nothing exists. Say so
   and offer to narrow the question (a date range, one source).
+- `status: "retrieval_unavailable"` means the records could not be searched at all right
+  now. Relay its `message`. Never say or imply that nothing exists — nothing was looked
+  at. Do not retry in the same turn.
 - `status: "generation_failed"` means the backend could not compose an answer this turn.
   Use the result's `message`, suggest a narrower question, and do NOT answer from
   `chunks` or from memory. It is not the same as "no records found".
