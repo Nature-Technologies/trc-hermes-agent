@@ -39,14 +39,15 @@ def backend_prompt(backend_root: Path) -> str:
 
 
 def soul_body(text: str) -> str:
-    """`SOUL.md` minus its leading HTML comment header.
+    """`SOUL.md` exactly as Hermes will load it — which must be the prompt and nothing
+    else.
 
-    The header explains where the file comes from and is not part of the prompt, so it
-    is excluded from the comparison rather than duplicated into the backend doc.
+    It used to carry an HTML comment header naming its source. Hermes' context-file
+    scanner (`tools/threat_patterns.py`) flags an HTML comment as `html_comment_injection`
+    and replaces the WHOLE file with `[BLOCKED: …]`, so the header alone was enough to
+    leave the model with no rules at all (staging, 2026-09-23). Provenance lives in
+    `deploy/trc/README-SOUL.md` instead, and a header here is now a drift like any other.
     """
-    if text.startswith("<!--"):
-        _, _, rest = text.partition("-->")
-        return rest.lstrip("\n")
     return text
 
 
@@ -67,8 +68,7 @@ def main() -> int:
         return 0
 
     if args.write:
-        header, _, _ = current.partition("-->")
-        _SOUL.write_text(f"{header}-->\n\n{expected}", encoding="utf-8")
+        _SOUL.write_text(expected, encoding="utf-8")
         print(f"rewrote {_SOUL} from the backend prompt")
         return 0
 
