@@ -1,6 +1,6 @@
 model:
   provider: openrouter
-  default: minimax/minimax-m3
+  default: "@preset/trc-staging"
 
 # ── Tool surface (H1) ─────────────────────────────────────────────────
 # WITHOUT this key the API server resolves the default `hermes-api-server`
@@ -88,12 +88,19 @@ session:
 # Whichever model is named here is a data-retention decision as much as a
 # quality one — it and the backend's generation model see masked text, and
 # both belong in the runbook with their providers' terms.
+#
+# The route (and `model.default`, which the status-hint side calls fall back
+# to) points at an OpenRouter preset, so the model, providers and sampling are
+# chosen in the OpenRouter dashboard without a redeploy. The dashboard's
+# "default model" setting does NOT change this — the alias wins over
+# `model.default` for every Open WebUI turn. The preset is not in OpenRouter's
+# model catalogue, so Hermes assumes a 256K context and steps down on overflow.
 platforms:
   api_server:
     extra:
       model_routes:
         trc-assistant:
-          model: "minimax/minimax-m3"
+          model: "@preset/trc-staging"
           provider: "openrouter"
 
 mcp_servers:
