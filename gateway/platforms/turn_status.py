@@ -33,12 +33,12 @@ from typing import Callable, Optional
 # one — `test_the_status_regex_is_byte_exact` pins the compiled pattern byte for byte.
 STATUS_TEXT_RE = re.compile("^[A-Za-z][A-Za-z ,.\x27\u2019\\-]{6,88}\u2026?\\Z")
 
-# Hermes registers MCP tools as ``mcp__<server>__<tool>``; these four are the ones that
+# Hermes registers MCP tools as ``mcp__<server>__<tool>``; these six are the ones that
 # search TRC's records. Anything else — ``ingest_document`` included — is "other".
 DATA_TOOL_PREFIX = "mcp__ragnarok__"
-# These four names mirror the backend's `mcp__ragnarok__` tool registry; a data tool
+# These six names mirror the backend's `mcp__ragnarok__` tool registry; a data tool
 # added there but not here reads as "other" (no hints, trace hidden) until this set grows.
-DATA_TOOLS = frozenset({"query", "list_entities", "generate_report", "find_relationships"})
+DATA_TOOLS = frozenset({"query", "list_entities", "generate_report", "find_relationships", "read_document", "lookup_live"})
 
 READING_LINE = "Reading your question…"
 COMPOSING_LINE = "Preparing your answer…"
@@ -50,6 +50,8 @@ OPENERS = {
     "list_entities": "Gathering the full list…",
     "generate_report": "Reading the source documents…",
     "find_relationships": "Checking relationship records…",
+    "read_document": "Opening the document…",
+    "lookup_live": "Checking the source system live…",
 }
 
 # The floor: what rotates when the hints side-call produced nothing usable.
@@ -58,6 +60,8 @@ CANNED = {
     "generate_report": ("Composing the document…",),
     "list_entities": (),
     "find_relationships": (),
+    "read_document": (),
+    "lookup_live": ("Waiting for the live figures…",),
 }
 
 

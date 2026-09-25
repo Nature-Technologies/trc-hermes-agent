@@ -117,6 +117,18 @@ mcp_servers:
     # more" is acceptable; a second 150 s wait added by the client doubles the
     # damage without asking anyone.
     timeout: 160
+    # H1 follow-up: `tools/mcp_tool.py` honours `tools.include`/`exclude` per
+    # MCP server. Pin the six end-user tools so `ingest_document` is off the
+    # wire by construction. A NEW backend tool must be added here to reach the
+    # model — the allowlist is the gate, not the prompt ban.
+    tools:
+      include:
+        - query
+        - read_document
+        - list_entities
+        - generate_report
+        - find_relationships
+        - lookup_live
 
 # ── Security ──────────────────────────────────────────────────────────
 # Secret redaction is ON by default — strings that look like API keys,
