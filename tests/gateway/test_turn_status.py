@@ -46,11 +46,13 @@ def _descriptions(frames):
 # --- naming and shapes -------------------------------------------------------------
 
 
-def test_data_tool_of_recognises_the_four_ragnarok_tools_only():
+def test_data_tool_of_recognises_the_six_ragnarok_tools_only():
     assert data_tool_of("mcp__ragnarok__query") == "query"
     assert data_tool_of("mcp__ragnarok__list_entities") == "list_entities"
     assert data_tool_of("mcp__ragnarok__generate_report") == "generate_report"
     assert data_tool_of("mcp__ragnarok__find_relationships") == "find_relationships"
+    assert data_tool_of("mcp__ragnarok__read_document") == "read_document"
+    assert data_tool_of("mcp__ragnarok__lookup_live") == "lookup_live"
     assert data_tool_of("mcp__ragnarok__ingest_document") is None
     assert data_tool_of("mcp__other__query") is None
     assert data_tool_of("session_search") is None
@@ -239,3 +241,12 @@ def test_nothing_rotates_outside_searching():
     m.on_tool_complete(QUERY)
     clock.advance(60.0)
     assert m.on_tick() == []  # composing
+
+
+def test_lookup_live_and_read_document_are_data_tools_with_openers():
+    from gateway.platforms import turn_status as ts
+
+    for tool in ("lookup_live", "read_document"):
+        assert ts.data_tool_of(f"{ts.DATA_TOOL_PREFIX}{tool}") == tool
+        assert tool in ts.OPENERS and tool in ts.CANNED
+    assert ts.OPENERS["lookup_live"].endswith("…")

@@ -81,3 +81,10 @@ services:
       # remote daemon, so a relative path here would point at a directory that
       # exists only on the CI runner. The deploy scp's this file into place.
       - ${HERMES_CONFIG_PATH:?HERMES_CONFIG_PATH must be set}:/opt/data/config.yaml
+      # The TRC system prompt, as the IDENTITY tier (see deploy/trc/README-SOUL.md).
+      # Read-only: nothing in the container should rewrite the security rules. It must
+      # be a bind mount, not a file dropped into the volume — the image seeds its own
+      # default SOUL.md into /opt/data on first boot and never overwrites it, so only
+      # a mount wins over that copy. Until 2026-09-23 the deploy uploaded this file to
+      # the host and nothing mounted it, and the model ran with no TRC rules at all.
+      - ${HERMES_SOUL_PATH:?HERMES_SOUL_PATH must be set}:/opt/data/SOUL.md:ro

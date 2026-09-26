@@ -1,12 +1,57 @@
 model:
   provider: openrouter
-  default: minimax/minimax-m3
+  default: "@preset/trc-staging"
+
+# ── Tool surface (H1) ─────────────────────────────────────────────────
+# WITHOUT this key the API server resolves the default `hermes-api-server`
+# toolset: terminal, process, read_file, write_file, patch, search_files,
+# web_search, web_extract, twelve browser_*, execute_code, delegate_task,
+# cronjob, skill_manage, image_generate, vision_analyze — about thirty tools
+# on the wire beside the five `mcp__ragnarok__*` ones. The system prompt bans
+# them by instruction only, and the model ran `search_files` anyway.
+#
+# `ragnarok` is the MCP server name; `resolve_toolset` resolves an MCP server
+# name as a toolset (toolsets.py, `get_toolset_alias_target`). If a deployed
+# build returns None for it, the fallback is `disabled_toolsets` listing every
+# non-MCP toolset — verify with `hermes tools --platform api_server`, which
+# must list five tools.
+platform_toolsets:
+  api_server:
+    - ragnarok
+
+# ── Loop guardrails (H4) ──────────────────────────────────────────────
+# `hard_stop_enabled` ships false and `max_turns` ships 90: a model looping on
+# a failing tool could spend ninety turns of external inference before anyone
+# noticed. Twelve turns is enough for query → read_document ×3 → answer.
+agent:
+  max_turns: 12
+  # ── System prompt size (H2) ─────────────────────────────────────────
+  # Message 0 was 27,541 characters on staging and the TRC rules started
+  # after the first 15 K of it. These two blocks are Hermes' own generic
+  # guidance ("finish the job", "batch your tool calls"); with five MCP
+  # tools and a prompt that already states the routing rules, they add
+  # length in front of the rules that matter and nothing else.
+  task_completion_guidance: false
+  parallel_tool_call_guidance: false
+tool_loop_guardrails:
+  hard_stop_enabled: true
+  hard_stop_after:
+    exact_failure: 3
+    same_tool_failure: 4
+    idempotent_no_progress: 3
 dashboard:
   theme: mono
   font: system-sans
+# Persistent memory OFF. These are the keys Hermes reads (agent/agent_init.py).
+# This block said `enabled: false` / `session_search: false` until 2026-09-23 —
+# neither is a key Hermes reads, so the defaults (both True) won and a "USER
+# PROFILE" built from earlier chats sat in every system prompt on staging,
+# persisted on the volume with no retention. In this deployment memory is a PII
+# store outside the redaction boundary's retention sweep, not a preference.
+# tests/test_trc_config_memory_off.py checks the MERGED config.
 memory:
-  enabled: false
-  session_search: false
+  memory_enabled: false
+  user_profile_enabled: false
 skills:
   disabled:
     - codebase-inspection
@@ -27,10 +72,63 @@ security:
 _config_version: 33
 session:
   persist: true
+# ── Served model (H6) ─────────────────────────────────────────────────
+# `model.default` said minimax/minimax-m3 and every Hermes-tagged OpenRouter
+# row for the staging session was deepseek/deepseek-v4-pro. Two candidate
+# causes: dashboard-persisted config on the volume winning over the uploaded
+# file, and Open WebUI sending a `model` field Hermes accepts as a raw
+# per-session model.
+#
+# The alias closes the second: Open WebUI selects `trc-assistant` (O4), which
+# resolves HERE to the model we chose, so the served model is a config value
+# and not whatever the client typed. `direct_model_requests` stays off (the
+# default) so a bare model name from any other client cannot switch the
+# executing model either.
+#
+# Whichever model is named here is a data-retention decision as much as a
+# quality one — it and the backend's generation model see masked text, and
+# both belong in the runbook with their providers' terms.
+#
+# The route (and `model.default`, which the status-hint side calls fall back
+# to) points at an OpenRouter preset, so the model, providers and sampling are
+# chosen in the OpenRouter dashboard without a redeploy. The dashboard's
+# "default model" setting does NOT change this — the alias wins over
+# `model.default` for every Open WebUI turn. The preset is not in OpenRouter's
+# model catalogue, so Hermes assumes a 256K context and steps down on overflow.
+platforms:
+  api_server:
+    extra:
+      model_routes:
+        trc-assistant:
+          model: "@preset/trc-staging"
+          provider: "openrouter"
+
 mcp_servers:
   ragnarok:
     url: http://app:8000/mcp
     forward_user_identity: true
+    # H5. The default is 300 s and the backend now gives up at 150 s
+    # (`QUERY_DEADLINE_SECONDS`), so this sits just above it: the backend is
+    # always the side that gives up first, and it gives up with a structured
+    # `timeout` naming the stages that finished. At 300 s a user waited five
+    # minutes on a turn whose generation had finished after 52 s.
+    #
+    # No automatic retry here on purpose — the model's own "let me try once
+    # more" is acceptable; a second 150 s wait added by the client doubles the
+    # damage without asking anyone.
+    timeout: 160
+    # H1 follow-up: `tools/mcp_tool.py` honours `tools.include`/`exclude` per
+    # MCP server. Pin the six end-user tools so `ingest_document` is off the
+    # wire by construction. A NEW backend tool must be added here to reach the
+    # model — the allowlist is the gate, not the prompt ban.
+    tools:
+      include:
+        - query
+        - read_document
+        - list_entities
+        - generate_report
+        - find_relationships
+        - lookup_live
 
 # ── Security ──────────────────────────────────────────────────────────
 # Secret redaction is ON by default — strings that look like API keys,

@@ -249,6 +249,18 @@ jobs:
           ssh -i "$RUNNER_TEMP/id_rsa" -p "$SSH_PORT" "${USERNAME}@${HOST}" \
             "mv -f ${HOST_DIR}/config.yaml.new ${HOST_DIR}/config.yaml"
 
+          # SOUL.md, by the same upload-beside-and-rename mechanism and for the
+          # same reason (H2). It is HERMES_HOME's identity file, so it is what
+          # puts the TRC rules at the FRONT of the system prompt instead of
+          # 15 K characters behind the Hermes persona. It is versioned with the
+          # agent that runs it, and CI checks it against the backend's reviewed
+          # copy (scripts/check_soul_matches_backend.py).
+          scp -i "$RUNNER_TEMP/id_rsa" -P "$SSH_PORT" \
+            deploy/trc/SOUL.md \
+            "${USERNAME}@${HOST}:${HOST_DIR}/SOUL.md.new"
+          ssh -i "$RUNNER_TEMP/id_rsa" -p "$SSH_PORT" "${USERNAME}@${HOST}" \
+            "mv -f ${HOST_DIR}/SOUL.md.new ${HOST_DIR}/SOUL.md"
+
       - name: Publish the shared-key fingerprint
         env:
           HERMES_API_KEY: ${{ secrets.HERMES_API_KEY }}
@@ -283,6 +295,8 @@ jobs:
           # Absolute path on the SERVER: the bind source is resolved by the
           # remote daemon. "Copy Hermes config to the host" put it there.
           HERMES_CONFIG_PATH: ${{ env.HOST_DIR }}/config.yaml
+          # Same mechanism, for the TRC system prompt (deploy/trc/README-SOUL.md).
+          HERMES_SOUL_PATH: ${{ env.HOST_DIR }}/SOUL.md
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           HERMES_API_KEY: ${{ secrets.HERMES_API_KEY }}
           HERMES_DASHBOARD_BASIC_AUTH_USERNAME: ${{ secrets.HERMES_DASHBOARD_BASIC_AUTH_USERNAME }}
@@ -340,4 +354,20 @@ jobs:
           except Exception as exc:
               print(f"could NOT reach app:8000/mcp over trc-shared: {exc}")
               sys.exit(1)
+          PY
+
+          # The TRC rules are what the model reads FIRST. Asked of Hermes' OWN loader
+          # inside the running container, because each of the three ways this has
+          # failed leaves a file that looks fine from outside: not mounted, shadowed
+          # by the image's seeded default, or replaced by `[BLOCKED: …]` by Hermes'
+          # injection scanner (deploy/trc/README-SOUL.md). All three shipped a model
+          # with no rules and no error, and all three fail this.
+          docker exec -i -w /opt/hermes hermes-agent /opt/hermes/.venv/bin/python - <<'PY'
+          import sys
+          from agent.prompt_builder import load_soul_md
+          soul = load_soul_md() or ""
+          if not soul.startswith("RULE ZERO"):
+              print(f"::error::SOUL.md did not load as the TRC prompt; got: {soul[:160]!r}")
+              sys.exit(1)
+          print(f"SOUL.md loaded: {len(soul)} chars, starts with RULE ZERO")
           PY
