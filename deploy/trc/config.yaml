@@ -40,8 +40,11 @@ code_execution:
   # Deliberately NOT in mcp_servers.ragnarok.tools.include: the model must not call it.
   record_computed_server: ragnarok
   description_intro: >-
-    Run a short Python program for calculations over TRC data: totals, differences,
-    percentages, averages, growth rates, rankings, counts per month, trends. It runs
+    Use this, without being asked, whenever an answer COMBINES figures: a change over
+    time, a trend, a comparison across entities or periods, a total, average, share,
+    ranking or count. A change over a span is a path, not one period: fetch the value
+    at several points (every half-year across two years). Run a short Python program
+    for the calculation over TRC data. It runs
     in an isolated sandbox with no network and no files; its only data source is the
     ragnarok tools listed below, called with keyword arguments. Fetch inside the
     program when you need many rows, pass answer=False to query when you need only
