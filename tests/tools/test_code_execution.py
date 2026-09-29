@@ -219,6 +219,69 @@ class TestExecuteCodeRemoteTempDir(unittest.TestCase):
         self.assertIn("TZ='US/Eastern; echo PWNED'", run_cmd,
                       "TZ value must be wrapped in single quotes by shlex.quote()")
 
+    def _make_fake_env(self):
+        class FakeEnv:
+            def get_temp_dir(self):
+                return "/tmp"
+
+            def execute(self, command, cwd=None, timeout=None):
+                if "command -v python3" in command:
+                    return {"output": "OK\n"}
+                if "python3 script.py" in command:
+                    return {"output": "done\n", "returncode": 0}
+                return {"output": ""}
+        return FakeEnv()
+
+    def _run_remote_capture(self, enabled_tools):
+        """Run _execute_remote and return (hermes_tools_src, thread_args)."""
+        shipped = {}
+        thread_args_captured = []
+
+        def fake_ship(env, remote_path, content):
+            shipped[remote_path.split("/")[-1]] = content
+
+        fake_thread = MagicMock()
+
+        class CapturingThread:
+            def __init__(self, target=None, args=(), daemon=None):
+                thread_args_captured.extend(args)
+
+            def start(self):
+                pass
+
+            def join(self, timeout=None):
+                pass
+
+        env = self._make_fake_env()
+        with patch("tools.code_execution_tool._load_config",
+                   return_value={"timeout": 30, "max_tool_calls": 5}), \
+             patch("tools.code_execution_tool._get_or_create_env",
+                   return_value=(env, "ssh")), \
+             patch("tools.code_execution_tool._ship_file_to_remote", side_effect=fake_ship), \
+             patch("tools.code_execution_tool.threading.Thread",
+                   side_effect=CapturingThread):
+            _execute_remote("print('ok')", "t", enabled_tools)
+
+        return shipped.get("hermes_tools.py", ""), thread_args_captured
+
+    def test_execute_remote_none_tools_gets_no_terminal_stub(self):
+        """I1: _execute_remote with enabled_tools=None must not ship a terminal stub."""
+        src, args = self._run_remote_capture(None)
+        self.assertNotIn("def terminal(", src,
+                         "terminal stub must not appear when enabled_tools=None")
+        # sandbox_tools is args[6]: the frozenset passed to the RPC poll thread
+        sandbox_tools_arg = args[6]
+        self.assertEqual(sandbox_tools_arg, frozenset(),
+                         "frozenset() must be passed to the RPC thread, not all tools")
+
+    def test_execute_remote_nonoverlapping_tools_gets_no_terminal_stub(self):
+        """I1: _execute_remote with tools that don't overlap must not ship a terminal stub."""
+        src, args = self._run_remote_capture(["vision_analyze"])
+        self.assertNotIn("def terminal(", src,
+                         "terminal stub must not appear when session has no sandbox tools")
+        sandbox_tools_arg = args[6]
+        self.assertEqual(sandbox_tools_arg, frozenset())
+
 
 @unittest.skipIf(sys.platform == "win32", "UDS not available on Windows")
 class TestExecuteCode(unittest.TestCase):
@@ -847,49 +910,56 @@ class TestExecuteCodeEdgeCases(unittest.TestCase):
         self.assertIn("No code", result["error"])
 
     @unittest.skipIf(sys.platform == "win32", "UDS not available on Windows")
-    def test_none_enabled_tools_uses_all(self):
-        """When enabled_tools is None, all sandbox tools should be available."""
-        code = (
-            "from hermes_tools import terminal, web_search, read_file\n"
-            "print('all imports ok')\n"
-        )
+    def test_none_enabled_tools_gets_no_tools(self):
+        """Fail closed (trc-backend spec 2026-09-28 §4.2): no session tools, no stubs."""
+        code = "from hermes_tools import terminal\nprint('imported')\n"
         with patch("model_tools.handle_function_call",
-                    return_value=json.dumps({"ok": True})):
+                   return_value=json.dumps({"ok": True})):
             result = json.loads(execute_code(code, task_id="test-none",
                                              enabled_tools=None))
-        self.assertEqual(result["status"], "success")
-        self.assertIn("all imports ok", result["output"])
+        self.assertEqual(result["status"], "error")
+        self.assertNotIn("imported", result["output"])
+        self.assertIn("ImportError", result["output"])
 
     @unittest.skipIf(sys.platform == "win32", "UDS not available on Windows")
-    def test_empty_enabled_tools_uses_all(self):
-        """When enabled_tools is [] (empty), all sandbox tools should be available."""
-        code = (
-            "from hermes_tools import terminal, web_search\n"
-            "print('imports ok')\n"
-        )
+    def test_empty_enabled_tools_gets_no_tools(self):
+        code = "from hermes_tools import terminal\nprint('imported')\n"
         with patch("model_tools.handle_function_call",
-                    return_value=json.dumps({"ok": True})):
+                   return_value=json.dumps({"ok": True})):
             result = json.loads(execute_code(code, task_id="test-empty",
                                              enabled_tools=[]))
-        self.assertEqual(result["status"], "success")
-        self.assertIn("imports ok", result["output"])
+        self.assertEqual(result["status"], "error")
+        self.assertIn("ImportError", result["output"])
 
     @unittest.skipIf(sys.platform == "win32", "UDS not available on Windows")
-    def test_nonoverlapping_tools_fallback(self):
-        """When enabled_tools has no overlap with SANDBOX_ALLOWED_TOOLS,
-        should fall back to all allowed tools."""
-        code = (
-            "from hermes_tools import terminal\n"
-            "print('fallback ok')\n"
-        )
+    def test_nonoverlapping_tools_get_no_tools(self):
+        """The case the old fallback turned into terminal access."""
+        code = "from hermes_tools import terminal\nprint('imported')\n"
         with patch("model_tools.handle_function_call",
-                    return_value=json.dumps({"ok": True})):
+                   return_value=json.dumps({"ok": True})):
             result = json.loads(execute_code(
                 code, task_id="test-nonoverlap",
                 enabled_tools=["vision_analyze", "browser_snapshot"],
             ))
-        self.assertEqual(result["status"], "success")
-        self.assertIn("fallback ok", result["output"])
+        self.assertEqual(result["status"], "error")
+        self.assertIn("ImportError", result["output"])
+
+    @unittest.skipIf(sys.platform == "win32", "UDS not available on Windows")
+    def test_rpc_gate_blocks_disallowed_tool_even_via_direct_call(self):
+        """I2: The RPC gate at _rpc_server_loop must reject terminal even when called
+        via hermes_tools._call directly (bypassing the import guard).
+        This is the real enforcement boundary (trc-backend spec 2026-09-28 §4.2)."""
+        code = (
+            "import hermes_tools, json\n"
+            "print(json.dumps(hermes_tools._call('terminal', {'command': 'echo x'})))\n"
+        )
+        with patch("model_tools.handle_function_call",
+                   return_value=json.dumps({"output": "SENTINEL-RAN"})):
+            result = json.loads(execute_code(code, task_id="test-rpc-gate",
+                                             enabled_tools=[]))
+        self.assertNotIn("SENTINEL-RAN", result.get("output", ""),
+                         "terminal must not execute when not in the allowlist")
+        self.assertIn("not available in execute_code", result.get("output", ""))
 
 
 # ---------------------------------------------------------------------------

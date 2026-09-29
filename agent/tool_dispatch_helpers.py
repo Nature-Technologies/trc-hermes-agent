@@ -508,6 +508,10 @@ def make_tool_result_message(
 _UNTRUSTED_TOOL_NAMES = frozenset({
     "web_extract",
     "web_search",
+    # A sandbox script can print what a data tool returned — document text included —
+    # so its output is attacker-controllable exactly like the tool's own result
+    # (trc-backend spec 2026-09-28 §4.4).
+    "execute_code",
 })
 
 _UNTRUSTED_TOOL_PREFIXES = (

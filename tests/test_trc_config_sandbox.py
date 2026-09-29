@@ -1,0 +1,60 @@
+"""The TRC deployment's sandbox surface, from the deployed config.yaml
+(trc-backend spec 2026-09-28 §4, §8 limit L2)."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import yaml
+
+_DEPLOYED = Path(__file__).resolve().parents[1] / "deploy" / "trc" / "config.yaml"
+_DATA_TOOLS = {
+    "mcp__ragnarok__query",
+    "mcp__ragnarok__read_document",
+    "mcp__ragnarok__list_entities",
+    "mcp__ragnarok__find_relationships",
+}
+
+
+def _cfg() -> dict:
+    return yaml.safe_load(_DEPLOYED.read_text(encoding="utf-8"))
+
+
+def test_the_api_server_gets_ragnarok_and_code_execution_and_nothing_dangerous():
+    """Plugin toolsets are on by default upstream, so this pins what must be present
+    and what must never be, rather than exact equality."""
+    from hermes_cli.tools_config import _get_platform_tools
+    from tools.registry import discover_builtin_tools
+
+    discover_builtin_tools()
+    enabled = _get_platform_tools(_cfg(), "api_server")
+    assert {"ragnarok", "code_execution"} <= enabled
+    forbidden = {
+        "terminal", "file", "web", "browser", "browser-cdp",
+        "delegation", "computer_use", "debugging", "coding",
+    }
+    assert not enabled & forbidden, enabled & forbidden
+
+
+def test_the_model_sees_exactly_the_six_end_user_tools():
+    """record_computed is gateway-only and ingest_document is gone (L2)."""
+    include = set(_cfg()["mcp_servers"]["ragnarok"]["tools"]["include"])
+    assert include == {
+        "query",
+        "read_document",
+        "list_entities",
+        "generate_report",
+        "find_relationships",
+        "lookup_live",
+    }
+
+
+def test_scripts_reach_only_the_four_data_tools_through_the_sidecar():
+    ce = _cfg()["code_execution"]
+    assert set(ce["sandbox_tools"]) == _DATA_TOOLS
+    assert ce["transport"] == "sidecar"
+    assert ce["sidecar_socket"] == "/run/hermes-sandbox/sock"
+    assert ce["record_computed_server"] == "ragnarok"
+    assert ce["max_tool_calls"] == 20
+    assert ce["timeout"] == 270
+    assert ce["sidecar_limits"] == {"wall": 240, "cpu": 60, "mem_mb": 768}

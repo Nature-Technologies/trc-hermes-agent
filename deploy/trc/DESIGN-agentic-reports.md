@@ -81,9 +81,13 @@ switch report mode to Hermes' Responses/background pattern and poll.
 
 ## 7. Toolset
 
-Unchanged from FIXES H1: `platform_toolsets.api_server: [ragnarok]`. Report mode
-adds nothing native. `execute_code`, `terminal`, `browser_*`, `web_*` stay off; the
-backend's `calculate` and `render_*` cover the needs.
+Superseded 2026-09-28 by trc-backend spec
+`docs/superpowers/specs/2026-09-28-hermes-analysis-sandbox-design.md` (D-SBX-1):
+`platform_toolsets.api_server: [ragnarok, code_execution]`. `execute_code` is on, but
+runs only in the `hermes-sandbox` sidecar (no network, no files, no secrets) and reaches
+only four ragnarok data tools through the gateway bridge. `terminal`, `browser_*`,
+`web_*` and file tools stay off. The backend `calculate` tool is not built: a fixed
+arithmetic grammar cannot group, loop, bucket or fit a trend.
 
 ## 8. Tests to add
 

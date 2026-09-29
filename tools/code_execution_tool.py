@@ -31,6 +31,7 @@ Remote execution additionally requires Python 3 in the terminal backend.
 import base64
 import functools
 import json
+import keyword
 import logging
 import os
 import platform
@@ -74,6 +75,54 @@ DEFAULT_TIMEOUT = 300        # 5 minutes
 DEFAULT_MAX_TOOL_CALLS = 50
 MAX_STDOUT_BYTES = 50_000    # 50 KB
 MAX_STDERR_BYTES = 10_000    # 10 KB
+
+_warned_sidecar_without_allowlist = False
+
+
+def _sandbox_allowlist() -> frozenset:
+    """The tools a sandbox script may call, before intersecting with the session.
+
+    ``code_execution.sandbox_tools`` in config.yaml replaces the built-in list (the TRC
+    deployment sets its four ragnarok data tools); unset keeps SANDBOX_ALLOWED_TOOLS.
+
+    Key absent → SANDBOX_ALLOWED_TOOLS (backward-compatible default), EXCEPT under the
+    sidecar transport → frozenset() and a warning once: an unreadable config.yaml reads
+    as {} while the env pin keeps scripts in the sidecar, and the built-ins would let
+    the gateway serve a script's bridged terminal() and file tools.
+    Key present, value is a list → frozenset of the listed names.
+    Key present, value is anything else → frozenset() and a warning (fail closed).
+    """
+    global _warned_sidecar_without_allowlist
+    cfg = _load_config()
+    if "sandbox_tools" not in cfg:
+        if _configured_transport() != "sidecar":
+            return SANDBOX_ALLOWED_TOOLS
+        if not _warned_sidecar_without_allowlist:
+            _warned_sidecar_without_allowlist = True
+            logger.warning(
+                "code_execution.sandbox_tools is not set under the sidecar transport; "
+                "no sandbox tools allowed"
+            )
+        return frozenset()
+    configured = cfg["sandbox_tools"]
+    if isinstance(configured, list):
+        return frozenset(str(name) for name in configured)
+    logger.warning(
+        "code_execution.sandbox_tools must be a list; got %s — no sandbox tools allowed",
+        type(configured).__name__,
+    )
+    return frozenset()
+
+
+def resolve_sandbox_tools(enabled_tools) -> frozenset:
+    """The allowlist intersected with the session's enabled tools.
+
+    EMPTY MEANS NO TOOLS. Upstream fell back to every sandbox tool when the
+    intersection was empty, which on a session with none of them (the TRC deployment:
+    ragnarok + code_execution) handed a script ``terminal`` and file access
+    (trc-backend spec 2026-09-28 §4.2).
+    """
+    return frozenset(_sandbox_allowlist() & set(enabled_tools or ()))
 
 
 def _assemble_stdout_result(
@@ -343,19 +392,91 @@ _TOOL_STUBS = {
 }
 
 
+MCP_TOOL_PREFIX = "mcp__"
+# Never shown to a script's author and never forwarded (trc-backend spec §4.3):
+# identity comes from the gateway's verified headers, not from code the model wrote.
+_MCP_HIDDEN_PARAMS = frozenset({"requesting_user", "session_id"})
+
+_MCP_NAMESPACE_SRC = '''
+
+def _unwrap_mcp(raw):
+    """An MCP result as the tool's own dict: structured content first, then JSON text."""
+    if isinstance(raw, dict):
+        if set(raw) == {"error"}:
+            return {"status": "error", "error": raw["error"]}
+        structured = raw.get("structuredContent")
+        if isinstance(structured, dict):
+            inner = structured.get("result")
+            if set(structured) == {"result"} and isinstance(inner, dict):
+                return inner
+            return structured
+        result = raw.get("result")
+        if isinstance(result, dict):
+            return result
+        if isinstance(result, str):
+            try:
+                parsed = json.loads(result)
+            except ValueError:
+                return {"text": result}
+            return parsed if isinstance(parsed, dict) else {"value": parsed}
+    return raw
+
+
+class _McpServer:
+    """`<server>.<tool>(**kwargs)` for the MCP tools this session allows."""
+
+    def __init__(self, server, tools):
+        self._server = server
+        self._tools = frozenset(tools)
+
+    def __dir__(self):
+        return sorted(self._tools)
+
+    def __getattr__(self, name):
+        if name.startswith("_") or name not in self._tools:
+            raise AttributeError(f"{self._server}.{name} is not available in this sandbox")
+        full = "mcp__" + self._server + "__" + name
+
+        def _tool(**kwargs):
+            return _unwrap_mcp(_call(full, kwargs))
+
+        _tool.__name__ = name
+        return _tool
+'''
+
+
+def _mcp_parts(tool_name: str) -> tuple:
+    """`mcp__<server>__<tool>` -> (server, tool)."""
+    server, _, tool = tool_name[len(MCP_TOOL_PREFIX):].partition("__")
+    return server, tool
+
+
+def _mcp_namespace_identifier(server: str) -> str:
+    """A valid Python identifier to bind server's namespace to in hermes_tools.
+
+    Server names are sanitized to [A-Za-z0-9_] but may start with a digit or be
+    a keyword ("1password", "class"); the namespace object still dispatches under
+    the real name, only the variable a script imports is adjusted."""
+    if server.isidentifier() and not keyword.iskeyword(server):
+        return server
+    return f"mcp_{server}"
+
+
 def generate_hermes_tools_module(enabled_tools: List[str],
                                  transport: str = "uds") -> str:
     """
     Build the source code for the hermes_tools.py stub module.
 
-    Only tools in both SANDBOX_ALLOWED_TOOLS and enabled_tools get stubs.
+    Only tools in both the sandbox allowlist and enabled_tools get stubs.
 
     Args:
         enabled_tools: Tool names enabled in the current session.
-        transport: ``"uds"`` for Unix domain socket (local backend) or
-                   ``"file"`` for file-based RPC (remote backends).
+        transport: ``"uds"`` for Unix domain socket (local backend),
+                   ``"file"`` for file-based RPC (remote backends), or
+                   ``"pipe"`` for the TRC sandbox sidecar, whose runner hands
+                   the script one end of a private socket pair.
     """
-    tools_to_generate = sorted(SANDBOX_ALLOWED_TOOLS & set(enabled_tools))
+    tools_to_generate = sorted(_sandbox_allowlist() & set(enabled_tools))
 
     stub_functions = []
     export_names = []
@@ -370,12 +491,26 @@ def generate_hermes_tools_module(enabled_tools: List[str],
         )
         export_names.append(func_name)
 
+    servers: dict = {}
+    for tool_name in tools_to_generate:
+        if tool_name.startswith(MCP_TOOL_PREFIX):
+            server, tool = _mcp_parts(tool_name)
+            servers.setdefault(server, []).append(tool)
+    mcp_src = ""
+    if servers:
+        mcp_src = _MCP_NAMESPACE_SRC + "".join(
+            f"\n{_mcp_namespace_identifier(server)} = _McpServer({server!r}, {sorted(tools)!r})\n"
+            for server, tools in sorted(servers.items())
+        )
+
     if transport == "file":
         header = _FILE_TRANSPORT_HEADER
+    elif transport == "pipe":
+        header = _PIPE_TRANSPORT_HEADER
     else:
         header = _UDS_TRANSPORT_HEADER
 
-    return header + "\n".join(stub_functions)
+    return header + "\n".join(stub_functions) + mcp_src
 
 
 # ---- Shared helpers section (embedded in both transport headers) ----------
@@ -552,6 +687,46 @@ def _call(tool_name, args):
 
 '''
 
+# ---- Pipe transport (TRC sandbox sidecar) ---------------------------------
+
+# Sidecar transport (trc-backend spec §4.5): the runner hands the script one end of a
+# private socket pair as HERMES_RPC_FD. No token — nothing else can reach that pair.
+_PIPE_TRANSPORT_HEADER = '''\
+"""Auto-generated Hermes tools RPC stubs (sidecar transport)."""
+import json, os, shlex, socket, threading, time
+
+_sock = None
+_call_lock = threading.Lock()
+''' + _COMMON_HELPERS + '''\
+
+def _connect():
+    global _sock
+    if _sock is None:
+        _sock = socket.socket(fileno=int(os.environ["HERMES_RPC_FD"]))
+    return _sock
+
+def _call(tool_name, args):
+    """Send a tool call through the runner to Hermes and return the parsed result."""
+    request = json.dumps({"tool": tool_name, "args": args}) + "\\n"
+    with _call_lock:
+        conn = _connect()
+        conn.sendall(request.encode())
+        buf = b""
+        while not buf.endswith(b"\\n"):
+            chunk = conn.recv(65536)
+            if not chunk:
+                raise RuntimeError("sandbox runner disconnected")
+            buf += chunk
+    result = json.loads(buf.decode().strip())
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except (json.JSONDecodeError, TypeError):
+            return result
+    return result
+
+'''
+
 
 # ---------------------------------------------------------------------------
 # RPC server (runs in a thread inside the parent process)
@@ -559,6 +734,67 @@ def _call(tool_name, args):
 
 # Terminal parameters that must not be used from ephemeral sandbox scripts
 _TERMINAL_BLOCKED_PARAMS = {"background", "pty", "notify_on_complete", "watch_patterns"}
+
+
+def _serve_bridged_call(
+    tool_name: str,
+    tool_args: Any,
+    *,
+    allowed_tools: frozenset,
+    tool_call_counter: list,
+    max_tool_calls: int,
+    task_id: Optional[str],
+) -> str:
+    """Serve one tool call a sandbox script made. The ONE place the rules live, shared
+    by the UDS loop, the file-RPC loop and the sidecar transport: allowlist, call cap,
+    argument rules (tools/trc_sandbox_bridge.py), per-turn cache, status frames."""
+    from model_tools import handle_function_call
+    from tools import trc_sandbox_bridge as bridge
+
+    if tool_name not in allowed_tools:
+        available = ", ".join(sorted(allowed_tools))
+        return json.dumps({
+            "error": (
+                f"Tool '{tool_name}' is not available in execute_code. "
+                f"Available: {available}"
+            )
+        })
+    if tool_call_counter[0] >= max_tool_calls:
+        return json.dumps({
+            "error": (
+                f"Tool call limit reached ({max_tool_calls}). "
+                "No more tool calls allowed in this execution."
+            )
+        })
+    if not isinstance(tool_args, dict):
+        tool_args = {}
+    if tool_name == "terminal":
+        for param in _TERMINAL_BLOCKED_PARAMS:
+            tool_args.pop(param, None)
+    tool_args = bridge.prepare_bridged_args(tool_name, tool_args)
+
+    def _dispatch() -> str:
+        call_id = bridge.notify_bridged_start(tool_name, tool_args)
+        _real_stdout, _real_stderr = sys.stdout, sys.stderr
+        devnull = open(os.devnull, "w", encoding="utf-8")
+        try:
+            sys.stdout = devnull
+            sys.stderr = devnull
+            result = handle_function_call(tool_name, tool_args, task_id=task_id)
+        except Exception as exc:
+            logger.error("Tool call failed in sandbox: %s", exc, exc_info=True)
+            result = tool_error(str(exc))
+        finally:
+            sys.stdout, sys.stderr = _real_stdout, _real_stderr
+            devnull.close()
+        if not isinstance(result, str):
+            result = json.dumps(result, ensure_ascii=False, default=str)
+        bridge.notify_bridged_complete(call_id, tool_name, tool_args, result)
+        return result
+
+    result = bridge.cached_bridged_call(tool_name, tool_args, _dispatch)
+    tool_call_counter[0] += 1
+    return result
 
 
 def _rpc_server_loop(
@@ -575,8 +811,6 @@ def _rpc_server_loop(
     Accept one client connection and dispatch tool-call requests until
     the client disconnects or the call limit is reached.
     """
-    from model_tools import handle_function_call
-
     conn = None
     try:
         server_sock.settimeout(0.05)
@@ -628,54 +862,14 @@ def _rpc_server_loop(
                 tool_name = request.get("tool", "")
                 tool_args = request.get("args", {})
 
-                # Enforce the allow-list
-                if tool_name not in allowed_tools:
-                    available = ", ".join(sorted(allowed_tools))
-                    resp = json.dumps({
-                        "error": (
-                            f"Tool '{tool_name}' is not available in execute_code. "
-                            f"Available: {available}"
-                        )
-                    })
-                    conn.sendall((resp + "\n").encode())
-                    continue
-
-                # Enforce tool call limit
-                if tool_call_counter[0] >= max_tool_calls:
-                    resp = json.dumps({
-                        "error": (
-                            f"Tool call limit reached ({max_tool_calls}). "
-                            "No more tool calls allowed in this execution."
-                        )
-                    })
-                    conn.sendall((resp + "\n").encode())
-                    continue
-
-                # Strip forbidden terminal parameters
-                if tool_name == "terminal" and isinstance(tool_args, dict):
-                    for param in _TERMINAL_BLOCKED_PARAMS:
-                        tool_args.pop(param, None)
-
-                # Dispatch through the standard tool handler.
-                # Suppress stdout/stderr from internal tool handlers so
-                # their status prints don't leak into the CLI spinner.
-                try:
-                    _real_stdout, _real_stderr = sys.stdout, sys.stderr
-                    devnull = open(os.devnull, "w", encoding="utf-8")
-                    try:
-                        sys.stdout = devnull
-                        sys.stderr = devnull
-                        result = handle_function_call(
-                            tool_name, tool_args, task_id=task_id
-                        )
-                    finally:
-                        sys.stdout, sys.stderr = _real_stdout, _real_stderr
-                        devnull.close()
-                except Exception as exc:
-                    logger.error("Tool call failed in sandbox: %s", exc, exc_info=True)
-                    result = tool_error(str(exc))
-
-                tool_call_counter[0] += 1
+                result = _serve_bridged_call(
+                    tool_name,
+                    tool_args,
+                    allowed_tools=allowed_tools,
+                    tool_call_counter=tool_call_counter,
+                    max_tool_calls=max_tool_calls,
+                    task_id=task_id,
+                )
                 call_duration = time.monotonic() - call_start
 
                 # Log for observability
@@ -857,8 +1051,6 @@ def _rpc_poll_loop(
     independent process, so these calls run safely concurrent with the
     script-execution thread.
     """
-    from model_tools import handle_function_call
-
     poll_interval = 0.1  # 100 ms
 
     quoted_rpc_dir = shlex.quote(rpc_dir)
@@ -920,54 +1112,20 @@ def _rpc_poll_loop(
                 res_file = f"{rpc_dir}/res_{seq_str}"
                 quoted_res_file = shlex.quote(res_file)
 
-                # Enforce allow-list
-                if tool_name not in allowed_tools:
-                    available = ", ".join(sorted(allowed_tools))
-                    tool_result = json.dumps({
-                        "error": (
-                            f"Tool '{tool_name}' is not available in execute_code. "
-                            f"Available: {available}"
-                        )
-                    })
-                # Enforce tool call limit
-                elif tool_call_counter[0] >= max_tool_calls:
-                    tool_result = json.dumps({
-                        "error": (
-                            f"Tool call limit reached ({max_tool_calls}). "
-                            "No more tool calls allowed in this execution."
-                        )
-                    })
-                else:
-                    # Strip forbidden terminal parameters
-                    if tool_name == "terminal" and isinstance(tool_args, dict):
-                        for param in _TERMINAL_BLOCKED_PARAMS:
-                            tool_args.pop(param, None)
-
-                    # Dispatch through the standard tool handler
-                    try:
-                        _real_stdout, _real_stderr = sys.stdout, sys.stderr
-                        devnull = open(os.devnull, "w", encoding="utf-8")
-                        try:
-                            sys.stdout = devnull
-                            sys.stderr = devnull
-                            tool_result = handle_function_call(
-                                tool_name, tool_args, task_id=task_id
-                            )
-                        finally:
-                            sys.stdout, sys.stderr = _real_stdout, _real_stderr
-                            devnull.close()
-                    except Exception as exc:
-                        logger.error("Tool call failed in remote sandbox: %s",
-                                     exc, exc_info=True)
-                        tool_result = tool_error(str(exc))
-
-                    tool_call_counter[0] += 1
-                    call_duration = time.monotonic() - call_start
-                    tool_call_log.append({
-                        "tool": tool_name,
-                        "args_preview": str(tool_args)[:80],
-                        "duration": round(call_duration, 2),
-                    })
+                tool_result = _serve_bridged_call(
+                    tool_name,
+                    tool_args,
+                    allowed_tools=allowed_tools,
+                    tool_call_counter=tool_call_counter,
+                    max_tool_calls=max_tool_calls,
+                    task_id=task_id,
+                )
+                call_duration = time.monotonic() - call_start
+                tool_call_log.append({
+                    "tool": tool_name,
+                    "args_preview": str(tool_args)[:80],
+                    "duration": round(call_duration, 2),
+                })
 
                 # Write response atomically (tmp + rename).
                 # Use echo piping (not stdin_data) because Modal doesn't
@@ -1009,10 +1167,7 @@ def _execute_remote(
     timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
-    session_tools = set(enabled_tools) if enabled_tools else set()
-    sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-    if not sandbox_tools:
-        sandbox_tools = SANDBOX_ALLOWED_TOOLS
+    sandbox_tools = resolve_sandbox_tools(enabled_tools)
 
     effective_task_id = task_id or "default"
     env, env_type = _get_or_create_env(effective_task_id)
@@ -1181,6 +1336,115 @@ def _execute_remote(
     return json.dumps(result, ensure_ascii=False)
 
 
+TRANSPORT_ENV = "HERMES_CODE_EXECUTION_TRANSPORT"
+_KNOWN_TRANSPORTS = frozenset({"sidecar"})
+_UNKNOWN_TRANSPORT = "execute_code is misconfigured (unknown transport); refusing to run."
+
+
+def _configured_transport() -> Optional[str]:
+    """The code_execution transport, stripped and lower-cased: the env var
+    HERMES_CODE_EXECUTION_TRANSPORT when it is set (non-empty), else
+    ``code_execution.transport``. None when neither is set, which keeps upstream's
+    local/remote dispatch.
+
+    The env var is what pins the TRC deployment to the sidecar: an unreadable
+    config.yaml reads as {}, and that must not make model-written code run in this
+    process. Any value but a known one is refused by the caller, never treated as unset.
+    """
+    value = os.environ.get(TRANSPORT_ENV, "").strip()
+    if not value:
+        configured = _load_config().get("transport")
+        value = "" if configured is None else str(configured).strip()
+    return value.lower() or None
+
+
+_SIDECAR_ERRORS = {
+    "timeout": "The script exceeded the sandbox's time limit and was stopped.",
+    "busy": "The calculation sandbox is busy; try again in a moment.",
+    "unavailable": "The calculation sandbox is unavailable right now.",
+}
+
+
+def _execute_sidecar(code: str, task_id: Optional[str], enabled_tools: Optional[List[str]]) -> str:
+    """Run `code` in the TRC sandbox sidecar (trc-backend spec §4.5)."""
+    from agent.redact import redact_sensitive_text
+    from tools.ansi_strip import strip_ansi
+    from tools.interrupt import is_interrupted
+    from tools.sidecar_sandbox import run_in_sidecar
+    from tools import trc_sandbox_bridge
+
+    cfg = _load_config()
+    sandbox_tools = resolve_sandbox_tools(enabled_tools)
+    max_tool_calls = int(cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS))
+    counter = [0]
+    started = time.monotonic()
+
+    def on_call(tool_name: str, args: dict) -> str:
+        return _serve_bridged_call(
+            tool_name,
+            args,
+            allowed_tools=sandbox_tools,
+            tool_call_counter=counter,
+            max_tool_calls=max_tool_calls,
+            task_id=task_id,
+        )
+
+    done = run_in_sidecar(
+        str(cfg.get("sidecar_socket") or "/run/hermes-sandbox/sock"),
+        code,
+        generate_hermes_tools_module(list(sandbox_tools), transport="pipe"),
+        dict(cfg.get("sidecar_limits") or {}),
+        on_call,
+        overall_timeout=float(cfg.get("timeout", DEFAULT_TIMEOUT)),
+        # Asked on this thread, the one agent.interrupt() flags when the turn is stopped.
+        should_stop=is_interrupted,
+    )
+    status = str(done.get("status") or "error")
+    if "op" not in done:
+        # Decided on this side (unavailable, timeout, interrupted), not reported by the
+        # runner. The value is a class name or a fixed string, never script output.
+        logger.warning("execute_code sidecar: %s (%s)", status, done.get("error"))
+    stdout_text, stdout_metadata = _truncate_stdout_text(str(done.get("stdout") or ""))
+    stderr_text = str(done.get("stderr") or "")[-MAX_STDERR_BYTES:]
+    stdout_text = redact_sensitive_text(strip_ansi(stdout_text), code_file=True)
+    stderr_text = redact_sensitive_text(strip_ansi(stderr_text), code_file=True)
+    if status != "interrupted":
+        # Never for a stopped turn: the backend keys computed figures by conversation,
+        # so anything recorded now would land in the NEXT turn's scope.
+        trc_sandbox_bridge.record_computed(stdout_text, cfg.get("record_computed_server"))
+
+    exit_code = done.get("exit_code", -1)
+    result: Dict[str, Any] = {
+        "status": status,
+        "output": stdout_text,
+        "exit_code": exit_code,
+        "tool_calls_made": counter[0],
+        "duration_seconds": round(time.monotonic() - started, 2),
+    }
+    result.update(stdout_metadata)
+    if status == "interrupted":
+        result["output"] = stdout_text + "\n[execution interrupted — user sent a new message]"
+    elif status in _SIDECAR_ERRORS:
+        result["error"] = _SIDECAR_ERRORS[status]
+        if status == "timeout":
+            # In the output too, as on the local path (#10807): an empty output reads
+            # to the model as "nothing happened", and it answers with nothing.
+            timeout_msg = _SIDECAR_ERRORS["timeout"]
+            result["output"] = (
+                f"{stdout_text}\n\n⏰ {timeout_msg}" if stdout_text else f"⏰ {timeout_msg}"
+            )
+        elif status == "busy" and stderr_text.strip():
+            # The runner's reason, e.g. "1 of 3 sandbox slots quarantined": two
+            # integers, written before any script ran.
+            result["error"] += f" ({stderr_text.strip()})"
+    elif status != "success" or exit_code != 0:
+        result["status"] = "error"
+        result["error"] = stderr_text or f"Script exited with code {exit_code}"
+        if stderr_text:
+            result["output"] = stdout_text + "\n--- stderr ---\n" + stderr_text
+    return json.dumps(result, ensure_ascii=False)
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -1214,6 +1478,18 @@ def execute_code(
 
     if not code or not code.strip():
         return tool_error("No code provided.")
+
+    # A transport that is set but unknown is refused, never read as unset: falling back
+    # would run model-written code in this process (trc-backend spec 2026-09-28 §4.5).
+    transport = _configured_transport()
+    if transport is not None and transport not in _KNOWN_TRANSPORTS:
+        logger.error("execute_code: unknown transport %r; refusing to run", transport[:40])
+        return json.dumps({
+            "status": "error",
+            "error": _UNKNOWN_TRANSPORT,
+            "tool_calls_made": 0,
+            "duration_seconds": 0,
+        })
 
     # Dispatch: remote backends use file-based RPC, local uses UDS
     from tools.terminal_tool import _get_env_config, _docker_has_host_access
@@ -1249,6 +1525,11 @@ def execute_code(
         from tools.interrupt import clear_current_thread_interrupt
         clear_current_thread_interrupt()
 
+    # The TRC deployment runs scripts in the no-network sidecar, never in this process
+    # (trc-backend spec 2026-09-28 §4.5). Unset keeps upstream's local/remote paths.
+    if transport == "sidecar":
+        return _execute_sidecar(code, task_id, enabled_tools)
+
     if env_type != "local":
         return _execute_remote(code, task_id, enabled_tools)
 
@@ -1263,11 +1544,7 @@ def execute_code(
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
     # Determine which tools the sandbox can call
-    session_tools = set(enabled_tools) if enabled_tools else set()
-    sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-
-    if not sandbox_tools:
-        sandbox_tools = SANDBOX_ALLOWED_TOOLS
+    sandbox_tools = resolve_sandbox_tools(enabled_tools)
 
     # --- Set up temp directory with hermes_tools.py and script.py ---
     tmpdir = tempfile.mkdtemp(prefix="hermes_sandbox_")
@@ -1895,6 +2172,44 @@ _TOOL_DOC_LINES = [
 ]
 
 
+def _mcp_doc_line(tool_name: str) -> str:
+    """One description line for an MCP stub, from the registered schema."""
+    from tools.registry import registry
+
+    server, tool = _mcp_parts(tool_name)
+    schema = registry.get_schema(tool_name) or {}
+    props = (schema.get("parameters") or {}).get("properties") or {}
+    params = ", ".join(p for p in props if p not in _MCP_HIDDEN_PARAMS)
+    summary = (schema.get("description") or "").strip().splitlines()
+    first = summary[0] if summary else ""
+    ident = _mcp_namespace_identifier(server)
+    return f"  {ident}.{tool}({params}) -> dict   (keyword arguments)\n    {first}"
+
+
+# The sandbox runner's wall-clock default and ceiling (deploy/trc/sandbox/runner.py).
+_SIDECAR_WALL_DEFAULT = 240
+
+
+def _sidecar_wall(cfg: dict) -> int:
+    """The run's wall-clock limit as the runner will apply it: asked for in
+    ``code_execution.sidecar_limits.wall``, clamped to its ceiling, default if unusable."""
+    limits = cfg.get("sidecar_limits")
+    try:
+        wall = int((limits if isinstance(limits, dict) else {}).get("wall", _SIDECAR_WALL_DEFAULT))
+    except (TypeError, ValueError, OverflowError):
+        return _SIDECAR_WALL_DEFAULT
+    return max(1, min(wall, _SIDECAR_WALL_DEFAULT))
+
+
+def _limits_sentence(cfg: dict, *, sidecar: bool = False) -> str:
+    # In the sidecar the runner's wall clock stops a script; Hermes' `timeout` only
+    # bounds how long the gateway waits for it, so it is not the limit to tell the model.
+    timeout = _sidecar_wall(cfg) if sidecar else int(cfg.get("timeout", DEFAULT_TIMEOUT))
+    calls = int(cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS))
+    span = f"{timeout // 60}-minute" if timeout % 60 == 0 else f"{timeout}-second"
+    return f"Limits: {span} timeout, 50KB stdout cap, max {calls} tool calls per script."
+
+
 def build_execute_code_schema(enabled_sandbox_tools: set = None,
                               mode: str = None) -> dict:
     """Build the execute_code schema with description listing only enabled tools.
@@ -1910,7 +2225,7 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
     If ``mode`` is None, the current ``code_execution.mode`` config is read.
     """
     if enabled_sandbox_tools is None:
-        enabled_sandbox_tools = SANDBOX_ALLOWED_TOOLS
+        enabled_sandbox_tools = _sandbox_allowlist()
     if mode is None:
         mode = _get_execution_mode()
 
@@ -1919,8 +2234,18 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         doc for name, doc in _TOOL_DOC_LINES if name in enabled_sandbox_tools
     )
 
+    cfg = _load_config()
+    mcp_lines = [
+        _mcp_doc_line(name)
+        for name in sorted(enabled_sandbox_tools)
+        if name.startswith(MCP_TOOL_PREFIX)
+    ]
+    if mcp_lines:
+        tool_lines = "\n".join(filter(None, [tool_lines, *mcp_lines]))
+
     # Build example import list from enabled tools
     import_examples = [n for n in ("web_search", "terminal") if n in enabled_sandbox_tools]
+    import_examples += sorted({_mcp_namespace_identifier(_mcp_parts(n)[0]) for n in enabled_sandbox_tools if n.startswith(MCP_TOOL_PREFIX)})
     if not import_examples:
         import_examples = sorted(enabled_sandbox_tools)[:2]
     if import_examples:
@@ -1931,7 +2256,10 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
     # Mode-specific CWD guidance. Project mode is the default and matches
     # terminal()'s filesystem/interpreter; strict mode retains the isolated
     # temp-dir staging and hermes-agent's own python.
-    if mode == "strict":
+    sidecar = _configured_transport() == "sidecar"
+    if sidecar:
+        cwd_note = "Scripts run in an isolated sandbox with no network and no files beyond a scratch directory."
+    elif mode == "strict":
         cwd_note = (
             "Scripts run in their own temp dir, not the session's CWD — use absolute paths "
             "(os.path.expanduser('~/.hermes/.env')) or terminal()/read_file() for user files."
@@ -1942,25 +2270,48 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
             "so project deps (pandas, etc.) and relative paths work like in terminal()."
         )
 
+    intro = str(cfg.get("description_intro") or "").strip()
+    if intro:
+        intro += "\n\n"
+    else:
+        intro = (
+            "Run a Python script that can call Hermes tools programmatically. "
+            "Use this when you need 3+ tool calls with processing logic between them, "
+            "need to filter/reduce large tool outputs before they enter your context, "
+            "need conditional branching (if X then Y else Z), or need to loop "
+            "(fetch N pages, process N files, retry on failure).\n\n"
+            "Use normal tool calls instead when: single tool call with no processing, "
+            "you need to see the full result and apply complex reasoning, "
+            "or the task requires interactive user input.\n\n"
+        )
+
+    if sidecar:
+        # No terminal() in the sandbox: a model told about it (or shell_quote) spends
+        # one of its few runs finding out.
+        limits = f"{_limits_sentence(cfg, sidecar=True)}\n\n"
+        helpers = (
+            "  json_parse(text: str) — json.loads with strict=False; use for text with control chars\n"
+        )
+    else:
+        limits = (
+            f"{_limits_sentence(cfg)} "
+            "terminal() is foreground-only (no background or pty).\n\n"
+        )
+        helpers = (
+            "  json_parse(text: str) — json.loads with strict=False; use for terminal() output with control chars\n"
+            "  shell_quote(s: str) — shlex.quote(); use when interpolating dynamic strings into shell commands\n"
+        )
+
     description = (
-        "Run a Python script that can call Hermes tools programmatically. "
-        "Use this when you need 3+ tool calls with processing logic between them, "
-        "need to filter/reduce large tool outputs before they enter your context, "
-        "need conditional branching (if X then Y else Z), or need to loop "
-        "(fetch N pages, process N files, retry on failure).\n\n"
-        "Use normal tool calls instead when: single tool call with no processing, "
-        "you need to see the full result and apply complex reasoning, "
-        "or the task requires interactive user input.\n\n"
+        f"{intro}"
         f"Available via `from hermes_tools import ...`:\n\n"
         f"{tool_lines}\n\n"
-        "Limits: 5-minute timeout, 50KB stdout cap, max 50 tool calls per script. "
-        "terminal() is foreground-only (no background or pty).\n\n"
+        f"{limits}"
         f"{cwd_note}\n\n"
         "Print your final result to stdout. Use Python stdlib (json, re, math, csv, "
         "datetime, collections, etc.) for processing between tool calls.\n\n"
         "Also available (no import needed — built into hermes_tools):\n"
-        "  json_parse(text: str) — json.loads with strict=False; use for terminal() output with control chars\n"
-        "  shell_quote(s: str) — shlex.quote(); use when interpolating dynamic strings into shell commands\n"
+        f"{helpers}"
         "  retry(fn, max_attempts=3, delay=2) — retry with exponential backoff for transient failures"
     )
 

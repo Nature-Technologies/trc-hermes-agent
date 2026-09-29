@@ -44,6 +44,7 @@ READING_LINE = "Reading your question…"
 COMPOSING_LINE = "Preparing your answer…"
 DONE_LINE = "Searched TRC records"
 OTHER_TOOL_LINE = "Working on it…"
+CALCULATING_LINE = "Calculating…"
 
 OPENERS = {
     "query": "Searching TRC records…",
@@ -194,7 +195,8 @@ class TurnStatus:
         tool = data_tool_of(tool_name)
         self._current_tool = tool
         if tool is None:
-            return self._emit(status_payload(OTHER_TOOL_LINE))
+            line = CALCULATING_LINE if tool_name == "execute_code" else OTHER_TOOL_LINE
+            return self._emit(status_payload(line))
         self._data_tool_ran = True
         return self._emit(status_payload(OPENERS[tool]))
 
