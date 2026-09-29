@@ -40,3 +40,18 @@ def test_an_unconnected_server_is_skipped():
     ):
         bridge.record_computed("1,000.00", "ragnarok")
     make.assert_not_called()
+
+
+def test_an_error_reply_is_logged_as_a_warning(caplog):
+    handler = MagicMock(return_value='{"error": "MCP call failed: boom"}')
+    with (
+        patch("tools.mcp_tool._servers", {"ragnarok": SimpleNamespace(tool_timeout=30)}),
+        patch("tools.mcp_tool._make_tool_handler", return_value=handler),
+    ):
+        bridge.record_computed("1,000.00", "ragnarok")  # must not raise
+    records = [r for r in caplog.records if r.name == "tools.trc_sandbox_bridge"]
+    warning_records = [r for r in records if r.levelname == "WARNING"]
+    assert len(warning_records) == 1
+    assert "record_computed failed" in warning_records[0].message
+    for record in records:
+        assert "boom" not in record.message

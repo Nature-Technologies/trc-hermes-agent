@@ -169,6 +169,14 @@ def record_computed(stdout_text: str, server_name: Optional[str]) -> None:
             return
         handler = _make_tool_handler(server_name, "record_computed", server.tool_timeout)
         raw = handler({"texts": [stdout_text]})
+        # Handler returns error JSON on RPC failure rather than raising
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(parsed, dict) and "error" in parsed:
+                logger.warning("record_computed failed: backend returned an error (%d chars sent)", len(stdout_text))
+                return
+        except (json.JSONDecodeError, TypeError):
+            pass  # Not a JSON error response; treat as success
         logger.info("record_computed: sent (%d chars) -> %s", len(stdout_text), str(raw)[:80])
     except Exception as exc:
         logger.warning("record_computed failed: %s", type(exc).__name__)
