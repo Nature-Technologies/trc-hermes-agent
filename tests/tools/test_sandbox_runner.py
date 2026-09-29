@@ -8,10 +8,13 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -23,6 +26,7 @@ _spec.loader.exec_module(runner)
 
 _needs_ownership = pytest.mark.skipif(
     sys.platform == "win32", reason="no file ownership on Windows")
+_needs_dir_fd = pytest.mark.skipif(not runner._DIR_FD, reason="no dir_fd on Windows")
 
 
 def test_limits_are_clamped_to_the_ceiling():
@@ -156,7 +160,7 @@ def _symlink(link: Path, target: Path) -> bool:
 def mount_point(tmp_path, monkeypatch):
     """tmp_path/slot-20001, which -- like the per-slot tmpfs -- must never be removed."""
     slot = tmp_path / "slot-20001"
-    real_rmtree, real_rmdir = runner.shutil.rmtree, runner.os.rmdir
+    real_rmtree, real_rmdir = shutil.rmtree, runner.os.rmdir
 
     def rmtree(path, *a, **kw):
         assert Path(path) != slot, "the slot directory itself must never be removed"
@@ -166,7 +170,7 @@ def mount_point(tmp_path, monkeypatch):
         assert Path(path) != slot, "the slot directory itself must never be removed"
         return real_rmdir(path, *a, **kw)
 
-    monkeypatch.setattr(runner.shutil, "rmtree", rmtree)
+    monkeypatch.setattr(shutil, "rmtree", rmtree)
     monkeypatch.setattr(runner.os, "rmdir", rmdir)
     return slot
 
@@ -189,6 +193,98 @@ def test_clear_dir_empties_the_directory_but_keeps_it(tmp_path, mount_point):
 
 def test_clear_dir_of_a_missing_directory_is_a_no_op(tmp_path):
     runner.clear_dir(str(tmp_path / "absent"))
+
+
+def _deep_tree(root: Path, depth: int) -> None:
+    """`depth` nested directories under `root`, a file at the top and at the bottom:
+    what `for _ in range(depth): os.mkdir("d"); os.chdir("d")` leaves behind."""
+    (root / "top.txt").write_bytes(b"x")
+    if not runner._DIR_FD:
+        here = root
+        for _ in range(depth):
+            here = here / "d"
+            here.mkdir()
+        (here / "leaf").write_bytes(b"x")
+        return
+    fd = os.open(root, os.O_RDONLY)
+    try:
+        for _ in range(depth):
+            os.mkdir("d", dir_fd=fd)
+            nested = os.open("d", os.O_RDONLY, dir_fd=fd)
+            os.close(fd)
+            fd = nested
+        os.close(os.open("leaf", os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=fd))
+    finally:
+        os.close(fd)
+
+
+@_needs_dir_fd
+def test_clear_dir_empties_a_tree_deeper_than_the_recursion_limit(mount_point):
+    """N1: shutil.rmtree recurses; 1,100 levels raised RecursionError and quarantined
+    the slot for good, so three such runs took the sandbox down."""
+    mount_point.mkdir()
+    _deep_tree(mount_point, 1100)
+    runner.clear_dir(str(mount_point))
+    assert mount_point.is_dir() and list(mount_point.iterdir()) == []
+
+
+def test_the_path_fallback_is_iterative_too(mount_point, monkeypatch):
+    """Where dir_fd is unsupported the same flat loop runs on paths. On Linux this
+    forces the fallback at full depth; Windows paths cap the depth at 40."""
+    depth = 40 if sys.platform == "win32" else 1100
+    mount_point.mkdir()
+    _deep_tree(mount_point, depth)
+    monkeypatch.setattr(runner, "_DIR_FD", False)
+    runner.clear_dir(str(mount_point))
+    assert mount_point.is_dir() and list(mount_point.iterdir()) == []
+
+
+@_needs_dir_fd
+def test_tree_removal_holds_at_most_two_directory_fds(tmp_path, monkeypatch):
+    root = tmp_path / "slot"
+    root.mkdir()
+    _deep_tree(root, 200)
+    for i in range(20):
+        (root / f"wide{i}" / "inner").mkdir(parents=True)
+    held, peak = set(), [0]
+    real_open, real_close = os.open, os.close
+
+    def opener(*a, **kw):
+        fd = real_open(*a, **kw)
+        held.add(fd)
+        peak[0] = max(peak[0], len(held))
+        return fd
+
+    def closer(fd):
+        held.discard(fd)
+        return real_close(fd)
+
+    monkeypatch.setattr(runner.os, "open", opener)
+    monkeypatch.setattr(runner.os, "close", closer)
+    runner.clear_dir(str(root))
+    assert list(root.iterdir()) == []
+    assert peak[0] == 2 and not held
+
+
+@_needs_dir_fd
+def test_a_symlinked_root_is_refused_not_followed(tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "keep.txt").write_text("keep", encoding="utf-8")
+    link = tmp_path / "link"
+    link.symlink_to(target, target_is_directory=True)
+    with pytest.raises(OSError):
+        runner._remove_dir(str(link))
+    assert (target / "keep.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_the_operation_cap_fails_closed(tmp_path, monkeypatch):
+    """N1: past MAX_REMOVE_OPS the removal raises instead of looping on."""
+    monkeypatch.setattr(runner, "MAX_REMOVE_OPS", 5)
+    for i in range(20):
+        (tmp_path / f"f{i}").write_bytes(b"x")
+    with pytest.raises(runner.CleanupTooLarge):
+        runner.clear_dir(str(tmp_path))
 
 
 def test_prepare_workdir_hands_the_directory_over_only_after_writing(
@@ -259,6 +355,16 @@ def test_ipc_leftovers_of_the_slot_uid_are_removed(tmp_path):
     assert os.listdir(shm) == [] and os.listdir(mq) == []
     assert (outside / "keep.txt").read_text(encoding="utf-8") == "keep"
     assert os.path.exists("/etc/passwd")
+
+
+@_needs_ownership
+@_needs_dir_fd
+def test_a_deep_tree_under_an_ipc_root_is_removed(tmp_path):
+    shm = tmp_path / "shm"
+    (shm / "deep").mkdir(parents=True)
+    _deep_tree(shm / "deep", 1100)
+    runner.wipe_ipc_leftovers(os.lstat(shm / "deep").st_uid, roots=(str(shm),))
+    assert os.listdir(shm) == []
 
 
 def test_missing_ipc_roots_are_not_an_error(tmp_path):
@@ -448,6 +554,37 @@ def test_a_call_whose_frame_outgrows_the_hermes_line_is_too_large(monkeypatch):
     assert outcome == "too_large" and frames == []
 
 
+def test_buffered_calls_stop_at_the_wall_clock(monkeypatch):
+    """N3: once the deadline passes, a call already buffered is not served."""
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(runner, "time",
+                        types.SimpleNamespace(monotonic=lambda: clock["now"], sleep=time.sleep))
+    child, script = socket.socketpair()
+    hermes, runner_side = socket.socketpair()
+    script.sendall(b'{"tool": "t", "args": {}}\n' * 2)
+    hermes.sendall(_reply(1, "ok") + _reply(2, "ok"))
+    rfile, wfile = runner_side.makefile("rb"), runner_side.makefile("wb")
+
+    class _SlowHermes:
+        """Each call takes Hermes a minute: the first one outlasts the wall clock."""
+
+        def write(self, data):
+            clock["now"] += 60
+            return wfile.write(data)
+
+        def flush(self):
+            wfile.flush()
+
+    outcome = runner.relay(child, runner_side, rfile, _SlowHermes(), _FakeProc(),
+                           clock["now"] + 30)
+    for obj in (child, rfile, wfile, runner_side):
+        obj.close()
+    frames = [json.loads(line) for line in _read_all(hermes).splitlines()]
+    assert outcome == "timeout"
+    assert [f["id"] for f in frames] == [1]
+    assert _read_all(script) == b"ok\n"
+
+
 class _FakeChild:
     """The runner's end of the script's socket, where sendall can be made to fail."""
 
@@ -515,6 +652,17 @@ class _Launched:
         self.returncode = -9
 
 
+class _Unreapable(_Launched):
+    def __init__(self):
+        super().__init__(running=True)
+
+    def kill(self):
+        self.killed = True
+
+    def wait(self, timeout=None):
+        raise subprocess.TimeoutExpired("launch.py", timeout)
+
+
 @pytest.fixture
 def job(tmp_path, monkeypatch, mount_point):
     """run_job with the slot machinery faked: one slot, no real processes."""
@@ -569,6 +717,50 @@ def test_a_survivor_at_the_pre_read_kill_quarantines_the_slot(job, capsys):
     assert job["kills"] == [20001, 20001]
     assert job["pool"].acquire(0.01) is None
     assert "quarantined" in capsys.readouterr().err
+
+
+def test_the_ipc_wipe_still_runs_when_the_clear_faults(job, monkeypatch, capsys):
+    """N1: a run must not keep its /dev/shm entries by making its own clear fail."""
+    def fail(path):
+        raise RecursionError
+
+    monkeypatch.setattr(runner, "clear_dir", fail)
+    job["run"]()
+    assert job["wiped"] == [20001]
+    assert job["pool"].acquire(0.01) is None
+    assert capsys.readouterr().err.strip() == (
+        "sandbox: slot 20001 quarantined: its work directory could not be cleared")
+
+
+def test_a_tree_past_the_operation_cap_quarantines_the_slot(job, monkeypatch):
+    monkeypatch.setattr(runner, "MAX_REMOVE_OPS", 5)
+    for i in range(20):
+        (job["slot"] / f"f{i}").write_bytes(b"x")
+    job["run"]()
+    assert job["wiped"] == [20001]
+    assert job["pool"].acquire(0.01) is None
+
+
+def test_busy_says_how_many_slots_are_quarantined(job, monkeypatch):
+    monkeypatch.setattr(runner, "BUSY_WAIT_SECONDS", 0.01)
+    held = job["pool"].acquire(0.01)
+    frame = job["run"]()
+    assert (frame["status"], frame["stderr"]) == ("busy", "")
+    job["pool"].release(held)
+    job["kill_results"] = [False, False]
+    job["run"]()
+    frame = job["run"]()
+    assert (frame["status"], frame["stderr"]) == ("busy", "1 of 1 sandbox slots quarantined")
+
+
+def test_an_unreaped_process_reports_exit_code_minus_one(job, monkeypatch):
+    """N5: a reap that times out leaves returncode None; the frame says -1."""
+    monkeypatch.setattr(runner, "relay", lambda *a: "exited")
+    job["proc"] = _Unreapable()
+    frame = job["run"]()
+    assert frame["exit_code"] == -1 and frame["status"] == "error"
+    assert job["pool"].acquire(0.01) is None
+    assert runner._finish("exited", time.monotonic(), None, "", "")["exit_code"] == -1
 
 
 def test_a_runner_fault_still_ends_in_a_done_frame(job, monkeypatch):

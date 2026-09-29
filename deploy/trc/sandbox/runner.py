@@ -19,9 +19,11 @@ never handed to another run.
 from __future__ import annotations
 
 import collections
+import errno
+import itertools
 import json
 import os
-import shutil
+import secrets
 import signal
 import socket
 import socketserver
@@ -45,6 +47,10 @@ MAX_LINE = 4_000_000
 POLL_SECONDS = 0.2
 HERMES_GRACE_SECONDS = 10
 IPC_ROOTS = ("/dev/shm", "/dev/mqueue")
+# Operations allowed to empty one tree. A slot's tmpfs holds 4096 inodes and an entry
+# costs at most two operations, so reaching this is a fault, not a slow cleanup.
+MAX_REMOVE_OPS = 200_000
+_DIR_FD = os.unlink in os.supports_dir_fd  # False on Windows, where only tests run
 DEFAULT_LIMITS = {"wall": 240, "cpu": 60, "mem_mb": 768}
 CEILINGS = {"wall": 240, "cpu": 60, "mem_mb": 768}
 
@@ -89,7 +95,18 @@ def recv(fp):
 class SlotPool:
     def __init__(self, uids):
         self._free = list(uids)
+        self.size = len(self._free)
+        self._quarantined = set()
         self._cond = threading.Condition()
+
+    def quarantine(self, uid) -> None:
+        """Never hand `uid` out again (until the daemon restarts)."""
+        with self._cond:
+            self._quarantined.add(uid)
+
+    def quarantined(self) -> int:
+        with self._cond:
+            return len(self._quarantined)
 
     def acquire(self, timeout):
         deadline = time.monotonic() + timeout
@@ -184,23 +201,121 @@ def slot_dir(uid) -> str:
     return os.path.join(WORK_ROOT, f"slot-{uid}")
 
 
+class CleanupTooLarge(Exception):
+    """Emptying a tree needed more than MAX_REMOVE_OPS operations."""
+
+
+class _Tree:
+    """Empty one directory, whatever the depth of what is in it, and keep the directory.
+
+    Flat, not recursive (shutil.rmtree recurses, and a run can nest deeper than the
+    interpreter's recursion limit): a subdirectory that is not empty has its children
+    moved up into the root under fresh names and is then removed, until the root is
+    empty. Each entry moves at most once, so the work is linear in the entry count.
+    At most two directory fds are held — the root and one subdirectory — and every
+    operation is relative to one of them, opened O_NOFOLLOW, so no path a run planted
+    is ever resolved. Past MAX_REMOVE_OPS it raises, and the caller quarantines the
+    slot: fail closed, never loop forever. Where dir_fd is unsupported (Windows, only
+    in tests) the same loop runs on paths."""
+
+    def __init__(self, path):
+        self.path = path
+        self.fd = None
+        self._ops = 0
+        self._prefix = f".trc-rm-{secrets.token_hex(8)}-"
+        self._fresh = itertools.count()
+        if _DIR_FD:
+            self.fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        else:
+            os.lstat(path)  # a missing root raises FileNotFoundError, as os.open does
+
+    def empty(self) -> None:
+        try:
+            while True:
+                names = os.listdir(self.path if self.fd is None else self.fd)
+                if not names:
+                    return
+                for name in names:
+                    self._spend()
+                    try:
+                        self._remove(name)
+                    except FileNotFoundError:
+                        continue
+        finally:
+            if self.fd is not None:
+                os.close(self.fd)
+
+    def _spend(self) -> None:
+        self._ops += 1
+        if self._ops > MAX_REMOVE_OPS:
+            raise CleanupTooLarge(self.path)
+
+    def _remove(self, name) -> None:
+        if not stat.S_ISDIR(self._lstat(name).st_mode):
+            self._unlink(name)
+            return
+        try:
+            self._rmdir(name)
+            return
+        except OSError as exc:
+            if exc.errno not in (errno.ENOTEMPTY, errno.EEXIST):
+                raise
+        self._hoist(name)
+        self._rmdir(name)
+
+    def _hoist(self, name) -> None:
+        """Move every child of the subdirectory `name` up into the root."""
+        if self.fd is None:
+            sub = os.path.join(self.path, name)
+            for child in os.listdir(sub):
+                self._spend()
+                os.rename(os.path.join(sub, child), os.path.join(self.path, self._new_name()))
+            return
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+        sub_fd = os.open(name, flags, dir_fd=self.fd)
+        try:
+            for child in os.listdir(sub_fd):
+                self._spend()
+                os.rename(child, self._new_name(), src_dir_fd=sub_fd, dst_dir_fd=self.fd)
+        finally:
+            os.close(sub_fd)
+
+    def _new_name(self) -> str:
+        return f"{self._prefix}{next(self._fresh)}"
+
+    def _lstat(self, name):
+        if self.fd is None:
+            return os.lstat(os.path.join(self.path, name))
+        return os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+
+    def _unlink(self, name) -> None:
+        if self.fd is None:
+            os.unlink(os.path.join(self.path, name))
+        else:
+            os.unlink(name, dir_fd=self.fd)
+
+    def _rmdir(self, name) -> None:
+        if self.fd is None:
+            os.rmdir(os.path.join(self.path, name))
+        else:
+            os.rmdir(name, dir_fd=self.fd)
+
+
 def clear_dir(path) -> None:
     """Empty `path` but keep it: each slot's directory is its own tmpfs mount point,
     which cannot be removed. Nothing a run planted is followed — a symlink is removed,
     never its target. A missing directory is already clear."""
     try:
-        with os.scandir(path) as it:
-            entries = list(it)
+        tree = _Tree(path)
     except FileNotFoundError:
         return
-    for entry in entries:
-        if entry.is_dir(follow_symlinks=False):
-            shutil.rmtree(entry.path)
-        else:
-            try:
-                os.unlink(entry.path)
-            except FileNotFoundError:
-                pass
+    tree.empty()
+
+
+def _remove_dir(path) -> None:
+    """Remove the directory `path` and everything in it, whatever the depth."""
+    _Tree(path).empty()
+    os.rmdir(path)
 
 
 def _create_file(path, body, uid) -> None:
@@ -255,7 +370,7 @@ def wipe_ipc_leftovers(uid, roots=IPC_ROOTS) -> None:
                 if info.st_uid != uid:
                     continue
                 if stat.S_ISDIR(info.st_mode):
-                    shutil.rmtree(entry.path)
+                    _remove_dir(entry.path)
                 else:
                     os.unlink(entry.path)
             except FileNotFoundError:
@@ -375,6 +490,8 @@ class _Relay:
             buf += chunk
             start = 0
             while True:
+                if time.monotonic() > self.deadline:
+                    return "timeout"  # not one more buffered call past the wall clock
                 end = buf.find(b"\n", scanned)
                 if end < 0:
                     break
@@ -458,6 +575,8 @@ _RUNNER_LINES = {"protocol": LOST_GATEWAY, "too_large": TOO_LARGE}
 
 
 def _finish(outcome, started, returncode, stdout, stderr) -> dict:
+    if returncode is None:  # never reaped: there is no exit code to report
+        returncode = -1
     if outcome == "exited":
         status = "success" if returncode == 0 else "error"
         return _done(status, started, returncode, stdout, stderr)
@@ -482,13 +601,14 @@ class _Slot:
         if self.fault is None:
             self.fault = reason
 
-    def kill(self) -> None:
+    def kill(self) -> bool:
         try:
             if kill_uid(self.uid):
-                return
+                return True
         except Exception:
             pass
         self._fail("processes survived cleanup")
+        return False
 
     def reap(self, proc) -> None:
         """The launcher's own pid, which may still be root (before its uid drop), where
@@ -501,12 +621,14 @@ class _Slot:
             self._fail("processes survived cleanup")
 
     def recycle(self, pool) -> None:
-        self.kill()
+        killed = self.kill()
         try:
             clear_dir(slot_dir(self.uid))
         except Exception:
             self._fail("its work directory could not be cleared")
-        if self.fault is None:
+        # Once nothing of the uid is alive, the wipe runs whatever else faulted: a run
+        # must not be able to keep its /dev/shm entries by making its own clear fail.
+        if killed:
             try:
                 wipe_ipc_leftovers(self.uid)
             except Exception:
@@ -514,6 +636,7 @@ class _Slot:
         if self.fault is None:
             pool.release(self.uid)
             return
+        pool.quarantine(self.uid)
         try:
             print(f"sandbox: slot {self.uid} quarantined: {self.fault}", file=sys.stderr,
                   flush=True)
@@ -550,7 +673,8 @@ def _run_in_slot(slot, limits, started, hermes_sock, rfile, wfile, request) -> d
         outcome = relay(parent, hermes_sock, rfile, wfile, proc, started + limits["wall"])
         slot.kill()  # before reading output: a leftover could hold the pipes open
         slot.reap(proc)
-        return _finish(outcome, started, proc.returncode, out.text(), err.text())
+        returncode = -1 if proc.returncode is None else proc.returncode
+        return _finish(outcome, started, returncode, out.text(), err.text())
     finally:
         parent.close()
         if proc is not None:
@@ -565,7 +689,9 @@ def run_job(hermes_sock, rfile, wfile, request) -> dict:
     limits = clamp_limits(request.get("limits"))
     uid = POOL.acquire(BUSY_WAIT_SECONDS)
     if uid is None:
-        return _done("busy", started)
+        held = POOL.quarantined()
+        note = f"{held} of {POOL.size} sandbox slots quarantined" if held else ""
+        return _done("busy", started, stderr=note)
     slot = _Slot(uid)
     try:
         return _run_in_slot(slot, limits, started, hermes_sock, rfile, wfile, request)
