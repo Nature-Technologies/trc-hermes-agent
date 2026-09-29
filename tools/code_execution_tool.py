@@ -81,11 +81,22 @@ def _sandbox_allowlist() -> frozenset:
 
     ``code_execution.sandbox_tools`` in config.yaml replaces the built-in list (the TRC
     deployment sets its four ragnarok data tools); unset keeps SANDBOX_ALLOWED_TOOLS.
+
+    Key absent → SANDBOX_ALLOWED_TOOLS (backward-compatible default).
+    Key present, value is a list → frozenset of the listed names.
+    Key present, value is anything else → frozenset() and a warning (fail closed).
     """
-    configured = _load_config().get("sandbox_tools")
+    cfg = _load_config()
+    if "sandbox_tools" not in cfg:
+        return SANDBOX_ALLOWED_TOOLS
+    configured = cfg["sandbox_tools"]
     if isinstance(configured, list):
         return frozenset(str(name) for name in configured)
-    return SANDBOX_ALLOWED_TOOLS
+    logger.warning(
+        "code_execution.sandbox_tools must be a list; got %s — no sandbox tools allowed",
+        type(configured).__name__,
+    )
+    return frozenset()
 
 
 def resolve_sandbox_tools(enabled_tools) -> frozenset:

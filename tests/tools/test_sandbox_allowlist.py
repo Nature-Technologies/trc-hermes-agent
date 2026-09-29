@@ -52,3 +52,15 @@ def test_the_stub_module_never_contains_a_tool_outside_the_allowlist():
     with _config({"sandbox_tools": ["mcp__ragnarok__query"]}):
         src = cet.generate_hermes_tools_module(["terminal", "mcp__ragnarok__query"])
     assert "def terminal(" not in src
+
+
+def test_malformed_sandbox_tools_value_fails_closed():
+    """A non-list value is misconfiguration: fail closed, never fall back to the built-in 7."""
+    with _config({"sandbox_tools": "web_search"}):
+        assert cet._sandbox_allowlist() == frozenset()
+
+
+def test_empty_list_in_config_means_no_tools():
+    """An explicit empty list means the operator wants zero tools: honour it."""
+    with _config({"sandbox_tools": []}):
+        assert cet._sandbox_allowlist() == frozenset()
