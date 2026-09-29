@@ -377,6 +377,65 @@ _TOOL_STUBS = {
 }
 
 
+MCP_TOOL_PREFIX = "mcp__"
+# Never shown to a script's author and never forwarded (trc-backend spec §4.3):
+# identity comes from the gateway's verified headers, not from code the model wrote.
+_MCP_HIDDEN_PARAMS = frozenset({"requesting_user", "session_id"})
+
+_MCP_NAMESPACE_SRC = '''
+
+def _unwrap_mcp(raw):
+    """An MCP result as the tool's own dict: structured content first, then JSON text."""
+    if isinstance(raw, dict):
+        if set(raw) == {"error"}:
+            return {"status": "error", "error": raw["error"]}
+        structured = raw.get("structuredContent")
+        if isinstance(structured, dict):
+            inner = structured.get("result")
+            if set(structured) == {"result"} and isinstance(inner, dict):
+                return inner
+            return structured
+        result = raw.get("result")
+        if isinstance(result, dict):
+            return result
+        if isinstance(result, str):
+            try:
+                parsed = json.loads(result)
+            except ValueError:
+                return {"text": result}
+            return parsed if isinstance(parsed, dict) else {"value": parsed}
+    return raw
+
+
+class _McpServer:
+    """`<server>.<tool>(**kwargs)` for the MCP tools this session allows."""
+
+    def __init__(self, server, tools):
+        self._server = server
+        self._tools = frozenset(tools)
+
+    def __dir__(self):
+        return sorted(self._tools)
+
+    def __getattr__(self, name):
+        if name.startswith("_") or name not in self._tools:
+            raise AttributeError(f"{self._server}.{name} is not available in this sandbox")
+        full = "mcp__" + self._server + "__" + name
+
+        def _tool(**kwargs):
+            return _unwrap_mcp(_call(full, kwargs))
+
+        _tool.__name__ = name
+        return _tool
+'''
+
+
+def _mcp_parts(tool_name: str) -> tuple:
+    """`mcp__<server>__<tool>` -> (server, tool)."""
+    server, _, tool = tool_name[len(MCP_TOOL_PREFIX):].partition("__")
+    return server, tool
+
+
 def generate_hermes_tools_module(enabled_tools: List[str],
                                  transport: str = "uds") -> str:
     """
@@ -404,12 +463,24 @@ def generate_hermes_tools_module(enabled_tools: List[str],
         )
         export_names.append(func_name)
 
+    servers: dict = {}
+    for tool_name in tools_to_generate:
+        if tool_name.startswith(MCP_TOOL_PREFIX):
+            server, tool = _mcp_parts(tool_name)
+            servers.setdefault(server, []).append(tool)
+    mcp_src = ""
+    if servers:
+        mcp_src = _MCP_NAMESPACE_SRC + "".join(
+            f"\n{server} = _McpServer({server!r}, {sorted(tools)!r})\n"
+            for server, tools in sorted(servers.items())
+        )
+
     if transport == "file":
         header = _FILE_TRANSPORT_HEADER
     else:
         header = _UDS_TRANSPORT_HEADER
 
-    return header + "\n".join(stub_functions)
+    return header + "\n".join(stub_functions) + mcp_src
 
 
 # ---- Shared helpers section (embedded in both transport headers) ----------
@@ -1922,6 +1993,26 @@ _TOOL_DOC_LINES = [
 ]
 
 
+def _mcp_doc_line(tool_name: str) -> str:
+    """One description line for an MCP stub, from the registered schema."""
+    from tools.registry import registry
+
+    server, tool = _mcp_parts(tool_name)
+    schema = registry.get_schema(tool_name) or {}
+    props = (schema.get("parameters") or {}).get("properties") or {}
+    params = ", ".join(p for p in props if p not in _MCP_HIDDEN_PARAMS)
+    summary = (schema.get("description") or "").strip().splitlines()
+    first = summary[0] if summary else ""
+    return f"  {server}.{tool}({params}) -> dict   (keyword arguments)\n    {first}"
+
+
+def _limits_sentence(cfg: dict) -> str:
+    timeout = int(cfg.get("timeout", DEFAULT_TIMEOUT))
+    calls = int(cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS))
+    span = f"{timeout // 60}-minute" if timeout % 60 == 0 else f"{timeout}-second"
+    return f"Limits: {span} timeout, 50KB stdout cap, max {calls} tool calls per script."
+
+
 def build_execute_code_schema(enabled_sandbox_tools: set = None,
                               mode: str = None) -> dict:
     """Build the execute_code schema with description listing only enabled tools.
@@ -1937,7 +2028,7 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
     If ``mode`` is None, the current ``code_execution.mode`` config is read.
     """
     if enabled_sandbox_tools is None:
-        enabled_sandbox_tools = SANDBOX_ALLOWED_TOOLS
+        enabled_sandbox_tools = _sandbox_allowlist()
     if mode is None:
         mode = _get_execution_mode()
 
@@ -1946,8 +2037,18 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         doc for name, doc in _TOOL_DOC_LINES if name in enabled_sandbox_tools
     )
 
+    cfg = _load_config()
+    mcp_lines = [
+        _mcp_doc_line(name)
+        for name in sorted(enabled_sandbox_tools)
+        if name.startswith(MCP_TOOL_PREFIX)
+    ]
+    if mcp_lines:
+        tool_lines = "\n".join(filter(None, [tool_lines, *mcp_lines]))
+
     # Build example import list from enabled tools
     import_examples = [n for n in ("web_search", "terminal") if n in enabled_sandbox_tools]
+    import_examples += sorted({_mcp_parts(n)[0] for n in enabled_sandbox_tools if n.startswith(MCP_TOOL_PREFIX)})
     if not import_examples:
         import_examples = sorted(enabled_sandbox_tools)[:2]
     if import_examples:
@@ -1958,7 +2059,9 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
     # Mode-specific CWD guidance. Project mode is the default and matches
     # terminal()'s filesystem/interpreter; strict mode retains the isolated
     # temp-dir staging and hermes-agent's own python.
-    if mode == "strict":
+    if str(cfg.get("transport", "")).lower() == "sidecar":
+        cwd_note = "Scripts run in an isolated sandbox with no network and no files beyond a scratch directory."
+    elif mode == "strict":
         cwd_note = (
             "Scripts run in their own temp dir, not the session's CWD — use absolute paths "
             "(os.path.expanduser('~/.hermes/.env')) or terminal()/read_file() for user files."
@@ -1969,18 +2072,26 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
             "so project deps (pandas, etc.) and relative paths work like in terminal()."
         )
 
+    intro = str(cfg.get("description_intro") or "").strip()
+    if intro:
+        intro += "\n\n"
+    else:
+        intro = (
+            "Run a Python script that can call Hermes tools programmatically. "
+            "Use this when you need 3+ tool calls with processing logic between them, "
+            "need to filter/reduce large tool outputs before they enter your context, "
+            "need conditional branching (if X then Y else Z), or need to loop "
+            "(fetch N pages, process N files, retry on failure).\n\n"
+            "Use normal tool calls instead when: single tool call with no processing, "
+            "you need to see the full result and apply complex reasoning, "
+            "or the task requires interactive user input.\n\n"
+        )
+
     description = (
-        "Run a Python script that can call Hermes tools programmatically. "
-        "Use this when you need 3+ tool calls with processing logic between them, "
-        "need to filter/reduce large tool outputs before they enter your context, "
-        "need conditional branching (if X then Y else Z), or need to loop "
-        "(fetch N pages, process N files, retry on failure).\n\n"
-        "Use normal tool calls instead when: single tool call with no processing, "
-        "you need to see the full result and apply complex reasoning, "
-        "or the task requires interactive user input.\n\n"
+        f"{intro}"
         f"Available via `from hermes_tools import ...`:\n\n"
         f"{tool_lines}\n\n"
-        "Limits: 5-minute timeout, 50KB stdout cap, max 50 tool calls per script. "
+        f"{_limits_sentence(cfg)} "
         "terminal() is foreground-only (no background or pty).\n\n"
         f"{cwd_note}\n\n"
         "Print your final result to stdout. Use Python stdlib (json, re, math, csv, "
