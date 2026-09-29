@@ -4,15 +4,34 @@ A separate process on purpose: the runner is threaded, and `preexec_fn` is unsaf
 threaded parent (trc-backend spec §5.2). argv: uid cpu_seconds mem_mb workdir rpc_fd.
 `-E -s` ignore the environment and user site-packages; `-I` is not used because it also
 drops the script's own directory from sys.path, where hermes_tools.py sits.
+
+The rlimits are per PROCESS, not per slot: RLIMIT_NPROC bounds how far a run can
+multiply them, and the container's `mem_limit` bounds the total.
 """
 
 import os
 import resource
 import sys
 
-NPROC = 32
+NPROC = 8  # numeric thread pools are pinned to one thread; a script needs no subprocesses
 FSIZE = 50 * 2**20
 NOFILE = 64
+OOM_SCORE_ADJ = "/proc/self/oom_score_adj"
+
+
+def _oom_first() -> None:
+    """Make the run the OOM killer's first choice, ahead of the daemon.
+
+    Raising the score needs no privilege. Lowering it below the inherited floor
+    (`oom_score_adj_min`: 0 unless compose sets one) needs CAP_SYS_RESOURCE, which
+    nothing in the container holds, so a run can at most bring itself back level with
+    the daemon, never below it. Best effort: the runner's correctness does not depend
+    on it, and a dev box may refuse the write."""
+    try:
+        with open(OOM_SCORE_ADJ, "w", encoding="ascii") as fh:
+            fh.write("1000")
+    except OSError:
+        pass
 
 
 def main(argv):
@@ -22,6 +41,9 @@ def main(argv):
     resource.setrlimit(resource.RLIMIT_NPROC, (NPROC, NPROC))
     resource.setrlimit(resource.RLIMIT_FSIZE, (FSIZE, FSIZE))
     resource.setrlimit(resource.RLIMIT_NOFILE, (NOFILE, NOFILE))
+    # A core dump would write a process image that holds tool data.
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    _oom_first()  # before the uid drop, which leaves /proc/self root's until the exec
     os.setgroups([])
     os.setgid(uid)
     os.setuid(uid)
