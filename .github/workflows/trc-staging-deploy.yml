@@ -114,6 +114,7 @@ jobs:
           set -eu
           printf 'staging=%s:staging\n' "$IMAGE" >> "$GITHUB_OUTPUT"
           printf 'sha=%s:git-%s\n' "$IMAGE" "${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          printf 'sandbox_sha=%s-sandbox:git-%s\n' "$IMAGE" "${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
       # Runs BEFORE the build: the build happens on this host, so free disk and
       # a reachable daemon are preconditions of the build itself. A full disk
@@ -213,6 +214,16 @@ jobs:
           # manifest list and an extra export pass for nothing.
           provenance: false
 
+      - name: Build the sandbox image on the deploy server
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: deploy/trc/sandbox/Dockerfile
+          push: false
+          tags: |
+            ${{ steps.tags.outputs.sandbox_sha }}
+          provenance: false
+
       - name: Copy Hermes config to the host
         env:
           HOST: ${{ secrets.HOST }}
@@ -286,6 +297,7 @@ jobs:
           # pointer. To roll back, hardcode an older `:git-<7>` tag here on a
           # throwaway branch -- but only one still in the host's image store.
           HERMES_IMAGE: ${{ steps.tags.outputs.sha }}
+          HERMES_SANDBOX_IMAGE: ${{ steps.tags.outputs.sandbox_sha }}
           # Per publisher, not one value for both -- see the ports block in the
           # compose file. The gateway stays on loopback (open-webui reaches it
           # over poc-net by container name, so 8642 never needs publishing);
@@ -371,3 +383,9 @@ jobs:
               sys.exit(1)
           print(f"SOUL.md loaded: {len(soul)} chars, starts with RULE ZERO")
           PY
+
+          # The sandbox's isolation, checked from the gateway's side on every deploy:
+          # no network, no control-socket access, no writable path outside the run,
+          # no secrets, nothing left behind (deploy/trc/sandbox/adversarial_check.py).
+          # -u 10000 is the gateway's uid: exec defaults to root, which reaches the 0600 socket regardless.
+          docker exec -u 10000 -w /opt/hermes hermes-agent /opt/hermes/.venv/bin/python deploy/trc/sandbox/adversarial_check.py --quick

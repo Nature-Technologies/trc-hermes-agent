@@ -29,19 +29,38 @@ HERE = Path(__file__).resolve().parent
 COMPOSE = HERE / "docker-compose-staging-trc.yml"
 ENV_EXAMPLE = HERE / ".env.staging.example"
 
+# The analysis sandbox (trc-backend spec 2026-09-28 §5.1). Its hardening IS the
+# security boundary for model-written code, so every line of it is asserted here.
+SANDBOX_SERVICE = "hermes-sandbox"
+SANDBOX_CAPS = {"SETUID", "SETGID", "KILL", "CHOWN", "DAC_OVERRIDE", "FOWNER"}
+SANDBOX_SOCKET_VOLUME = "hermes-sandbox-sock"
+SANDBOX_SOCKET_MOUNT = f"{SANDBOX_SOCKET_VOLUME}:/run/hermes-sandbox"
+# A socket volume holds no data: an empty one after a rename is harmless, so it is
+# the one volume allowed to be project-owned rather than external.
+EPHEMERAL_VOLUMES = {SANDBOX_SOCKET_VOLUME}
+# The runner's slot uids (deploy/trc/sandbox/runner.py); each gets its own tmpfs.
+SANDBOX_SLOT_UIDS = (20001, 20002, 20003)
+# IPC-namespace sysctls: nothing a run leaves in SysV or POSIX IPC outlives it.
+SANDBOX_SYSCTLS = {
+    "kernel.shm_rmid_forced": "1",
+    "kernel.msgmni": "0",
+    "kernel.sem": "0 0 0 0",
+    "fs.mqueue.queues_max": "0",
+}
+
 EXPECTED_PROJECT = "trc-staging-hermes-agent"
 EXPECTED_NETWORKS = {"poc-net", "trc-shared"}
-EXPECTED_VOLUMES = {"trc-staging-hermes-memory"}
+EXPECTED_VOLUMES = {"trc-staging-hermes-memory", SANDBOX_SOCKET_VOLUME}
 # Cross-project DNS depends on these exact names: open-webui, in a different
 # compose project, reaches this service at http://hermes-agent:8642.
-EXPECTED_CONTAINERS = {"hermes-agent"}
+EXPECTED_CONTAINERS = {"hermes-agent", "hermes-sandbox"}
 # Service-level membership, which is a different assertion from EXPECTED_NETWORKS
 # above. A top-level network that no service joins is silently IGNORED: drop
 # `trc-shared` from the hermes-agent service's own `networks:` list and this
 # validator, `docker compose config` and `docker compose up` all stay green,
 # while the container can no longer resolve app:8000 -- the only symptom is
 # every ragnarok MCP call failing at runtime.
-EXPECTED_SERVICE_NETWORKS = {"hermes-agent": {"poc-net", "trc-shared"}}
+EXPECTED_SERVICE_NETWORKS = {"hermes-agent": {"poc-net", "trc-shared"}, "hermes-sandbox": set()}
 
 failures: list[str] = []
 
@@ -49,6 +68,96 @@ failures: list[str] = []
 def check(condition: bool, message: str) -> None:
     if not condition:
         failures.append(message)
+
+
+def _tmpfs_mounts(spec: dict) -> dict[str, set[str]]:
+    """A service's tmpfs mounts as {path: {option, ...}}, in either spelling."""
+    entries = (spec or {}).get("tmpfs") or []
+    if isinstance(entries, str):
+        entries = [entries]
+    mounts: dict[str, set[str]] = {}
+    for entry in entries:
+        path, _, opts = str(entry).partition(":")
+        mounts[path] = {o for o in opts.split(",") if o}
+    return mounts
+
+
+def _as_mapping(value) -> dict[str, str]:
+    """A compose `environment:`/`sysctls:` value as {key: str(value)}, either spelling."""
+    if isinstance(value, dict):
+        return {str(k): str(v) for k, v in value.items()}
+    out: dict[str, str] = {}
+    for item in value or []:
+        key, _, val = str(item).partition("=")
+        out[key] = val
+    return out
+
+
+def check_sandbox_hardening(services: dict) -> None:
+    spec = services.get(SANDBOX_SERVICE) or {}
+    check(spec.get("network_mode") == "none",
+          "hermes-sandbox must set `network_mode: none` -- no interface means model-written code can reach nothing")
+    check("networks" not in spec, "hermes-sandbox must join no network")
+    check(spec.get("read_only") is True, "hermes-sandbox must set `read_only: true`")
+    check(spec.get("cap_drop") == ["ALL"], "hermes-sandbox must `cap_drop: [ALL]`")
+    check(set(spec.get("cap_add") or []) == SANDBOX_CAPS,
+          f"hermes-sandbox cap_add must be exactly {sorted(SANDBOX_CAPS)}")
+    check("no-new-privileges:true" in (spec.get("security_opt") or []),
+          "hermes-sandbox must set `security_opt: [no-new-privileges:true]`")
+    check("environment" not in spec and "env_file" not in spec,
+          "hermes-sandbox must have no environment -- there is no secret to find")
+    check(spec.get("volumes") == [SANDBOX_SOCKET_MOUNT],
+          f"hermes-sandbox must mount only {SANDBOX_SOCKET_MOUNT}")
+    for key in ("mem_limit", "pids_limit", "cpus", "tmpfs"):
+        check(key in spec, f"hermes-sandbox must set `{key}`")
+    check(spec.get("init") is True,
+          "hermes-sandbox must set `init: true` -- otherwise the runner is PID 1 and "
+          "never reaps a killed leftover, which stays a zombie under the slot uid and "
+          "counts against RLIMIT_NPROC and pids_limit")
+    check(spec.get("ipc") == "none",
+          "hermes-sandbox must set `ipc: none` -- a private IPC namespace with no "
+          "/dev/shm, which Docker otherwise mounts mode 1777 even on a read-only root")
+    check(_as_mapping(spec.get("sysctls")) == SANDBOX_SYSCTLS,
+          f"hermes-sandbox sysctls must be exactly {SANDBOX_SYSCTLS} -- SysV and POSIX "
+          "IPC would otherwise let one run leave data for the next")
+
+    mounts = _tmpfs_mounts(spec)
+    check("/work" not in mounts,
+          "hermes-sandbox must not mount a tmpfs at /work itself -- one shared tmpfs "
+          "lets a run fill the space its neighbours write into; each slot gets its own")
+    slot_paths = {f"/work/slot-{uid}" for uid in SANDBOX_SLOT_UIDS}
+    check(set(mounts) == slot_paths | {"/tmp"},
+          f"hermes-sandbox tmpfs mounts must be exactly {sorted(slot_paths | {'/tmp'})}, "
+          f"got {sorted(mounts)}")
+    check(mounts.get("/tmp") == {"size=16m", "mode=0755"},
+          "hermes-sandbox /tmp must be `size=16m,mode=0755` -- not writable by a run, or "
+          "it carries one run's data to the next")
+    for uid in SANDBOX_SLOT_UIDS:
+        path = f"/work/slot-{uid}"
+        opts = mounts.get(path)
+        check(opts is not None, f"hermes-sandbox must mount a tmpfs at {path}")
+        if opts is None:
+            continue
+        check("nr_inodes=4096" in opts,
+              f"hermes-sandbox tmpfs {path} must set `nr_inodes=4096` -- without an inode "
+              "cap a run creates more entries than the runner's cleanup may remove, and "
+              "the slot is quarantined (nr_inodes=0 means unlimited)")
+        expected = {"size=256m", f"uid={uid}", f"gid={uid}", "mode=0700",
+                    "noexec", "nosuid", "nodev"}
+        rest = {o for o in opts if not o.startswith("nr_inodes=")}
+        check(rest == expected,
+              f"hermes-sandbox tmpfs {path} options must be {sorted(expected)} plus "
+              f"nr_inodes=4096, got {sorted(opts)}")
+
+    agent = services.get("hermes-agent") or {}
+    agent_volumes = agent.get("volumes") or []
+    check(SANDBOX_SOCKET_MOUNT in agent_volumes,
+          f"hermes-agent must mount {SANDBOX_SOCKET_MOUNT} to reach the runner")
+    check(_as_mapping(agent.get("environment")).get("HERMES_CODE_EXECUTION_TRANSPORT")
+          == "sidecar",
+          "hermes-agent must set `HERMES_CODE_EXECUTION_TRANSPORT: sidecar` -- it wins "
+          "over config.yaml, so a bad config can never run model-written code as a "
+          "local subprocess in hermes-agent, which has the network and Hermes' volumes")
 
 
 def placeholder(key: str) -> str:
@@ -232,19 +341,14 @@ def _step_by_name(doc: dict, name: str) -> dict | None:
     return None
 
 
-def _step_with_uses_containing(doc: dict, needle: str) -> dict | None:
-    """The first step whose `uses:` value contains `needle`, or None.
-
-    Used to scope an assertion to a single step's own `env:` mapping rather
-    than the whole file -- e.g. confirming the build step specifically has no
-    DOCKER_HOST, not just that DOCKER_HOST appears somewhere unrelated.
-    """
-    for job in (doc.get("jobs") or {}).values():
-        for step in (job or {}).get("steps") or []:
-            uses = (step or {}).get("uses")
-            if uses and needle in uses:
-                return step
-    return None
+def _steps_with_uses_containing(doc: dict, needle: str) -> list:
+    """Every step whose `uses:` value contains `needle` -- each build step is checked."""
+    return [
+        step
+        for job in (doc.get("jobs") or {}).values()
+        for step in (job or {}).get("steps") or []
+        if needle in ((step or {}).get("uses") or "")
+    ]
 
 
 def _step_env_keys(step: dict | None) -> set[str]:
@@ -631,28 +735,34 @@ def check_deploy_workflow() -> None:
     # The build must produce the image in the deploy host's store and push it
     # nowhere. `push: true` would reintroduce the registry round-trip this
     # design removed, and would need a registry credential on the runner again.
-    build_step = _step_with_uses_containing(doc, "docker/build-push-action")
+    build_steps = _steps_with_uses_containing(doc, "docker/build-push-action")
     check(
-        build_step is not None,
+        bool(build_steps),
         "no step uses docker/build-push-action -- build and deploy are "
         "unified in this workflow now that trc-publish.yml is deleted, so "
         "the image must be built here",
     )
-    if build_step is not None:
+    for build_step in build_steps:
         check(
             (build_step.get("with") or {}).get("push") in (False, "false"),
-            "the docker/build-push-action step must set `push: false` -- the "
-            "image is built straight into the deploy host's image store and "
-            "there is no registry in this deploy any more",
+            f"the {build_step.get('name')!r} docker/build-push-action step must "
+            "set `push: false` -- the image is built straight into the deploy "
+            "host's image store and there is no registry in this deploy any more",
         )
         check(
             "platforms" not in (build_step.get("with") or {}),
-            "the docker/build-push-action step must not set `platforms` -- "
-            "the build is native to the deploy host, and naming an "
-            "architecture it does not have silently switches on QEMU "
+            f"the {build_step.get('name')!r} docker/build-push-action step must "
+            "not set `platforms` -- the build is native to the deploy host, and "
+            "naming an architecture it does not have silently switches on QEMU "
             "emulation, which is far slower than the cold build this design "
             "exists to avoid",
         )
+    sandbox_builds = [
+        s for s in build_steps
+        if (s.get("with") or {}).get("file") == "deploy/trc/sandbox/Dockerfile"
+    ]
+    check(len(sandbox_builds) == 1,
+          "the workflow must build deploy/trc/sandbox/Dockerfile exactly once")
 
     keyscan_truncates = [
         ln.strip() for ln in script_lines
@@ -818,6 +928,8 @@ def main() -> int:
         f"volumes must be exactly {sorted(EXPECTED_VOLUMES)}, got {sorted(volumes)}",
     )
     for name, spec in volumes.items():
+        if name in EPHEMERAL_VOLUMES:
+            continue
         check(
             bool((spec or {}).get("external")),
             f"volume {name!r} must declare `external: true` -- see this "
@@ -878,6 +990,7 @@ def main() -> int:
             "stale tag left over from the old push-based scheme",
         )
 
+    check_sandbox_hardening(services)
     check_env_example_declares_every_reference()
     check_compose_renders()
     check_deploy_workflow()

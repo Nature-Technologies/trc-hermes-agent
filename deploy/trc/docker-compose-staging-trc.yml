@@ -21,6 +21,9 @@ volumes:
   # rename of this compose project can never silently swap in an empty volume.
   trc-staging-hermes-memory:
     external: true
+  # Holds only the runner's unix socket (trc-backend spec 2026-09-28 §5.1). No data,
+  # so -- alone among this file's volumes -- it is project-owned, not external.
+  hermes-sandbox-sock: {}
 
 services:
   hermes-agent:
@@ -75,8 +78,15 @@ services:
       HERMES_DASHBOARD_BASIC_AUTH_USERNAME: "${HERMES_DASHBOARD_BASIC_AUTH_USERNAME}"
       HERMES_DASHBOARD_BASIC_AUTH_PASSWORD: "${HERMES_DASHBOARD_BASIC_AUTH_PASSWORD}"
       HERMES_SKIP_CONFIG_MIGRATION: "1"
+      # Wins over config.yaml and refuses any unknown value, so an unreadable or
+      # half-written config can never make model-written code run as a local
+      # subprocess here, where the network and Hermes' volumes are.
+      HERMES_CODE_EXECUTION_TRANSPORT: sidecar
+    depends_on: [hermes-sandbox]
     volumes:
       - trc-staging-hermes-memory:/opt/data
+      # The analysis sandbox runner's socket (deploy/trc/sandbox/runner.py).
+      - hermes-sandbox-sock:/run/hermes-sandbox
       # Absolute path ON THE SERVER. Bind-mount sources are resolved by the
       # remote daemon, so a relative path here would point at a directory that
       # exists only on the CI runner. The deploy scp's this file into place.
@@ -88,3 +98,45 @@ services:
       # a mount wins over that copy. Until 2026-09-23 the deploy uploaded this file to
       # the host and nothing mounted it, and the model ran with no TRC rules at all.
       - ${HERMES_SOUL_PATH:?HERMES_SOUL_PATH must be set}:/opt/data/SOUL.md:ro
+
+  hermes-sandbox:
+    # The analysis sandbox runner (deploy/trc/sandbox). Runs model-written Python, so
+    # everything below is the security boundary -- validate_compose.py asserts each line.
+    image: ${HERMES_SANDBOX_IMAGE:?HERMES_SANDBOX_IMAGE must be set}
+    pull_policy: never
+    container_name: hermes-sandbox
+    restart: unless-stopped
+    # A real PID 1 that reaps orphans: without it the runner is PID 1, a killed
+    # setsid/double-fork leftover stays a zombie under the slot uid, and SIGTERM on
+    # `docker stop` is not delivered properly.
+    init: true
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [SETUID, SETGID, KILL, CHOWN, DAC_OVERRIDE, FOWNER]
+    security_opt: ["no-new-privileges:true"]
+    ipc: none            # private IPC namespace, no /dev/shm mounted
+    sysctls:
+      kernel.shm_rmid_forced: 1     # SysV shm dies with its last process
+      kernel.msgmni: 0              # no SysV message queues
+      kernel.sem: "0 0 0 0"         # no SysV semaphore sets
+      fs.mqueue.queues_max: 0       # no POSIX message queues
+    # Three slots of 768 MB plus the daemon. Size against the host's free memory
+    # after Milvus before enabling (spec §12); the host has swap-killed the app once.
+    # rlimits are per process, so mem_limit is the real bound on the total; the
+    # launcher sets oom_score_adj=1000 on every run, so the OOM killer takes a run
+    # before the daemon.
+    mem_limit: 3g
+    pids_limit: 128
+    cpus: 2
+    tmpfs:
+      # One size- and inode-capped tmpfs per slot; /work itself stays on the read-only
+      # root. nr_inodes keeps a run's entry count inside the runner's cleanup cap, and
+      # noexec stops a run writing and loading a native payload.
+      - /work/slot-20001:size=256m,nr_inodes=4096,uid=20001,gid=20001,mode=0700,noexec,nosuid,nodev
+      - /work/slot-20002:size=256m,nr_inodes=4096,uid=20002,gid=20002,mode=0700,noexec,nosuid,nodev
+      - /work/slot-20003:size=256m,nr_inodes=4096,uid=20003,gid=20003,mode=0700,noexec,nosuid,nodev
+      # Not writable by a run: a shared /tmp would carry one run's data to the next.
+      - /tmp:size=16m,mode=0755
+    volumes:
+      - hermes-sandbox-sock:/run/hermes-sandbox
