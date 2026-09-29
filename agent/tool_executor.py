@@ -295,6 +295,12 @@ def _apply_tool_request_middleware_for_agent(
     effective_task_id: str,
     tool_call_id: str,
 ) -> tuple[dict, list[dict[str, Any]]]:
+    # TRC: `answer=false` is for sandboxed scripts only (trc-backend spec 2026-09-28
+    # §4.3). The model's own query calls must return the composed answer it relays;
+    # composing from raw chunks is how a figure was once attached to the wrong client.
+    from tools.trc_sandbox_bridge import strip_script_only_args
+
+    function_args = strip_script_only_args(function_name, function_args)
     try:
         from hermes_cli.middleware import apply_tool_request_middleware
 

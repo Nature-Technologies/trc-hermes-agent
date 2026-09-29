@@ -678,6 +678,67 @@ def _call(tool_name, args):
 _TERMINAL_BLOCKED_PARAMS = {"background", "pty", "notify_on_complete", "watch_patterns"}
 
 
+def _serve_bridged_call(
+    tool_name: str,
+    tool_args: Any,
+    *,
+    allowed_tools: frozenset,
+    tool_call_counter: list,
+    max_tool_calls: int,
+    task_id: Optional[str],
+) -> str:
+    """Serve one tool call a sandbox script made. The ONE place the rules live, shared
+    by the UDS loop, the file-RPC loop and the sidecar transport: allowlist, call cap,
+    argument rules (tools/trc_sandbox_bridge.py), per-turn cache, status frames."""
+    from model_tools import handle_function_call
+    from tools import trc_sandbox_bridge as bridge
+
+    if tool_name not in allowed_tools:
+        available = ", ".join(sorted(allowed_tools))
+        return json.dumps({
+            "error": (
+                f"Tool '{tool_name}' is not available in execute_code. "
+                f"Available: {available}"
+            )
+        })
+    if tool_call_counter[0] >= max_tool_calls:
+        return json.dumps({
+            "error": (
+                f"Tool call limit reached ({max_tool_calls}). "
+                "No more tool calls allowed in this execution."
+            )
+        })
+    if not isinstance(tool_args, dict):
+        tool_args = {}
+    if tool_name == "terminal":
+        for param in _TERMINAL_BLOCKED_PARAMS:
+            tool_args.pop(param, None)
+    tool_args = bridge.prepare_bridged_args(tool_name, tool_args)
+
+    def _dispatch() -> str:
+        call_id = bridge.notify_bridged_start(tool_name, tool_args)
+        _real_stdout, _real_stderr = sys.stdout, sys.stderr
+        devnull = open(os.devnull, "w", encoding="utf-8")
+        try:
+            sys.stdout = devnull
+            sys.stderr = devnull
+            result = handle_function_call(tool_name, tool_args, task_id=task_id)
+        except Exception as exc:
+            logger.error("Tool call failed in sandbox: %s", exc, exc_info=True)
+            result = tool_error(str(exc))
+        finally:
+            sys.stdout, sys.stderr = _real_stdout, _real_stderr
+            devnull.close()
+        if not isinstance(result, str):
+            result = json.dumps(result, ensure_ascii=False, default=str)
+        bridge.notify_bridged_complete(call_id, tool_name, tool_args, result)
+        return result
+
+    result = bridge.cached_bridged_call(tool_name, tool_args, _dispatch)
+    tool_call_counter[0] += 1
+    return result
+
+
 def _rpc_server_loop(
     server_sock: socket.socket,
     task_id: str,
@@ -692,8 +753,6 @@ def _rpc_server_loop(
     Accept one client connection and dispatch tool-call requests until
     the client disconnects or the call limit is reached.
     """
-    from model_tools import handle_function_call
-
     conn = None
     try:
         server_sock.settimeout(0.05)
@@ -745,54 +804,14 @@ def _rpc_server_loop(
                 tool_name = request.get("tool", "")
                 tool_args = request.get("args", {})
 
-                # Enforce the allow-list
-                if tool_name not in allowed_tools:
-                    available = ", ".join(sorted(allowed_tools))
-                    resp = json.dumps({
-                        "error": (
-                            f"Tool '{tool_name}' is not available in execute_code. "
-                            f"Available: {available}"
-                        )
-                    })
-                    conn.sendall((resp + "\n").encode())
-                    continue
-
-                # Enforce tool call limit
-                if tool_call_counter[0] >= max_tool_calls:
-                    resp = json.dumps({
-                        "error": (
-                            f"Tool call limit reached ({max_tool_calls}). "
-                            "No more tool calls allowed in this execution."
-                        )
-                    })
-                    conn.sendall((resp + "\n").encode())
-                    continue
-
-                # Strip forbidden terminal parameters
-                if tool_name == "terminal" and isinstance(tool_args, dict):
-                    for param in _TERMINAL_BLOCKED_PARAMS:
-                        tool_args.pop(param, None)
-
-                # Dispatch through the standard tool handler.
-                # Suppress stdout/stderr from internal tool handlers so
-                # their status prints don't leak into the CLI spinner.
-                try:
-                    _real_stdout, _real_stderr = sys.stdout, sys.stderr
-                    devnull = open(os.devnull, "w", encoding="utf-8")
-                    try:
-                        sys.stdout = devnull
-                        sys.stderr = devnull
-                        result = handle_function_call(
-                            tool_name, tool_args, task_id=task_id
-                        )
-                    finally:
-                        sys.stdout, sys.stderr = _real_stdout, _real_stderr
-                        devnull.close()
-                except Exception as exc:
-                    logger.error("Tool call failed in sandbox: %s", exc, exc_info=True)
-                    result = tool_error(str(exc))
-
-                tool_call_counter[0] += 1
+                result = _serve_bridged_call(
+                    tool_name,
+                    tool_args,
+                    allowed_tools=allowed_tools,
+                    tool_call_counter=tool_call_counter,
+                    max_tool_calls=max_tool_calls,
+                    task_id=task_id,
+                )
                 call_duration = time.monotonic() - call_start
 
                 # Log for observability
@@ -974,8 +993,6 @@ def _rpc_poll_loop(
     independent process, so these calls run safely concurrent with the
     script-execution thread.
     """
-    from model_tools import handle_function_call
-
     poll_interval = 0.1  # 100 ms
 
     quoted_rpc_dir = shlex.quote(rpc_dir)
@@ -1037,54 +1054,20 @@ def _rpc_poll_loop(
                 res_file = f"{rpc_dir}/res_{seq_str}"
                 quoted_res_file = shlex.quote(res_file)
 
-                # Enforce allow-list
-                if tool_name not in allowed_tools:
-                    available = ", ".join(sorted(allowed_tools))
-                    tool_result = json.dumps({
-                        "error": (
-                            f"Tool '{tool_name}' is not available in execute_code. "
-                            f"Available: {available}"
-                        )
-                    })
-                # Enforce tool call limit
-                elif tool_call_counter[0] >= max_tool_calls:
-                    tool_result = json.dumps({
-                        "error": (
-                            f"Tool call limit reached ({max_tool_calls}). "
-                            "No more tool calls allowed in this execution."
-                        )
-                    })
-                else:
-                    # Strip forbidden terminal parameters
-                    if tool_name == "terminal" and isinstance(tool_args, dict):
-                        for param in _TERMINAL_BLOCKED_PARAMS:
-                            tool_args.pop(param, None)
-
-                    # Dispatch through the standard tool handler
-                    try:
-                        _real_stdout, _real_stderr = sys.stdout, sys.stderr
-                        devnull = open(os.devnull, "w", encoding="utf-8")
-                        try:
-                            sys.stdout = devnull
-                            sys.stderr = devnull
-                            tool_result = handle_function_call(
-                                tool_name, tool_args, task_id=task_id
-                            )
-                        finally:
-                            sys.stdout, sys.stderr = _real_stdout, _real_stderr
-                            devnull.close()
-                    except Exception as exc:
-                        logger.error("Tool call failed in remote sandbox: %s",
-                                     exc, exc_info=True)
-                        tool_result = tool_error(str(exc))
-
-                    tool_call_counter[0] += 1
-                    call_duration = time.monotonic() - call_start
-                    tool_call_log.append({
-                        "tool": tool_name,
-                        "args_preview": str(tool_args)[:80],
-                        "duration": round(call_duration, 2),
-                    })
+                tool_result = _serve_bridged_call(
+                    tool_name,
+                    tool_args,
+                    allowed_tools=allowed_tools,
+                    tool_call_counter=tool_call_counter,
+                    max_tool_calls=max_tool_calls,
+                    task_id=task_id,
+                )
+                call_duration = time.monotonic() - call_start
+                tool_call_log.append({
+                    "tool": tool_name,
+                    "args_preview": str(tool_args)[:80],
+                    "duration": round(call_duration, 2),
+                })
 
                 # Write response atomically (tmp + rename).
                 # Use echo piping (not stdin_data) because Modal doesn't
