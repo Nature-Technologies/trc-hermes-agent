@@ -14,10 +14,39 @@ model:
 # name as a toolset (toolsets.py, `get_toolset_alias_target`). If a deployed
 # build returns None for it, the fallback is `disabled_toolsets` listing every
 # non-MCP toolset — verify with `hermes tools --platform api_server`, which
-# must list five tools.
+# must list seven tools: six `mcp__ragnarok__*` plus `execute_code`.
 platform_toolsets:
   api_server:
     - ragnarok
+    - code_execution
+
+# ── Analysis sandbox (trc-backend spec 2026-09-28-hermes-analysis-sandbox-design) ──
+# execute_code runs scripts in the `hermes-sandbox` container (no network, no files,
+# no secrets) and never in this process. Scripts reach data ONLY through the four
+# tools below, via the gateway's bridge, with this request's verified identity.
+# Kill switch: remove `code_execution` from platform_toolsets.api_server.
+code_execution:
+  transport: sidecar
+  sidecar_socket: /run/hermes-sandbox/sock
+  sidecar_limits: {wall: 240, cpu: 60, mem_mb: 768}
+  timeout: 270
+  max_tool_calls: 20
+  sandbox_tools:
+    - mcp__ragnarok__query
+    - mcp__ragnarok__read_document
+    - mcp__ragnarok__list_entities
+    - mcp__ragnarok__find_relationships
+  # Gateway-only backend tool fed each run's output, for the "calculated" figure note.
+  # Deliberately NOT in mcp_servers.ragnarok.tools.include: the model must not call it.
+  record_computed_server: ragnarok
+  description_intro: >-
+    Run a short Python program for calculations over TRC data: totals, differences,
+    percentages, averages, growth rates, rankings, counts per month, trends. It runs
+    in an isolated sandbox with no network and no files; its only data source is the
+    ragnarok tools listed below, called with keyword arguments. Fetch inside the
+    program when you need many rows, pass answer=False to query when you need only
+    the data, and print only results — each figure with its [Sn] marker and date.
+    numpy and pandas are available.
 
 # ── Loop guardrails (H4) ──────────────────────────────────────────────
 # `hard_stop_enabled` ships false and `max_turns` ships 90: a model looping on
