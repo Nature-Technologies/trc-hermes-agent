@@ -31,6 +31,7 @@ Remote execution additionally requires Python 3 in the terminal backend.
 import base64
 import functools
 import json
+import keyword
 import logging
 import os
 import platform
@@ -436,6 +437,17 @@ def _mcp_parts(tool_name: str) -> tuple:
     return server, tool
 
 
+def _mcp_namespace_identifier(server: str) -> str:
+    """A valid Python identifier to bind server's namespace to in hermes_tools.
+
+    Server names are sanitized to [A-Za-z0-9_] but may start with a digit or be
+    a keyword ("1password", "class"); the namespace object still dispatches under
+    the real name, only the variable a script imports is adjusted."""
+    if server.isidentifier() and not keyword.iskeyword(server):
+        return server
+    return f"mcp_{server}"
+
+
 def generate_hermes_tools_module(enabled_tools: List[str],
                                  transport: str = "uds") -> str:
     """
@@ -471,7 +483,7 @@ def generate_hermes_tools_module(enabled_tools: List[str],
     mcp_src = ""
     if servers:
         mcp_src = _MCP_NAMESPACE_SRC + "".join(
-            f"\n{server} = _McpServer({server!r}, {sorted(tools)!r})\n"
+            f"\n{_mcp_namespace_identifier(server)} = _McpServer({server!r}, {sorted(tools)!r})\n"
             for server, tools in sorted(servers.items())
         )
 
@@ -2003,7 +2015,8 @@ def _mcp_doc_line(tool_name: str) -> str:
     params = ", ".join(p for p in props if p not in _MCP_HIDDEN_PARAMS)
     summary = (schema.get("description") or "").strip().splitlines()
     first = summary[0] if summary else ""
-    return f"  {server}.{tool}({params}) -> dict   (keyword arguments)\n    {first}"
+    ident = _mcp_namespace_identifier(server)
+    return f"  {ident}.{tool}({params}) -> dict   (keyword arguments)\n    {first}"
 
 
 def _limits_sentence(cfg: dict) -> str:
@@ -2048,7 +2061,7 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
 
     # Build example import list from enabled tools
     import_examples = [n for n in ("web_search", "terminal") if n in enabled_sandbox_tools]
-    import_examples += sorted({_mcp_parts(n)[0] for n in enabled_sandbox_tools if n.startswith(MCP_TOOL_PREFIX)})
+    import_examples += sorted({_mcp_namespace_identifier(_mcp_parts(n)[0]) for n in enabled_sandbox_tools if n.startswith(MCP_TOOL_PREFIX)})
     if not import_examples:
         import_examples = sorted(enabled_sandbox_tools)[:2]
     if import_examples:

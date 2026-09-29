@@ -87,3 +87,64 @@ def test_the_description_lists_mcp_stubs_and_honours_the_intro_and_limits():
     # No built-in tool's doc line (the helper line may still mention terminal()).
     assert "terminal(command" not in text and "web_search(query" not in text
     assert "from hermes_tools import ragnarok" in schema["parameters"]["properties"]["code"]["description"]
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1: digit-leading and keyword server names → valid identifiers
+# ---------------------------------------------------------------------------
+
+_ALLOW_1PW = {
+    "sandbox_tools": ["mcp__1password__lookup"],
+}
+
+
+def _module_cfg(tools, calls, cfg):
+    """Like _module but with an explicit config dict."""
+    with patch.object(cet, "_load_config", return_value=cfg):
+        src = cet.generate_hermes_tools_module(tools)
+    ns: dict = {}
+    exec(compile(src, "hermes_tools", "exec"), ns)  # noqa: S102 - generated test code
+
+    def fake_call(tool_name, args):
+        calls.append((tool_name, args))
+        return {"result": json.dumps({"status": "ok"})}
+
+    ns["_call"] = fake_call
+    return types.SimpleNamespace(**ns)
+
+
+def test_digit_leading_server_module_compiles_and_dispatches():
+    """mcp__1password__lookup → variable `mcp_1password`; dispatch uses real name."""
+    calls: list = []
+    mod = _module_cfg(["mcp__1password__lookup"], calls, _ALLOW_1PW)
+    # The module must compile (no SyntaxError) and expose mcp_1password
+    out = mod.mcp_1password.lookup(x=1)
+    assert calls == [("mcp__1password__lookup", {"x": 1})]
+    assert out == {"status": "ok"}
+
+
+def test_keyword_server_module_compiles():
+    """A server named 'class' (a Python keyword) → variable `mcp_class`."""
+    cfg = {"sandbox_tools": ["mcp__class__search"]}
+    calls: list = []
+    mod = _module_cfg(["mcp__class__search"], calls, cfg)
+    mod.mcp_class.search(q="test")
+    assert calls == [("mcp__class__search", {"q": "test"})]
+
+
+def test_digit_leading_server_description_uses_identifier():
+    """Description line and import example use `mcp_1password`, not `1password`."""
+    cfg = dict(_ALLOW_1PW, description_intro="")
+    fake_schema = {"description": "Look up a secret.", "parameters": {"properties": {"key": {"type": "string"}}}}
+    with (
+        patch.object(cet, "_load_config", return_value=cfg),
+        patch("tools.registry.registry.get_schema", return_value=fake_schema),
+    ):
+        schema = cet.build_execute_code_schema({"mcp__1password__lookup"}, mode="strict")
+    text = schema["description"]
+    assert "mcp_1password.lookup(" in text
+    # The bare digit-leading form must not appear as the identifier (though it
+    # appears as a substring of "mcp_1password").  Check for the indented doc line.
+    assert "  1password.lookup(" not in text
+    code_desc = schema["parameters"]["properties"]["code"]["description"]
+    assert "mcp_1password" in code_desc
