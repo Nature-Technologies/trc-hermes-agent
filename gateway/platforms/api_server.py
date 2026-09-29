@@ -6235,6 +6235,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 identity_token = set_end_user_identity(request_end_user_identity)
                 chat_id_token = set_end_user_chat_id(request_end_user_chat_id)
                 request_id_token = set_end_user_request_id(request_end_user_request_id)
+                # Bridged sandbox calls report progress through the same callbacks,
+                # so the status line moves while a script fetches (spec §4.3).
+                from tools.trc_sandbox_bridge import (
+                    reset_progress_callbacks,
+                    set_progress_callbacks,
+                )
+
+                progress_token = set_progress_callbacks(tool_start_callback, tool_complete_callback)
                 tokens = self._bind_api_server_session(
                     chat_id=session_id or "",
                     session_key=gateway_session_key or session_id or "",
@@ -6381,6 +6389,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
                     )
                 finally:
+                    try:
+                        from tools.trc_sandbox_bridge import discard_turn_cache
+                        discard_turn_cache()
+                    except Exception as _dtc_exc:
+                        logger.debug("discard_turn_cache failed: %s", type(_dtc_exc).__name__)
+                    reset_progress_callbacks(progress_token)
                     clear_session_vars(tokens)
                     reset_end_user_request_id(request_id_token)
                     reset_end_user_chat_id(chat_id_token)
