@@ -146,3 +146,29 @@ def notify_bridged_complete(call_id, tool_name: str, args: dict, result: Any) ->
         callbacks[1](call_id, tool_name, args, result)
     except Exception as exc:
         logger.debug("bridged complete callback failed: %s", type(exc).__name__)
+
+
+def record_computed(stdout_text: str, server_name: Optional[str]) -> None:
+    """Send a run's printed output to the backend's `record_computed` (spec §4.4).
+
+    The backend digests the figures in it into the turn's COMPUTED set, so `/unmask`
+    gives them the softer "calculated" note. `record_computed` is not in the model's
+    `tools.include`, so it is not in the registry: call it through the MCP client
+    directly. Runs on the execute_code thread, whose context carries the end-user
+    identity and chat id the handler forwards. Never raises: a failure only means
+    those figures get the stronger "not quoted" warning — the safe direction.
+    """
+    if not server_name or not stdout_text or not stdout_text.strip():
+        return
+    try:
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        server = _servers.get(server_name)
+        if server is None:
+            logger.warning("record_computed: MCP server %r is not connected", server_name)
+            return
+        handler = _make_tool_handler(server_name, "record_computed", server.tool_timeout)
+        raw = handler({"texts": [stdout_text]})
+        logger.info("record_computed: sent (%d chars) -> %s", len(stdout_text), str(raw)[:80])
+    except Exception as exc:
+        logger.warning("record_computed failed: %s", type(exc).__name__)
