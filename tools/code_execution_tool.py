@@ -76,6 +76,29 @@ MAX_STDOUT_BYTES = 50_000    # 50 KB
 MAX_STDERR_BYTES = 10_000    # 10 KB
 
 
+def _sandbox_allowlist() -> frozenset:
+    """The tools a sandbox script may call, before intersecting with the session.
+
+    ``code_execution.sandbox_tools`` in config.yaml replaces the built-in list (the TRC
+    deployment sets its four ragnarok data tools); unset keeps SANDBOX_ALLOWED_TOOLS.
+    """
+    configured = _load_config().get("sandbox_tools")
+    if isinstance(configured, list):
+        return frozenset(str(name) for name in configured)
+    return SANDBOX_ALLOWED_TOOLS
+
+
+def resolve_sandbox_tools(enabled_tools) -> frozenset:
+    """The allowlist intersected with the session's enabled tools.
+
+    EMPTY MEANS NO TOOLS. Upstream fell back to every sandbox tool when the
+    intersection was empty, which on a session with none of them (the TRC deployment:
+    ragnarok + code_execution) handed a script ``terminal`` and file access
+    (trc-backend spec 2026-09-28 §4.2).
+    """
+    return frozenset(_sandbox_allowlist() & set(enabled_tools or ()))
+
+
 def _assemble_stdout_result(
     head: bytes,
     tail: bytes = b"",
@@ -348,14 +371,14 @@ def generate_hermes_tools_module(enabled_tools: List[str],
     """
     Build the source code for the hermes_tools.py stub module.
 
-    Only tools in both SANDBOX_ALLOWED_TOOLS and enabled_tools get stubs.
+    Only tools in both the sandbox allowlist and enabled_tools get stubs.
 
     Args:
         enabled_tools: Tool names enabled in the current session.
         transport: ``"uds"`` for Unix domain socket (local backend) or
                    ``"file"`` for file-based RPC (remote backends).
     """
-    tools_to_generate = sorted(SANDBOX_ALLOWED_TOOLS & set(enabled_tools))
+    tools_to_generate = sorted(_sandbox_allowlist() & set(enabled_tools))
 
     stub_functions = []
     export_names = []
@@ -1009,10 +1032,7 @@ def _execute_remote(
     timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
-    session_tools = set(enabled_tools) if enabled_tools else set()
-    sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-    if not sandbox_tools:
-        sandbox_tools = SANDBOX_ALLOWED_TOOLS
+    sandbox_tools = resolve_sandbox_tools(enabled_tools)
 
     effective_task_id = task_id or "default"
     env, env_type = _get_or_create_env(effective_task_id)
@@ -1263,11 +1283,7 @@ def execute_code(
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
     # Determine which tools the sandbox can call
-    session_tools = set(enabled_tools) if enabled_tools else set()
-    sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-
-    if not sandbox_tools:
-        sandbox_tools = SANDBOX_ALLOWED_TOOLS
+    sandbox_tools = resolve_sandbox_tools(enabled_tools)
 
     # --- Set up temp directory with hermes_tools.py and script.py ---
     tmpdir = tempfile.mkdtemp(prefix="hermes_sandbox_")
