@@ -24,6 +24,7 @@ import itertools
 import json
 import os
 import secrets
+import select
 import signal
 import socket
 import socketserver
@@ -455,6 +456,23 @@ def _script_reply(result) -> bytes:
     return _frame(result)
 
 
+def _hermes_gone(sock) -> bool:
+    """Whether Hermes has hung up, checked without reading anything. Hermes sends
+    nothing unasked during a run — only a result, once a call has gone out — so
+    anything readable here, end of file or data, means the run has no one left to
+    answer to. A socket that cannot be polled counts as gone."""
+    try:
+        if hasattr(select, "poll"):
+            poller = select.poll()
+            poller.register(
+                sock, select.POLLIN | select.POLLHUP | getattr(select, "POLLRDHUP", 0))
+            return bool(poller.poll(0))
+        readable, _, _ = select.select([sock], [], [], 0)  # Windows, where only tests run
+        return bool(readable)
+    except (OSError, ValueError):
+        return True
+
+
 def _await_exit(proc, deadline) -> str:
     try:
         proc.wait(timeout=max(0.0, deadline - time.monotonic()))
@@ -482,6 +500,11 @@ class _Relay:
             try:
                 chunk = self.child.recv(65536)
             except socket.timeout:
+                # A quiet tick. If Hermes has gone (its turn was stopped), end now: a
+                # run that makes no bridged call would otherwise hold its slot for the
+                # whole wall clock. (No Hermes end only in run_job's unit tests.)
+                if self.hermes_sock is not None and _hermes_gone(self.hermes_sock):
+                    return "protocol"
                 continue
             except OSError:
                 chunk = b""

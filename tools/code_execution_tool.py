@@ -1322,6 +1322,28 @@ def _execute_remote(
     return json.dumps(result, ensure_ascii=False)
 
 
+TRANSPORT_ENV = "HERMES_CODE_EXECUTION_TRANSPORT"
+_KNOWN_TRANSPORTS = frozenset({"sidecar"})
+_UNKNOWN_TRANSPORT = "execute_code is misconfigured (unknown transport); refusing to run."
+
+
+def _configured_transport() -> Optional[str]:
+    """The code_execution transport, stripped and lower-cased: the env var
+    HERMES_CODE_EXECUTION_TRANSPORT when it is set (non-empty), else
+    ``code_execution.transport``. None when neither is set, which keeps upstream's
+    local/remote dispatch.
+
+    The env var is what pins the TRC deployment to the sidecar: an unreadable
+    config.yaml reads as {}, and that must not make model-written code run in this
+    process. Any value but a known one is refused by the caller, never treated as unset.
+    """
+    value = os.environ.get(TRANSPORT_ENV, "").strip()
+    if not value:
+        configured = _load_config().get("transport")
+        value = "" if configured is None else str(configured).strip()
+    return value.lower() or None
+
+
 _SIDECAR_ERRORS = {
     "timeout": "The script exceeded the sandbox's time limit and was stopped.",
     "busy": "The calculation sandbox is busy; try again in a moment.",
@@ -1333,6 +1355,7 @@ def _execute_sidecar(code: str, task_id: Optional[str], enabled_tools: Optional[
     """Run `code` in the TRC sandbox sidecar (trc-backend spec §4.5)."""
     from agent.redact import redact_sensitive_text
     from tools.ansi_strip import strip_ansi
+    from tools.interrupt import is_interrupted
     from tools.sidecar_sandbox import run_in_sidecar
     from tools import trc_sandbox_bridge
 
@@ -1359,13 +1382,22 @@ def _execute_sidecar(code: str, task_id: Optional[str], enabled_tools: Optional[
         dict(cfg.get("sidecar_limits") or {}),
         on_call,
         overall_timeout=float(cfg.get("timeout", DEFAULT_TIMEOUT)),
+        # Asked on this thread, the one agent.interrupt() flags when the turn is stopped.
+        should_stop=is_interrupted,
     )
     status = str(done.get("status") or "error")
+    if "op" not in done:
+        # Decided on this side (unavailable, timeout, interrupted), not reported by the
+        # runner. The value is a class name or a fixed string, never script output.
+        logger.warning("execute_code sidecar: %s (%s)", status, done.get("error"))
     stdout_text, stdout_metadata = _truncate_stdout_text(str(done.get("stdout") or ""))
     stderr_text = str(done.get("stderr") or "")[-MAX_STDERR_BYTES:]
     stdout_text = redact_sensitive_text(strip_ansi(stdout_text), code_file=True)
     stderr_text = redact_sensitive_text(strip_ansi(stderr_text), code_file=True)
-    trc_sandbox_bridge.record_computed(stdout_text, cfg.get("record_computed_server"))
+    if status != "interrupted":
+        # Never for a stopped turn: the backend keys computed figures by conversation,
+        # so anything recorded now would land in the NEXT turn's scope.
+        trc_sandbox_bridge.record_computed(stdout_text, cfg.get("record_computed_server"))
 
     exit_code = done.get("exit_code", -1)
     result: Dict[str, Any] = {
@@ -1376,9 +1408,18 @@ def _execute_sidecar(code: str, task_id: Optional[str], enabled_tools: Optional[
         "duration_seconds": round(time.monotonic() - started, 2),
     }
     result.update(stdout_metadata)
-    if status in _SIDECAR_ERRORS:
+    if status == "interrupted":
+        result["output"] = stdout_text + "\n[execution interrupted — user sent a new message]"
+    elif status in _SIDECAR_ERRORS:
         result["error"] = _SIDECAR_ERRORS[status]
-        if status == "busy" and stderr_text.strip():
+        if status == "timeout":
+            # In the output too, as on the local path (#10807): an empty output reads
+            # to the model as "nothing happened", and it answers with nothing.
+            timeout_msg = _SIDECAR_ERRORS["timeout"]
+            result["output"] = (
+                f"{stdout_text}\n\n⏰ {timeout_msg}" if stdout_text else f"⏰ {timeout_msg}"
+            )
+        elif status == "busy" and stderr_text.strip():
             # The runner's reason, e.g. "1 of 3 sandbox slots quarantined": two
             # integers, written before any script ran.
             result["error"] += f" ({stderr_text.strip()})"
@@ -1424,6 +1465,18 @@ def execute_code(
     if not code or not code.strip():
         return tool_error("No code provided.")
 
+    # A transport that is set but unknown is refused, never read as unset: falling back
+    # would run model-written code in this process (trc-backend spec 2026-09-28 §4.5).
+    transport = _configured_transport()
+    if transport is not None and transport not in _KNOWN_TRANSPORTS:
+        logger.error("execute_code: unknown transport %r; refusing to run", transport[:40])
+        return json.dumps({
+            "status": "error",
+            "error": _UNKNOWN_TRANSPORT,
+            "tool_calls_made": 0,
+            "duration_seconds": 0,
+        })
+
     # Dispatch: remote backends use file-based RPC, local uses UDS
     from tools.terminal_tool import _get_env_config, _docker_has_host_access
     _env_config = _get_env_config()
@@ -1460,7 +1513,7 @@ def execute_code(
 
     # The TRC deployment runs scripts in the no-network sidecar, never in this process
     # (trc-backend spec 2026-09-28 §4.5). Unset keeps upstream's local/remote paths.
-    if str(_load_config().get("transport", "")).lower() == "sidecar":
+    if transport == "sidecar":
         return _execute_sidecar(code, task_id, enabled_tools)
 
     if env_type != "local":
@@ -2172,7 +2225,7 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
     # Mode-specific CWD guidance. Project mode is the default and matches
     # terminal()'s filesystem/interpreter; strict mode retains the isolated
     # temp-dir staging and hermes-agent's own python.
-    if str(cfg.get("transport", "")).lower() == "sidecar":
+    if _configured_transport() == "sidecar":
         cwd_note = "Scripts run in an isolated sandbox with no network and no files beyond a scratch directory."
     elif mode == "strict":
         cwd_note = (

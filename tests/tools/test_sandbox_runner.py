@@ -629,6 +629,36 @@ def test_replies_to_the_script_get_the_wall_clock_not_the_poll_timeout(error, ex
         assert child.recvs_after_send == 0
 
 
+@pytest.mark.parametrize("hang_up", ["close", "unsolicited"])
+def test_the_relay_notices_hermes_hanging_up_mid_run(hang_up):
+    """Task 7 fix round 1: a run whose Hermes went away (a stopped turn) ends at the next
+    poll tick, not at its next bridged call — a pure-compute orphan would otherwise hold
+    its slot for the whole wall clock. Hermes sends nothing unasked mid-run, so data is a
+    hang-up too."""
+    child, _script = socket.socketpair()
+    hermes, runner_side = socket.socketpair()
+    result = {}
+
+    def run():
+        result["outcome"] = runner.relay(
+            child, runner_side, runner_side.makefile("rb"), runner_side.makefile("wb"),
+            _FakeProc(), time.monotonic() + 10,
+        )
+        result["at"] = time.monotonic()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    time.sleep(0.3)  # the relay is ticking, with nothing from the script
+    hung_up_at = time.monotonic()
+    if hang_up == "close":
+        hermes.close()
+    else:
+        hermes.sendall(b"x")
+    thread.join(5)
+    assert result["outcome"] == "protocol"
+    assert result["at"] - hung_up_at < 1.0
+
+
 # --- run_job -------------------------------------------------------------------------
 
 
