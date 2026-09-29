@@ -457,8 +457,10 @@ def generate_hermes_tools_module(enabled_tools: List[str],
 
     Args:
         enabled_tools: Tool names enabled in the current session.
-        transport: ``"uds"`` for Unix domain socket (local backend) or
-                   ``"file"`` for file-based RPC (remote backends).
+        transport: ``"uds"`` for Unix domain socket (local backend),
+                   ``"file"`` for file-based RPC (remote backends), or
+                   ``"pipe"`` for the TRC sandbox sidecar, whose runner hands
+                   the script one end of a private socket pair.
     """
     tools_to_generate = sorted(_sandbox_allowlist() & set(enabled_tools))
 
@@ -489,6 +491,8 @@ def generate_hermes_tools_module(enabled_tools: List[str],
 
     if transport == "file":
         header = _FILE_TRANSPORT_HEADER
+    elif transport == "pipe":
+        header = _PIPE_TRANSPORT_HEADER
     else:
         header = _UDS_TRANSPORT_HEADER
 
@@ -660,6 +664,46 @@ def _call(tool_name, args):
         pass
 
     result = json.loads(raw)
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except (json.JSONDecodeError, TypeError):
+            return result
+    return result
+
+'''
+
+# ---- Pipe transport (TRC sandbox sidecar) ---------------------------------
+
+# Sidecar transport (trc-backend spec §4.5): the runner hands the script one end of a
+# private socket pair as HERMES_RPC_FD. No token — nothing else can reach that pair.
+_PIPE_TRANSPORT_HEADER = '''\
+"""Auto-generated Hermes tools RPC stubs (sidecar transport)."""
+import json, os, shlex, socket, threading, time
+
+_sock = None
+_call_lock = threading.Lock()
+''' + _COMMON_HELPERS + '''\
+
+def _connect():
+    global _sock
+    if _sock is None:
+        _sock = socket.socket(fileno=int(os.environ["HERMES_RPC_FD"]))
+    return _sock
+
+def _call(tool_name, args):
+    """Send a tool call through the runner to Hermes and return the parsed result."""
+    request = json.dumps({"tool": tool_name, "args": args}) + "\\n"
+    with _call_lock:
+        conn = _connect()
+        conn.sendall(request.encode())
+        buf = b""
+        while not buf.endswith(b"\\n"):
+            chunk = conn.recv(65536)
+            if not chunk:
+                raise RuntimeError("sandbox runner disconnected")
+            buf += chunk
+    result = json.loads(buf.decode().strip())
     if isinstance(result, str):
         try:
             return json.loads(result)
@@ -1278,6 +1322,74 @@ def _execute_remote(
     return json.dumps(result, ensure_ascii=False)
 
 
+_SIDECAR_ERRORS = {
+    "timeout": "The script exceeded the sandbox's time limit and was stopped.",
+    "busy": "The calculation sandbox is busy; try again in a moment.",
+    "unavailable": "The calculation sandbox is unavailable right now.",
+}
+
+
+def _execute_sidecar(code: str, task_id: Optional[str], enabled_tools: Optional[List[str]]) -> str:
+    """Run `code` in the TRC sandbox sidecar (trc-backend spec §4.5)."""
+    from agent.redact import redact_sensitive_text
+    from tools.ansi_strip import strip_ansi
+    from tools.sidecar_sandbox import run_in_sidecar
+    from tools import trc_sandbox_bridge
+
+    cfg = _load_config()
+    sandbox_tools = resolve_sandbox_tools(enabled_tools)
+    max_tool_calls = int(cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS))
+    counter = [0]
+    started = time.monotonic()
+
+    def on_call(tool_name: str, args: dict) -> str:
+        return _serve_bridged_call(
+            tool_name,
+            args,
+            allowed_tools=sandbox_tools,
+            tool_call_counter=counter,
+            max_tool_calls=max_tool_calls,
+            task_id=task_id,
+        )
+
+    done = run_in_sidecar(
+        str(cfg.get("sidecar_socket") or "/run/hermes-sandbox/sock"),
+        code,
+        generate_hermes_tools_module(list(sandbox_tools), transport="pipe"),
+        dict(cfg.get("sidecar_limits") or {}),
+        on_call,
+        overall_timeout=float(cfg.get("timeout", DEFAULT_TIMEOUT)),
+    )
+    status = str(done.get("status") or "error")
+    stdout_text, stdout_metadata = _truncate_stdout_text(str(done.get("stdout") or ""))
+    stderr_text = str(done.get("stderr") or "")[-MAX_STDERR_BYTES:]
+    stdout_text = redact_sensitive_text(strip_ansi(stdout_text), code_file=True)
+    stderr_text = redact_sensitive_text(strip_ansi(stderr_text), code_file=True)
+    trc_sandbox_bridge.record_computed(stdout_text, cfg.get("record_computed_server"))
+
+    exit_code = done.get("exit_code", -1)
+    result: Dict[str, Any] = {
+        "status": status,
+        "output": stdout_text,
+        "exit_code": exit_code,
+        "tool_calls_made": counter[0],
+        "duration_seconds": round(time.monotonic() - started, 2),
+    }
+    result.update(stdout_metadata)
+    if status in _SIDECAR_ERRORS:
+        result["error"] = _SIDECAR_ERRORS[status]
+        if status == "busy" and stderr_text.strip():
+            # The runner's reason, e.g. "1 of 3 sandbox slots quarantined": two
+            # integers, written before any script ran.
+            result["error"] += f" ({stderr_text.strip()})"
+    elif status != "success" or exit_code != 0:
+        result["status"] = "error"
+        result["error"] = stderr_text or f"Script exited with code {exit_code}"
+        if stderr_text:
+            result["output"] = stdout_text + "\n--- stderr ---\n" + stderr_text
+    return json.dumps(result, ensure_ascii=False)
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -1345,6 +1457,11 @@ def execute_code(
     if _guard.get("user_approved"):
         from tools.interrupt import clear_current_thread_interrupt
         clear_current_thread_interrupt()
+
+    # The TRC deployment runs scripts in the no-network sidecar, never in this process
+    # (trc-backend spec 2026-09-28 §4.5). Unset keeps upstream's local/remote paths.
+    if str(_load_config().get("transport", "")).lower() == "sidecar":
+        return _execute_sidecar(code, task_id, enabled_tools)
 
     if env_type != "local":
         return _execute_remote(code, task_id, enabled_tools)
