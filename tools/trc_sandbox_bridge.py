@@ -169,14 +169,43 @@ def record_computed(stdout_text: str, server_name: Optional[str]) -> None:
             return
         handler = _make_tool_handler(server_name, "record_computed", server.tool_timeout)
         raw = handler({"texts": [stdout_text]})
-        # Handler returns error JSON on RPC failure rather than raising
-        try:
-            parsed = json.loads(raw) if isinstance(raw, str) else raw
-            if isinstance(parsed, dict) and "error" in parsed:
-                logger.warning("record_computed failed: backend returned an error (%d chars sent)", len(stdout_text))
-                return
-        except (json.JSONDecodeError, TypeError):
-            pass  # Not a JSON error response; treat as success
+        failed, reason = _record_computed_failure(raw)
+        if failed:
+            logger.warning(
+                "record_computed failed: %s (%d chars sent)",
+                reason or "the call returned an error",
+                len(stdout_text),
+            )
+            return
         logger.info("record_computed: sent (%d chars) -> %s", len(stdout_text), str(raw)[:80])
     except Exception as exc:
         logger.warning("record_computed failed: %s", type(exc).__name__)
+
+
+def _record_computed_failure(raw: Any) -> tuple:
+    """(failed, reason) for the handler's reply to `record_computed`.
+
+    The handler returns error JSON rather than raising, and wraps the backend's own
+    `{"status": "error", "error": ...}` as `{"result": <its JSON text>,
+    "structuredContent": {...}}`, so a top-level check alone logged the backend's
+    fail-closed refusals ("no verified caller identity") as sent. `reason` is the
+    backend's error string, a fixed message and never script output; it stays empty
+    for a top-level error, whose text (a validation error, say) can echo the arguments.
+    """
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, TypeError):
+        return False, ""  # not JSON: treat as success
+    if not isinstance(parsed, dict):
+        return False, ""
+    if "error" in parsed:
+        return True, ""
+    for body in (parsed.get("structuredContent"), parsed.get("result")):
+        if isinstance(body, str):
+            try:
+                body = json.loads(body)
+            except (json.JSONDecodeError, TypeError):
+                continue
+        if isinstance(body, dict) and body.get("status") == "error":
+            return True, str(body.get("error") or "")[:200]
+    return False, ""

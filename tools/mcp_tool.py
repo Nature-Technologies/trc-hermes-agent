@@ -4983,15 +4983,14 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
         try:
             result = _call_once()
-            # Check if the MCP tool itself returned an error
-            try:
-                parsed = json.loads(result)
-                if "error" in parsed:
-                    _bump_server_error(server_name)
-                else:
-                    _reset_server_error(server_name)  # success — reset
-            except (json.JSONDecodeError, TypeError):
-                _reset_server_error(server_name)  # non-JSON = success
+            # _call_once returned, so the round trip completed: the server is
+            # reachable even when the tool answered isError (e.g. an argument-
+            # validation failure). Only transport failures -- the exception
+            # paths below -- count toward the breaker; a tool-level error
+            # resets it exactly as a success does. Counting tool errors let one
+            # caller looping over a bad call open the process-global breaker
+            # for every user of the server for a full cooldown.
+            _reset_server_error(server_name)
             return result
         except InterruptedError:
             return _interrupted_call_result()

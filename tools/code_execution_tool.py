@@ -76,6 +76,8 @@ DEFAULT_MAX_TOOL_CALLS = 50
 MAX_STDOUT_BYTES = 50_000    # 50 KB
 MAX_STDERR_BYTES = 10_000    # 10 KB
 
+_warned_sidecar_without_allowlist = False
+
 
 def _sandbox_allowlist() -> frozenset:
     """The tools a sandbox script may call, before intersecting with the session.
@@ -83,13 +85,25 @@ def _sandbox_allowlist() -> frozenset:
     ``code_execution.sandbox_tools`` in config.yaml replaces the built-in list (the TRC
     deployment sets its four ragnarok data tools); unset keeps SANDBOX_ALLOWED_TOOLS.
 
-    Key absent → SANDBOX_ALLOWED_TOOLS (backward-compatible default).
+    Key absent → SANDBOX_ALLOWED_TOOLS (backward-compatible default), EXCEPT under the
+    sidecar transport → frozenset() and a warning once: an unreadable config.yaml reads
+    as {} while the env pin keeps scripts in the sidecar, and the built-ins would let
+    the gateway serve a script's bridged terminal() and file tools.
     Key present, value is a list → frozenset of the listed names.
     Key present, value is anything else → frozenset() and a warning (fail closed).
     """
+    global _warned_sidecar_without_allowlist
     cfg = _load_config()
     if "sandbox_tools" not in cfg:
-        return SANDBOX_ALLOWED_TOOLS
+        if _configured_transport() != "sidecar":
+            return SANDBOX_ALLOWED_TOOLS
+        if not _warned_sidecar_without_allowlist:
+            _warned_sidecar_without_allowlist = True
+            logger.warning(
+                "code_execution.sandbox_tools is not set under the sidecar transport; "
+                "no sandbox tools allowed"
+            )
+        return frozenset()
     configured = cfg["sandbox_tools"]
     if isinstance(configured, list):
         return frozenset(str(name) for name in configured)
@@ -2172,8 +2186,25 @@ def _mcp_doc_line(tool_name: str) -> str:
     return f"  {ident}.{tool}({params}) -> dict   (keyword arguments)\n    {first}"
 
 
-def _limits_sentence(cfg: dict) -> str:
-    timeout = int(cfg.get("timeout", DEFAULT_TIMEOUT))
+# The sandbox runner's wall-clock default and ceiling (deploy/trc/sandbox/runner.py).
+_SIDECAR_WALL_DEFAULT = 240
+
+
+def _sidecar_wall(cfg: dict) -> int:
+    """The run's wall-clock limit as the runner will apply it: asked for in
+    ``code_execution.sidecar_limits.wall``, clamped to its ceiling, default if unusable."""
+    limits = cfg.get("sidecar_limits")
+    try:
+        wall = int((limits if isinstance(limits, dict) else {}).get("wall", _SIDECAR_WALL_DEFAULT))
+    except (TypeError, ValueError, OverflowError):
+        return _SIDECAR_WALL_DEFAULT
+    return max(1, min(wall, _SIDECAR_WALL_DEFAULT))
+
+
+def _limits_sentence(cfg: dict, *, sidecar: bool = False) -> str:
+    # In the sidecar the runner's wall clock stops a script; Hermes' `timeout` only
+    # bounds how long the gateway waits for it, so it is not the limit to tell the model.
+    timeout = _sidecar_wall(cfg) if sidecar else int(cfg.get("timeout", DEFAULT_TIMEOUT))
     calls = int(cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS))
     span = f"{timeout // 60}-minute" if timeout % 60 == 0 else f"{timeout}-second"
     return f"Limits: {span} timeout, 50KB stdout cap, max {calls} tool calls per script."
@@ -2225,7 +2256,8 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
     # Mode-specific CWD guidance. Project mode is the default and matches
     # terminal()'s filesystem/interpreter; strict mode retains the isolated
     # temp-dir staging and hermes-agent's own python.
-    if _configured_transport() == "sidecar":
+    sidecar = _configured_transport() == "sidecar"
+    if sidecar:
         cwd_note = "Scripts run in an isolated sandbox with no network and no files beyond a scratch directory."
     elif mode == "strict":
         cwd_note = (
@@ -2253,18 +2285,33 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
             "or the task requires interactive user input.\n\n"
         )
 
+    if sidecar:
+        # No terminal() in the sandbox: a model told about it (or shell_quote) spends
+        # one of its few runs finding out.
+        limits = f"{_limits_sentence(cfg, sidecar=True)}\n\n"
+        helpers = (
+            "  json_parse(text: str) — json.loads with strict=False; use for text with control chars\n"
+        )
+    else:
+        limits = (
+            f"{_limits_sentence(cfg)} "
+            "terminal() is foreground-only (no background or pty).\n\n"
+        )
+        helpers = (
+            "  json_parse(text: str) — json.loads with strict=False; use for terminal() output with control chars\n"
+            "  shell_quote(s: str) — shlex.quote(); use when interpolating dynamic strings into shell commands\n"
+        )
+
     description = (
         f"{intro}"
         f"Available via `from hermes_tools import ...`:\n\n"
         f"{tool_lines}\n\n"
-        f"{_limits_sentence(cfg)} "
-        "terminal() is foreground-only (no background or pty).\n\n"
+        f"{limits}"
         f"{cwd_note}\n\n"
         "Print your final result to stdout. Use Python stdlib (json, re, math, csv, "
         "datetime, collections, etc.) for processing between tool calls.\n\n"
         "Also available (no import needed — built into hermes_tools):\n"
-        "  json_parse(text: str) — json.loads with strict=False; use for terminal() output with control chars\n"
-        "  shell_quote(s: str) — shlex.quote(); use when interpolating dynamic strings into shell commands\n"
+        f"{helpers}"
         "  retry(fn, max_attempts=3, delay=2) — retry with exponential backoff for transient failures"
     )
 

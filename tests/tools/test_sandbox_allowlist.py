@@ -6,9 +6,19 @@ access. An empty intersection now means no tools."""
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import patch
 
+import pytest
+
 from tools import code_execution_tool as cet
+
+
+@pytest.fixture(autouse=True)
+def _no_transport_pin(monkeypatch):
+    """No transport pinned by the host running the tests (the TRC image sets one)."""
+    monkeypatch.delenv(cet.TRANSPORT_ENV, raising=False)
+    monkeypatch.setattr(cet, "_warned_sidecar_without_allowlist", False)
 
 
 def _config(cfg):
@@ -64,3 +74,21 @@ def test_empty_list_in_config_means_no_tools():
     """An explicit empty list means the operator wants zero tools: honour it."""
     with _config({"sandbox_tools": []}):
         assert cet._sandbox_allowlist() == frozenset()
+
+
+def test_the_sidecar_pin_with_no_config_allows_no_tools(monkeypatch, caplog):
+    """config.yaml unreadable reads as {}; the env pin still sends scripts to the
+    sidecar, so the built-in seven (terminal, files, web) must not be offered."""
+    monkeypatch.setenv(cet.TRANSPORT_ENV, "sidecar")
+    with _config({}), caplog.at_level(logging.WARNING, logger=cet.logger.name):
+        assert cet._sandbox_allowlist() == frozenset()
+        assert cet._sandbox_allowlist() == frozenset()
+        assert cet.resolve_sandbox_tools(["terminal", "read_file"]) == frozenset()
+    warnings = [r for r in caplog.records if "sandbox_tools is not set" in r.getMessage()]
+    assert len(warnings) == 1, "warn once, not per call"
+
+
+def test_no_pin_and_no_config_keeps_the_built_in_seven():
+    with _config({}):
+        assert cet._sandbox_allowlist() == cet.SANDBOX_ALLOWED_TOOLS
+        assert len(cet.SANDBOX_ALLOWED_TOOLS) == 7

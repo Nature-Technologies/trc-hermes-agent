@@ -7,6 +7,8 @@ import json
 import types
 from unittest.mock import patch
 
+import pytest
+
 from tools import code_execution_tool as cet
 
 _ALLOW = {
@@ -65,28 +67,54 @@ def test_structured_content_is_unwrapped_to_the_tools_own_dict():
     }
 
 
-def test_the_description_lists_mcp_stubs_and_honours_the_intro_and_limits():
-    cfg = dict(_ALLOW, description_intro="TRC INTRO.", timeout=270, max_tool_calls=20)
-    schema_props = {
-        "query": {"type": "string"},
-        "requesting_user": {"type": "string"},
-        "session_id": {"type": "string"},
-        "answer": {"type": "boolean"},
-    }
-    fake_schema = {"description": "Answer a question.\nMore.", "parameters": {"properties": schema_props}}
+_SCHEMA_PROPS = {
+    "query": {"type": "string"},
+    "requesting_user": {"type": "string"},
+    "session_id": {"type": "string"},
+    "answer": {"type": "boolean"},
+}
+_FAKE_SCHEMA = {"description": "Answer a question.\nMore.", "parameters": {"properties": _SCHEMA_PROPS}}
+
+
+def _schema(cfg):
     with (
         patch.object(cet, "_load_config", return_value=cfg),
-        patch("tools.registry.registry.get_schema", return_value=fake_schema),
+        patch("tools.registry.registry.get_schema", return_value=_FAKE_SCHEMA),
     ):
-        schema = cet.build_execute_code_schema({"mcp__ragnarok__query"}, mode="strict")
+        return cet.build_execute_code_schema({"mcp__ragnarok__query"}, mode="strict")
+
+
+def test_the_description_lists_mcp_stubs_and_honours_the_intro_and_limits(monkeypatch):
+    """Not the sidecar: upstream's wording, with Hermes' `timeout` as the limit."""
+    monkeypatch.delenv(cet.TRANSPORT_ENV, raising=False)
+    schema = _schema(dict(_ALLOW, description_intro="TRC INTRO.", timeout=270, max_tool_calls=20))
     text = schema["description"]
     assert text.startswith("TRC INTRO.")
     assert "ragnarok.query(query, answer)" in text  # identity args hidden
     assert "Answer a question." in text
     assert "270-second timeout" in text and "max 20 tool calls" in text
+    assert "terminal() is foreground-only" in text and "shell_quote(" in text
     # No built-in tool's doc line (the helper line may still mention terminal()).
     assert "terminal(command" not in text and "web_search(query" not in text
     assert "from hermes_tools import ragnarok" in schema["parameters"]["properties"]["code"]["description"]
+
+
+@pytest.mark.parametrize(
+    ("limits", "span"),
+    [({"wall": 240}, "4-minute"), (None, "4-minute"), ({"wall": 90}, "90-second"), ({"wall": 999}, "4-minute")],
+)
+def test_the_sidecar_description_states_the_runners_wall_and_no_terminal(monkeypatch, limits, span):
+    """The runner's wall clock stops a script, not Hermes' `timeout`; and there is no
+    terminal() in the sandbox, so neither it nor shell_quote is offered."""
+    monkeypatch.setenv(cet.TRANSPORT_ENV, "sidecar")
+    cfg = dict(_ALLOW, description_intro="TRC INTRO.", timeout=270, max_tool_calls=20)
+    if limits is not None:
+        cfg["sidecar_limits"] = limits
+    text = _schema(cfg)["description"]
+    assert f"Limits: {span} timeout, 50KB stdout cap, max 20 tool calls per script." in text
+    assert "270-second" not in text
+    assert "terminal()" not in text and "shell_quote" not in text
+    assert "json_parse(text: str)" in text and "retry(fn" in text
 
 
 # ---------------------------------------------------------------------------

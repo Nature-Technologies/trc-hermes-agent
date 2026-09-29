@@ -388,4 +388,6 @@ jobs:
           # no network, no control-socket access, no writable path outside the run,
           # no secrets, nothing left behind (deploy/trc/sandbox/adversarial_check.py).
           # -u 10000 is the gateway's uid: exec defaults to root, which reaches the 0600 socket regardless.
-          docker exec -u 10000 -w /opt/hermes hermes-agent /opt/hermes/.venv/bin/python deploy/trc/sandbox/adversarial_check.py --quick
+          # A failed check stops the sandbox rather than leaving it serving: execute_code then
+          # answers `unavailable` (fail closed), and `restart: unless-stopped` keeps it down.
+          docker exec -u 10000 -w /opt/hermes hermes-agent /opt/hermes/.venv/bin/python deploy/trc/sandbox/adversarial_check.py --quick || { docker stop hermes-sandbox; echo "::error::sandbox isolation check failed; hermes-sandbox stopped"; exit 1; }

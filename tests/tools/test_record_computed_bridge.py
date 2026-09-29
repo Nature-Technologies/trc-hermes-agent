@@ -1,6 +1,7 @@
 """After each run the gateway reports its stdout for the computed-figure tier
 (trc-backend spec §4.4). A failure must never break the run's result."""
 
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -55,3 +56,60 @@ def test_an_error_reply_is_logged_as_a_warning(caplog):
     assert "record_computed failed" in warning_records[0].message
     for record in records:
         assert "boom" not in record.message
+
+
+_REFUSAL = {"status": "error", "error": "no verified caller identity (fail-closed)"}
+
+
+def _warnings_for(reply, caplog, stdout="growth 1,700,000.00"):
+    handler = MagicMock(return_value=reply)
+    with (
+        caplog.at_level("INFO", logger="tools.trc_sandbox_bridge"),
+        patch("tools.mcp_tool._servers", {"ragnarok": SimpleNamespace(tool_timeout=30)}),
+        patch("tools.mcp_tool._make_tool_handler", return_value=handler),
+    ):
+        bridge.record_computed(stdout, "ragnarok")
+    records = [r for r in caplog.records if r.name == "tools.trc_sandbox_bridge"]
+    for record in records:
+        assert stdout not in record.getMessage(), "script output must never be logged"
+    assert not [r for r in records if r.getMessage().startswith("record_computed: sent")], (
+        "a failure logged as sent"
+    )
+    return [r.getMessage() for r in records if r.levelname == "WARNING"]
+
+
+def test_a_backend_refusal_in_structured_content_is_a_failure(caplog):
+    reply = json.dumps({"result": json.dumps(_REFUSAL), "structuredContent": _REFUSAL})
+    (warning,) = _warnings_for(reply, caplog)
+    assert "no verified caller identity (fail-closed)" in warning
+
+
+def test_a_backend_refusal_in_the_result_text_is_a_failure(caplog):
+    reply = json.dumps({"result": json.dumps(_REFUSAL)})
+    (warning,) = _warnings_for(reply, caplog)
+    assert "no verified caller identity (fail-closed)" in warning
+
+
+def test_a_top_level_error_is_a_failure(caplog):
+    (warning,) = _warnings_for(json.dumps({"error": "MCP call failed"}), caplog)
+    assert "record_computed failed" in warning
+
+
+def test_the_backend_reason_is_truncated(caplog):
+    long = {"status": "error", "error": "x" * 500}
+    (warning,) = _warnings_for(json.dumps({"result": json.dumps(long)}), caplog)
+    assert "x" * 200 in warning and "x" * 201 not in warning
+
+
+def test_a_backend_success_is_logged_as_sent(caplog):
+    ok = {"status": "ok", "count": 1, "promoted": 0}
+    handler = MagicMock(return_value=json.dumps({"result": json.dumps(ok), "structuredContent": ok}))
+    with (
+        caplog.at_level("INFO", logger="tools.trc_sandbox_bridge"),
+        patch("tools.mcp_tool._servers", {"ragnarok": SimpleNamespace(tool_timeout=30)}),
+        patch("tools.mcp_tool._make_tool_handler", return_value=handler),
+    ):
+        bridge.record_computed("growth 1,700,000.00", "ragnarok")
+    messages = [r.getMessage() for r in caplog.records if r.name == "tools.trc_sandbox_bridge"]
+    assert any(m.startswith("record_computed: sent") for m in messages)
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
