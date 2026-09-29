@@ -1877,6 +1877,7 @@ class MCPServerTask:
         "_forward_user_identity", "_user_identity_header", "_end_user_identity",
         "_chat_id_header", "_end_user_chat_id",
         "_request_id_header", "_end_user_request_id",
+        "_end_user_bridged",
         "_lifecycle_started_at", "_last_tool_call_at",
         "_idle_timeout_seconds", "_max_lifetime_seconds", "_recycled_reason",
         "initialize_result", "_ping_unsupported",
@@ -1950,6 +1951,15 @@ class MCPServerTask:
         self._end_user_chat_id: Optional[str] = None
         self._request_id_header: str = _DEFAULT_REQUEST_ID_HEADER
         self._end_user_request_id: Optional[str] = None
+        # Whether the current tools/call was issued by a sandboxed script rather than
+        # the model directly.  Armed by _make_tool_handler (on the agent thread, in the
+        # same breath as identity / chat / request) from the _BRIDGED ContextVar that
+        # tools/trc_sandbox_bridge._serve_bridged_call sets for the duration of its
+        # dispatch.  The outbound HTTP-request hook stamps X-Hermes-Bridged: 1 when
+        # this is True, and actively removes it when False, so a stale True from the
+        # previous call can never leak to the next one.  Never set without that hook
+        # running; always cleared in the same finally as identity.
+        self._end_user_bridged: bool = False
         now = time.monotonic()
         self._lifecycle_started_at: float = now
         self._last_tool_call_at: float = now
@@ -4367,6 +4377,16 @@ def _make_end_user_identity_hook(
             else:
                 request.headers.pop(request_header_name, None)
 
+        # Bridged calls (tool calls a sandbox script makes) carry X-Hermes-Bridged: 1
+        # so the backend can hold their tokens PENDING rather than DELIVERED.  The
+        # header is actively REMOVED when not bridged — an absent or False value must
+        # never inherit a True from a previous call (the "arm for one call" invariant
+        # that identity enforces via _rpc_lock applies here too).
+        if getattr(server, "_end_user_bridged", False):
+            request.headers["X-Hermes-Bridged"] = "1"
+        else:
+            request.headers.pop("X-Hermes-Bridged", None)
+
     return _stamp_end_user_identity
 
 
@@ -4756,6 +4776,29 @@ def _resolve_end_user_request_id(server: Any) -> Optional[str]:
         return None
 
 
+def _resolve_end_user_bridged() -> bool:
+    """True when the current call is inside a sandbox script's bridged dispatch.
+
+    Read on the agent thread in the same breath as identity / chat / request
+    (see :func:`_make_tool_handler`).  The ContextVar lives in trc_sandbox_bridge
+    to keep the dependency arrow in the right direction: the bridge sets it, the
+    MCP layer reads it here, and the lazy import means neither module pulls the
+    other in at load time.
+
+    Fail-safe: any import error or missing attribute returns False, which is the
+    same as a model-direct call — no header is sent and no invariant is broken.
+    The bridged header is not a security credential (unlike the identity token),
+    but the same fail-safe discipline is correct: an absent value must behave
+    identically to a False value, never to a True.
+    """
+    try:
+        from tools.trc_sandbox_bridge import _BRIDGED  # noqa: PLC0415
+
+        return _BRIDGED.get()
+    except Exception:
+        return False
+
+
 def _mark_server_call_started(server: Any) -> None:
     """Record a user-visible MCP operation when the server supports it."""
     mark_tool_call = getattr(server, "mark_tool_call", None)
@@ -4853,6 +4896,12 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         # so they must not be read where one could be bound and the other not.
         end_user_chat_id = _resolve_end_user_chat_id(server)
         end_user_request_id = _resolve_end_user_request_id(server)
+        # Bridged flag: True iff this call is being made by a sandbox script
+        # (trc_sandbox_bridge._serve_bridged_call sets the ContextVar; a model-
+        # direct call reads the default False).  Captured here, on the agent
+        # thread, for the same reason as identity — the ContextVar cannot be
+        # read on the MCP loop, so we arm a plain attribute instead (below).
+        end_user_bridged = _resolve_end_user_bridged()
 
         # One line per hop, so a broken metadata chain is visible without a
         # debugger. Identities, presence flags and names only -- never the token
@@ -4883,12 +4932,14 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 server._end_user_identity = end_user_identity
                 server._end_user_chat_id = end_user_chat_id
                 server._end_user_request_id = end_user_request_id
+                server._end_user_bridged = end_user_bridged
                 try:
                     result = await server.session.call_tool(tool_name, arguments=args)
                 finally:
                     server._end_user_identity = None
                     server._end_user_chat_id = None
                     server._end_user_request_id = None
+                    server._end_user_bridged = False
                     server._pending_call_context = None
             # The RPC round-trip completed — the session is demonstrably
             # healthy at the transport level (even if the tool itself

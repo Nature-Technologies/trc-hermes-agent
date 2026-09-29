@@ -20,6 +20,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import sys
 import threading
 import uuid
 from collections import OrderedDict
@@ -37,6 +39,134 @@ _cache: "OrderedDict[tuple, str]" = OrderedDict()
 _cache_lock = threading.Lock()
 
 _PROGRESS: ContextVar[Optional[tuple]] = ContextVar("trc_bridged_progress", default=None)
+
+# Terminal parameters that sandbox scripts must not supply (blocking at the
+# dispatch layer prevents a script from spawning persistent background processes
+# or attaching a pty that outlives the run).
+_TERMINAL_BLOCKED_PARAMS: frozenset = frozenset(
+    {"background", "pty", "notify_on_complete", "watch_patterns"}
+)
+
+# --------------------------------------------------------------------------
+# Bridged ContextVar — marks tool calls a sandbox script makes vs. model-direct
+# --------------------------------------------------------------------------
+#
+# Why a ContextVar: the MCP loop runs on a dedicated event-loop thread and
+# copies THAT thread's context when spawning coroutines via
+# run_coroutine_threadsafe, NOT the agent thread's.  So a raw ContextVar
+# value set on the agent thread would NOT be visible to the MCP coroutine.
+#
+# The solution mirrors what the identity / chat / request headers do:
+#   1. _serve_bridged_call (below) sets _BRIDGED to True for the duration of
+#      its dispatch — on the agent thread.
+#   2. _make_tool_handler (mcp_tool.py) reads _BRIDGED.get() on the agent
+#      thread in the same breath as identity / chat / request, and arms
+#      server._end_user_bridged as a PLAIN ATTRIBUTE.
+#   3. The outbound HTTP-request hook (_stamp_end_user_identity, mcp_tool.py)
+#      reads server._end_user_bridged on the MCP loop and stamps (or removes)
+#      X-Hermes-Bridged: 1.  _rpc_lock serialises calls so at most one value
+#      is ever armed, and the finally block clears it unconditionally.
+#
+# A model-direct call never enters _serve_bridged_call, so _BRIDGED stays at
+# its default False and the header is actively REMOVED — a stale True can
+# never leak to a subsequent call.
+
+_BRIDGED: ContextVar[bool] = ContextVar("hermes_bridged", default=False)
+
+
+def _bridged_now() -> bool:
+    """True iff the running code is inside a bridged dispatch (_serve_bridged_call)."""
+    return _BRIDGED.get()
+
+
+def _dispatch_one(
+    tool_name: str,
+    tool_args: dict,
+    *,
+    task_id: Optional[str],
+) -> str:
+    """Dispatch one sandboxed tool call to handle_function_call.
+
+    Kept as a named module-level function (rather than an inline closure) so
+    tests can patch it — e.g. to assert that _BRIDGED is True during dispatch
+    without needing a live model_tools installation.  The lazy import keeps
+    model_tools out of the module-load critical path.
+    """
+    from model_tools import handle_function_call
+
+    call_id = notify_bridged_start(tool_name, tool_args)
+    _real_stdout, _real_stderr = sys.stdout, sys.stderr
+    devnull = open(os.devnull, "w", encoding="utf-8")  # noqa: WPS515
+    try:
+        sys.stdout = devnull
+        sys.stderr = devnull
+        result = handle_function_call(tool_name, tool_args, task_id=task_id)
+    except Exception as exc:
+        logger.error("Tool call failed in sandbox: %s", exc, exc_info=True)
+        result = json.dumps({"error": str(exc)})
+    finally:
+        sys.stdout, sys.stderr = _real_stdout, _real_stderr
+        devnull.close()
+    if not isinstance(result, str):
+        result = json.dumps(result, ensure_ascii=False, default=str)
+    notify_bridged_complete(call_id, tool_name, tool_args, result)
+    return result
+
+
+def _serve_bridged_call(
+    tool_name: str,
+    tool_args: Any,
+    *,
+    allowed_tools: frozenset,
+    tool_call_counter: list,
+    max_tool_calls: int,
+    task_id: Optional[str],
+) -> str:
+    """Serve one tool call a sandbox script made.
+
+    The ONE place the bridged-call rules live, shared by the UDS loop, the
+    file-RPC loop and the sidecar transport: allowlist, call cap, argument
+    stripping (prepare_bridged_args), per-turn cache, status frames.
+
+    Sets _BRIDGED for exactly the duration of this dispatch so the backend
+    receives X-Hermes-Bridged: 1 on every MCP request the call makes — which
+    routes returned tokens to PENDING rather than DELIVERED (spec §4.4, L4).
+    The ContextVar is reset in a finally so a cached result or an exception
+    never leaves it armed for the next call.
+    """
+    if tool_name not in allowed_tools:
+        available = ", ".join(sorted(allowed_tools))
+        return json.dumps({
+            "error": (
+                f"Tool '{tool_name}' is not available in execute_code. "
+                f"Available: {available}"
+            )
+        })
+    if tool_call_counter[0] >= max_tool_calls:
+        return json.dumps({
+            "error": (
+                f"Tool call limit reached ({max_tool_calls}). "
+                "No more tool calls allowed in this execution."
+            )
+        })
+    if not isinstance(tool_args, dict):
+        tool_args = {}
+    if tool_name == "terminal":
+        for param in _TERMINAL_BLOCKED_PARAMS:
+            tool_args.pop(param, None)
+    tool_args = prepare_bridged_args(tool_name, tool_args)
+
+    tok = _BRIDGED.set(True)
+    try:
+        result = cached_bridged_call(
+            tool_name,
+            tool_args,
+            lambda: _dispatch_one(tool_name, tool_args, task_id=task_id),
+        )
+    finally:
+        _BRIDGED.reset(tok)
+    tool_call_counter[0] += 1
+    return result
 
 
 def prepare_bridged_args(tool_name: str, args: dict) -> dict:
@@ -168,7 +298,26 @@ def record_computed(stdout_text: str, server_name: Optional[str]) -> None:
             logger.warning("record_computed: MCP server %r is not connected", server_name)
             return
         handler = _make_tool_handler(server_name, "record_computed", server.tool_timeout)
-        raw = handler({"texts": [stdout_text]})
+        # One retry on a TRANSPORT failure (an exception raised by the handler —
+        # a dropped connection, a timeout, a not-yet-connected session).  A
+        # well-formed error reply from the backend (detected by _record_computed_failure)
+        # is NOT retried: the backend already parsed the call and said no, so
+        # repeating it would only add latency before the same refusal.
+        raw: Optional[str] = None
+        for attempt in range(1, 3):
+            try:
+                raw = handler({"texts": [stdout_text]})
+                break
+            except Exception as exc:
+                logger.warning(
+                    "record_computed transport failure attempt %d/2: %s",
+                    attempt,
+                    type(exc).__name__,
+                )
+                if attempt >= 2:
+                    return  # never raise — a failure only costs the computed tier
+        if raw is None:
+            return
         failed, reason = _record_computed_failure(raw)
         if failed:
             logger.warning(

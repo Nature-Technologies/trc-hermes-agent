@@ -745,56 +745,21 @@ def _serve_bridged_call(
     max_tool_calls: int,
     task_id: Optional[str],
 ) -> str:
-    """Serve one tool call a sandbox script made. The ONE place the rules live, shared
-    by the UDS loop, the file-RPC loop and the sidecar transport: allowlist, call cap,
-    argument rules (tools/trc_sandbox_bridge.py), per-turn cache, status frames."""
-    from model_tools import handle_function_call
+    """Delegate to trc_sandbox_bridge._serve_bridged_call — the one place the rules live.
+
+    The full implementation lives in trc_sandbox_bridge so the diff to upstream
+    code_execution_tool.py stays small.  This shim keeps the three call sites in
+    this file working without modification.
+    """
     from tools import trc_sandbox_bridge as bridge
-
-    if tool_name not in allowed_tools:
-        available = ", ".join(sorted(allowed_tools))
-        return json.dumps({
-            "error": (
-                f"Tool '{tool_name}' is not available in execute_code. "
-                f"Available: {available}"
-            )
-        })
-    if tool_call_counter[0] >= max_tool_calls:
-        return json.dumps({
-            "error": (
-                f"Tool call limit reached ({max_tool_calls}). "
-                "No more tool calls allowed in this execution."
-            )
-        })
-    if not isinstance(tool_args, dict):
-        tool_args = {}
-    if tool_name == "terminal":
-        for param in _TERMINAL_BLOCKED_PARAMS:
-            tool_args.pop(param, None)
-    tool_args = bridge.prepare_bridged_args(tool_name, tool_args)
-
-    def _dispatch() -> str:
-        call_id = bridge.notify_bridged_start(tool_name, tool_args)
-        _real_stdout, _real_stderr = sys.stdout, sys.stderr
-        devnull = open(os.devnull, "w", encoding="utf-8")
-        try:
-            sys.stdout = devnull
-            sys.stderr = devnull
-            result = handle_function_call(tool_name, tool_args, task_id=task_id)
-        except Exception as exc:
-            logger.error("Tool call failed in sandbox: %s", exc, exc_info=True)
-            result = tool_error(str(exc))
-        finally:
-            sys.stdout, sys.stderr = _real_stdout, _real_stderr
-            devnull.close()
-        if not isinstance(result, str):
-            result = json.dumps(result, ensure_ascii=False, default=str)
-        bridge.notify_bridged_complete(call_id, tool_name, tool_args, result)
-        return result
-
-    result = bridge.cached_bridged_call(tool_name, tool_args, _dispatch)
-    tool_call_counter[0] += 1
-    return result
+    return bridge._serve_bridged_call(
+        tool_name,
+        tool_args,
+        allowed_tools=allowed_tools,
+        tool_call_counter=tool_call_counter,
+        max_tool_calls=max_tool_calls,
+        task_id=task_id,
+    )
 
 
 def _rpc_server_loop(
