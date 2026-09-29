@@ -17,6 +17,7 @@ that file only calls in here.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
@@ -53,10 +54,20 @@ def strip_script_only_args(tool_name: str, args: Any) -> Any:
 
 
 def _turn_key() -> Optional[tuple]:
-    from gateway.session_context import get_end_user_chat_id, get_end_user_request_id
+    from gateway.session_context import (
+        get_end_user_chat_id,
+        get_end_user_identity,
+        get_end_user_request_id,
+    )
 
-    chat, request = get_end_user_chat_id(), get_end_user_request_id()
-    return (chat, request) if chat and request else None
+    identity = get_end_user_identity()
+    chat = get_end_user_chat_id()
+    request = get_end_user_request_id()
+    if not identity or not chat or not request:
+        return None
+    # Hash the identity so a raw JWT never sits in a cache key.
+    identity_hash = hashlib.sha256(identity.encode()).hexdigest()[:32]
+    return (identity_hash, chat, request)
 
 
 def _is_cacheable(result: Any) -> bool:
@@ -86,6 +97,24 @@ def cached_bridged_call(tool_name: str, args: dict, call: Callable[[], str]) -> 
             while len(_cache) > _CACHE_MAX_ENTRIES:
                 _cache.popitem(last=False)
     return result
+
+
+def discard_turn_cache() -> int:
+    """Remove every cache entry belonging to the CURRENT turn.
+
+    Called by the API server when a request ends (Task 4 wires it), so a
+    turn's results do not outlive it; the LRU bound stays as a backstop.
+    Returns the number of entries dropped. No-op (returns 0) when there is
+    no current turn key.
+    """
+    turn = _turn_key()
+    if turn is None:
+        return 0
+    with _cache_lock:
+        to_drop = [k for k in _cache if k[0] == turn]
+        for k in to_drop:
+            del _cache[k]
+    return len(to_drop)
 
 
 def set_progress_callbacks(start: Optional[Callable], complete: Optional[Callable]):

@@ -5,10 +5,20 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
+import pytest
+
 from tools import code_execution_tool as cet
 from tools import trc_sandbox_bridge as bridge
 
 Q = "mcp__ragnarok__query"
+
+
+@pytest.fixture(autouse=True)
+def _clear_cache():
+    """Isolate each test: clear the process-global LRU before it runs."""
+    bridge._cache.clear()
+    yield
+    bridge._cache.clear()
 
 
 def test_identity_arguments_are_stripped_from_bridged_calls():
@@ -37,6 +47,7 @@ def test_the_turn_cache_reuses_a_result_within_one_turn():
         return json.dumps({"status": "ok"})
 
     with (
+        patch("gateway.session_context.get_end_user_identity", return_value="tok-a"),
         patch("gateway.session_context.get_end_user_chat_id", return_value="chat-1"),
         patch("gateway.session_context.get_end_user_request_id", return_value="msg-1"),
     ):
@@ -54,6 +65,7 @@ def test_a_new_turn_refetches():
 
     for msg in ("msg-a", "msg-b"):
         with (
+            patch("gateway.session_context.get_end_user_identity", return_value="tok-a"),
             patch("gateway.session_context.get_end_user_chat_id", return_value="chat-1"),
             patch("gateway.session_context.get_end_user_request_id", return_value=msg),
         ):
@@ -69,12 +81,87 @@ def test_errors_are_not_cached():
         return json.dumps({"error": "MCP call failed"})
 
     with (
+        patch("gateway.session_context.get_end_user_identity", return_value="tok-a"),
         patch("gateway.session_context.get_end_user_chat_id", return_value="chat-1"),
         patch("gateway.session_context.get_end_user_request_id", return_value="msg-e"),
     ):
         bridge.cached_bridged_call(Q, {"query": "q"}, call)
         bridge.cached_bridged_call(Q, {"query": "q"}, call)
     assert len(calls) == 2
+
+
+def test_different_identity_same_turn_ids_refetches():
+    """I1: same chat+message ids but a different identity must NOT share a cached result."""
+    calls = []
+
+    def call():
+        calls.append(1)
+        return json.dumps({"status": "ok"})
+
+    for identity in ("user-alice-jwt", "user-bob-jwt"):
+        with (
+            patch("gateway.session_context.get_end_user_identity", return_value=identity),
+            patch("gateway.session_context.get_end_user_chat_id", return_value="chat-1"),
+            patch("gateway.session_context.get_end_user_request_id", return_value="msg-1"),
+        ):
+            bridge.cached_bridged_call(Q, {"query": "q"}, call)
+    assert len(calls) == 2
+
+
+def test_missing_identity_is_not_cached():
+    """I1: when identity is missing the turn key is None → no caching, always dispatch."""
+    calls = []
+
+    def call():
+        calls.append(1)
+        return json.dumps({"status": "ok"})
+
+    with (
+        patch("gateway.session_context.get_end_user_identity", return_value=None),
+        patch("gateway.session_context.get_end_user_chat_id", return_value="chat-1"),
+        patch("gateway.session_context.get_end_user_request_id", return_value="msg-1"),
+    ):
+        bridge.cached_bridged_call(Q, {"query": "q"}, call)
+        bridge.cached_bridged_call(Q, {"query": "q"}, call)
+    assert len(calls) == 2
+
+
+def test_discard_turn_cache_drops_current_turn_and_leaves_others():
+    """I2: discard_turn_cache removes the current turn's entries; other turns survive."""
+    # Populate two turns.
+    for identity, msg, result_val in [
+        ("id-a", "msg-1", "ok-a"),
+        ("id-b", "msg-2", "ok-b"),
+    ]:
+        with (
+            patch("gateway.session_context.get_end_user_identity", return_value=identity),
+            patch("gateway.session_context.get_end_user_chat_id", return_value="chat-1"),
+            patch("gateway.session_context.get_end_user_request_id", return_value=msg),
+        ):
+            bridge.cached_bridged_call(Q, {"query": "q"}, lambda v=result_val: json.dumps({"r": v}))
+
+    assert len(bridge._cache) == 2
+
+    # Discard from id-a's turn.
+    with (
+        patch("gateway.session_context.get_end_user_identity", return_value="id-a"),
+        patch("gateway.session_context.get_end_user_chat_id", return_value="chat-1"),
+        patch("gateway.session_context.get_end_user_request_id", return_value="msg-1"),
+    ):
+        dropped = bridge.discard_turn_cache()
+
+    assert dropped == 1
+    assert len(bridge._cache) == 1  # id-b's entry survives
+
+
+def test_discard_turn_cache_no_op_without_turn_key():
+    """discard_turn_cache returns 0 and does nothing when there is no current turn."""
+    with (
+        patch("gateway.session_context.get_end_user_identity", return_value=None),
+        patch("gateway.session_context.get_end_user_chat_id", return_value="chat-1"),
+        patch("gateway.session_context.get_end_user_request_id", return_value="msg-1"),
+    ):
+        assert bridge.discard_turn_cache() == 0
 
 
 def test_progress_callbacks_fire_with_one_id_per_call():
