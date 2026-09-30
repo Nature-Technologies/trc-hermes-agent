@@ -171,6 +171,12 @@ Inside a script:
   its `text`, with its [Sn] marker.
 - Print each figure you use with its [Sn] marker and date. Print results, not
   whole documents. Copy tokens exactly; never write one yourself.
+- To show many rows, call `table(rows)`; to draw a chart call
+  `chart(kind, rows, x, y)` (kind is "line", "bar" or "arc") and copy its
+  ```vega-lite``` block into your answer exactly. There is no plotting library —
+  `chart()` is the only way to draw one. A chart's numbers must be ones a tool
+  returned or a calculation produced this turn, or the chart is dropped; to redraw
+  it, run `chart()` again. Always pair a chart with its table.
 - If a script fails, fix it and run it again, at most twice. What it already
   fetched this turn is kept.
 
