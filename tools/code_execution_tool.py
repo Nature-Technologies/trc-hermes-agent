@@ -462,6 +462,55 @@ def _mcp_namespace_identifier(server: str) -> str:
     return f"mcp_{server}"
 
 
+# A display helper generated into every stub module (trc-backend spec 2026-09-29 §5.2).
+# Pure stdlib, self-contained: the sandbox has no Hermes imports. A script calls
+# table(rows) and copies the printed markdown; because the rows' name tokens print, the
+# backend's delivered ledger promotes them so they un-mask (Part 0).
+_TABLE_HELPER_SRC = '''
+
+def table(rows, columns=None, title=None, source_key="source"):
+    """Print `rows` (a list of dicts) as a GitHub-flavoured markdown table.
+
+    Numbers are thousands-separated with 2 decimals; a *_pct / *_percent field is a
+    signed 1-decimal percent; None or a missing value is an em dash (never 0); each
+    row's `source` becomes a Source column of [Sn] markers. Print figures with their
+    markers so they restore.
+    """
+    rows = list(rows or [])
+    if not rows:
+        print("(no rows)")
+        return
+    if columns is None:
+        columns = [k for k in rows[0].keys() if k != source_key]
+
+    def _fmt(key, value):
+        if value is None:
+            return "\\u2014"
+        if isinstance(value, bool):
+            return str(value)
+        if isinstance(value, (int, float)):
+            if key.endswith("_pct") or key.endswith("_percent"):
+                return "{:+.1f}%".format(value)
+            return "{:,.2f}".format(value)
+        return str(value)
+
+    def _src(value):
+        if not value:
+            return "\\u2014"
+        return "[{}]".format(str(value).strip().strip("[]"))
+
+    headers = [c.replace("_", " ").title() for c in columns] + ["Source"]
+    if title:
+        print("**{}**".format(title))
+        print()
+    print("| " + " | ".join(headers) + " |")
+    print("| " + " | ".join(["---"] * len(headers)) + " |")
+    for row in rows:
+        cells = [_fmt(c, row.get(c)) for c in columns] + [_src(row.get(source_key))]
+        print("| " + " | ".join(cells) + " |")
+'''
+
+
 def generate_hermes_tools_module(enabled_tools: List[str],
                                  transport: str = "uds") -> str:
     """
@@ -510,7 +559,7 @@ def generate_hermes_tools_module(enabled_tools: List[str],
     else:
         header = _UDS_TRANSPORT_HEADER
 
-    return header + "\n".join(stub_functions) + mcp_src
+    return header + "\n".join(stub_functions) + mcp_src + _TABLE_HELPER_SRC
 
 
 # ---- Shared helpers section (embedded in both transport headers) ----------
