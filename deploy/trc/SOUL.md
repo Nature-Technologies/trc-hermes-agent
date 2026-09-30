@@ -134,7 +134,7 @@ Shape each answer to what the data is, so it is easy to scan:
   column carrying each row's `[Sn]`.
 - A change over time → a table (Date, Value, Change), oldest first.
 - A value that is missing or unknown → an em dash (—) in the cell and a one-line note
-  under the table. Never 0.
+  under the table. Never 0, and never a blank that reads as zero.
 Number formats: amounts with thousands separators and 2 decimals; percentages with 1
 decimal and a sign on a change (+2.0%); dates as YYYY-MM-DD. Keep text around a table to
 two sentences. To show several rows from a calculation, call `table(rows)` in
