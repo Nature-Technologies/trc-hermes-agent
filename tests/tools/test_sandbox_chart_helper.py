@@ -93,3 +93,36 @@ def test_arc_chart_uses_theta():
     # arc encodes magnitude as theta (and category as color) — both allowed channels
     enc = spec["encoding"]
     assert "theta" in enc or "y" in enc
+
+
+# --- expanded chart grammar (trc-backend spec 2026-09-30) ------------------------------
+
+
+def test_area_and_point_marks_are_supported():
+    area = _spec_of(_render("area", [{"d": "2024", "v": 1.0}], x="d", y="v"))
+    assert area["mark"] in ("area", {"type": "area"})
+    point = _spec_of(_render("point", [{"d": "2024", "v": 1.0}], x="d", y="v"))
+    assert point["mark"] in ("point", {"type": "point"})
+
+
+def test_size_and_opacity_become_channels():
+    out = _render(
+        "point", [{"d": "2024", "v": 1.0, "w": 3.0}], x="d", y="v", size="w", opacity="w"
+    )
+    enc = _spec_of(out)["encoding"]
+    assert enc["size"]["field"] == "w" and enc["size"]["type"] == "quantitative"
+    assert enc["opacity"]["field"] == "w"
+
+
+def test_point_true_adds_points_to_a_line():
+    out = _render("line", [{"d": "2024", "v": 1.0}], x="d", y="v", point=True)
+    assert _spec_of(out)["mark"] == {"type": "line", "point": True}
+
+
+def test_axis_titles_are_carried():
+    out = _render(
+        "bar", [{"d": "Q1", "v": 1.0}], x="d", y="v", x_title="Quarter", y_title="Value"
+    )
+    enc = _spec_of(out)["encoding"]
+    assert enc["x"]["axis"]["title"] == "Quarter"
+    assert enc["y"]["axis"]["title"] == "Value"

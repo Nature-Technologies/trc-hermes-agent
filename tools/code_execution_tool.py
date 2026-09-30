@@ -473,16 +473,20 @@ def _mcp_namespace_identifier(server: str) -> str:
 # the delivered ledger promotes them. Pure stdlib.
 _CHART_HELPER_SRC = '''
 
-def chart(kind, rows, x, y, series=None, title=None):
+def chart(kind, rows, x, y, series=None, title=None, size=None, opacity=None,
+          point=False, x_title=None, y_title=None):
     """Print a ```vega-lite chart of `rows` (a list of dicts).
 
-    kind: "line", "bar" or "arc". x/y: the row keys to plot. series: a key to colour by.
-    Only subset-legal keys are emitted (no url, no transform). Copy the printed block
-    into your answer, and pair it with a table. Print numbers/tokens verbatim so they
-    verify and restore.
+    kind: "line", "bar", "area", "point" or "arc". x/y: the row keys to plot. series: a
+    key to colour by. size/opacity: a row key mapped to that channel. point=True adds
+    points to a line. x_title/y_title: axis titles. Only subset-legal keys are emitted
+    (no url, no transform). Copy the printed block into your answer; it renders in chat
+    and in a PDF report. Print numbers/tokens verbatim so they verify and restore. For a
+    chart this helper does not cover, you may write the Vega-Lite spec dict yourself,
+    within the same subset (line/bar/area/point/arc; inline data; no url/transform).
     """
-    if kind not in ("line", "bar", "arc"):
-        raise ValueError("chart kind must be line, bar or arc")
+    if kind not in ("line", "bar", "area", "point", "arc"):
+        raise ValueError("chart kind must be line, bar, area, point or arc")
     rows = list(rows or [])
     if len(rows) > 200:
         raise ValueError(
@@ -503,10 +507,13 @@ def chart(kind, rows, x, y, series=None, title=None):
                 return "temporal" if _is_iso_date(v) else "nominal"
         return "nominal"
 
-    encoding = {
-        "x": {"field": x, "type": _x_type()},
-        "y": {"field": y, "type": "quantitative"},
-    }
+    x_enc = {"field": x, "type": _x_type()}
+    if x_title:
+        x_enc["axis"] = {"title": str(x_title)}
+    y_enc = {"field": y, "type": "quantitative"}
+    if y_title:
+        y_enc["axis"] = {"title": str(y_title)}
+    encoding = {"x": x_enc, "y": y_enc}
     if kind == "arc":
         encoding = {
             "theta": {"field": y, "type": "quantitative"},
@@ -514,10 +521,18 @@ def chart(kind, rows, x, y, series=None, title=None):
         }
     if series and kind != "arc":
         encoding["color"] = {"field": series, "type": "nominal"}
+    if size and kind != "arc":
+        encoding["size"] = {"field": size, "type": "quantitative"}
+    if opacity and kind != "arc":
+        encoding["opacity"] = {"field": opacity, "type": "quantitative"}
+
+    mark = kind
+    if point and kind == "line":
+        mark = {"type": "line", "point": True}
 
     spec = {
         "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
-        "mark": kind,
+        "mark": mark,
         "data": {"values": rows},
         "encoding": encoding,
     }
