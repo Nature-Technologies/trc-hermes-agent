@@ -14,6 +14,9 @@ _DATA_TOOLS = {
     "mcp__ragnarok__list_entities",
     "mcp__ragnarok__find_relationships",
 }
+# The full sandbox allowlist: the four read tools plus render_report, which a script calls
+# to publish a computed report (trc-backend spec §7).
+_SANDBOX_TOOLS = _DATA_TOOLS | {"mcp__ragnarok__render_report"}
 
 
 def _cfg() -> dict:
@@ -36,22 +39,24 @@ def test_the_api_server_gets_ragnarok_and_code_execution_and_nothing_dangerous()
     assert not enabled & forbidden, enabled & forbidden
 
 
-def test_the_model_sees_exactly_the_six_end_user_tools():
-    """record_computed is gateway-only and ingest_document is gone (L2)."""
+def test_the_model_sees_exactly_the_seven_end_user_tools():
+    """record_computed is gateway-only and ingest_document is gone (L2); render_report is
+    model-callable too (spec §7.1), so it is here as well as in sandbox_tools."""
     include = set(_cfg()["mcp_servers"]["ragnarok"]["tools"]["include"])
     assert include == {
         "query",
         "read_document",
         "list_entities",
         "generate_report",
+        "render_report",
         "find_relationships",
         "lookup_live",
     }
 
 
-def test_scripts_reach_only_the_four_data_tools_through_the_sidecar():
+def test_scripts_reach_the_read_tools_and_render_report_through_the_sidecar():
     ce = _cfg()["code_execution"]
-    assert set(ce["sandbox_tools"]) == _DATA_TOOLS
+    assert set(ce["sandbox_tools"]) == _SANDBOX_TOOLS
     assert ce["transport"] == "sidecar"
     assert ce["sidecar_socket"] == "/run/hermes-sandbox/sock"
     assert ce["record_computed_server"] == "ragnarok"

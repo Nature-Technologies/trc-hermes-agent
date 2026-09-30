@@ -574,6 +574,80 @@ def table(rows, columns=None, title=None, source_key="source"):
 '''
 
 
+# A report builder generated into the stub module only when render_report is available
+# (trc-backend spec 2026-09-29 §7.1). Assembles masked markdown from the same table()/
+# chart() helpers and publishes it through render_report; the backend restores the real
+# values inside its boundary and renders the PDF. Bound to the MCP namespace that exposes
+# render_report so a server rename cannot strand it.
+def _report_builder_src(namespace: str) -> str:
+    return '''
+
+def _capture(fn):
+    """Run a print-based helper (table/chart) and capture its stdout as a string."""
+    import io, contextlib
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        fn()
+    return buffer.getvalue().rstrip("\\n")
+
+
+class Report:
+    """Assemble a report and publish it as a downloadable PDF.
+
+    Build it up with .heading()/.text()/.bullets()/.table()/.chart() -- the tables and
+    charts reuse the table()/chart() helpers -- then call .publish(). The title and every
+    section keep their <PERSON_1>-style tokens verbatim; the backend restores the real
+    values inside its boundary and renders the PDF. publish() prints the report_id.
+    """
+
+    def __init__(self, title=""):
+        self._title = str(title)
+        self._parts = []
+
+    def heading(self, text, level=2):
+        try:
+            level = int(level)
+        except (TypeError, ValueError):
+            level = 2
+        level = 1 if level < 1 else (3 if level > 3 else level)
+        self._parts.append("#" * level + " " + str(text))
+        return self
+
+    def text(self, paragraph):
+        self._parts.append(str(paragraph))
+        return self
+
+    def bullets(self, items):
+        self._parts.append("\\n".join("- " + str(i) for i in (items or [])))
+        return self
+
+    def table(self, rows, columns=None, title=None, source_key="source"):
+        self._parts.append(_capture(lambda: table(rows, columns, title, source_key)))
+        return self
+
+    def chart(self, kind, rows, x, y, series=None, title=None):
+        self._parts.append(_capture(lambda: chart(kind, rows, x, y, series, title)))
+        return self
+
+    def _document(self):
+        return "\\n\\n".join(p for p in self._parts if p and p.strip())
+
+    def publish(self):
+        """Send the report to render_report and print the report_id."""
+        result = ''' + namespace + '''.render_report(
+            title=self._title, document=self._document())
+        if isinstance(result, dict) and result.get("status") == "ok":
+            print(
+                "Report ready: report_id=" + str(result.get("report_id"))
+                + " (" + str(result.get("page_count")) + " page(s), expires in "
+                + str(result.get("expires_in_minutes")) + " min)"
+            )
+        else:
+            print("Report not published: " + str(result))
+        return result
+'''
+
+
 def generate_hermes_tools_module(enabled_tools: List[str],
                                  transport: str = "uds") -> str:
     """
@@ -615,6 +689,14 @@ def generate_hermes_tools_module(enabled_tools: List[str],
             for server, tools in sorted(servers.items())
         )
 
+    # The Report builder is emitted only when render_report is reachable, bound to the
+    # namespace that exposes it — publish() calls `<namespace>.render_report(...)`.
+    report_src = ""
+    for server, tools in sorted(servers.items()):
+        if "render_report" in tools:
+            report_src = _report_builder_src(_mcp_namespace_identifier(server))
+            break
+
     if transport == "file":
         header = _FILE_TRANSPORT_HEADER
     elif transport == "pipe":
@@ -623,7 +705,12 @@ def generate_hermes_tools_module(enabled_tools: List[str],
         header = _UDS_TRANSPORT_HEADER
 
     return (
-        header + "\n".join(stub_functions) + mcp_src + _TABLE_HELPER_SRC + _CHART_HELPER_SRC
+        header
+        + "\n".join(stub_functions)
+        + mcp_src
+        + _TABLE_HELPER_SRC
+        + _CHART_HELPER_SRC
+        + report_src
     )
 
 
