@@ -466,6 +466,65 @@ def _mcp_namespace_identifier(server: str) -> str:
 # Pure stdlib, self-contained: the sandbox has no Hermes imports. A script calls
 # table(rows) and copies the printed markdown; because the rows' name tokens print, the
 # backend's delivered ledger promotes them so they un-mask (Part 0).
+# A chart helper generated into every stub module (trc-backend spec 2026-09-29 §6.2).
+# Builds a strict Vega-Lite subset (line/bar/arc, inline values, a handful of channels)
+# and prints it as a ```vega-lite block. The backend validates the subset and verifies
+# every number came from a tool or calculation this conversation; labels are tokens, so
+# the delivered ledger promotes them. Pure stdlib.
+_CHART_HELPER_SRC = '''
+
+def chart(kind, rows, x, y, series=None, title=None):
+    """Print a ```vega-lite chart of `rows` (a list of dicts).
+
+    kind: "line", "bar" or "arc". x/y: the row keys to plot. series: a key to colour by.
+    Only subset-legal keys are emitted (no url, no transform). Copy the printed block
+    into your answer, and pair it with a table. Print numbers/tokens verbatim so they
+    verify and restore.
+    """
+    if kind not in ("line", "bar", "arc"):
+        raise ValueError("chart kind must be line, bar or arc")
+    rows = list(rows or [])
+
+    def _is_iso_date(value):
+        if not isinstance(value, str) or len(value) < 8:
+            return False
+        head = value[:10]
+        parts = head.split("-")
+        return len(parts) == 3 and all(p.isdigit() for p in parts)
+
+    def _x_type():
+        for row in rows:
+            v = row.get(x)
+            if v is not None:
+                return "temporal" if _is_iso_date(v) else "nominal"
+        return "nominal"
+
+    encoding = {
+        "x": {"field": x, "type": _x_type()},
+        "y": {"field": y, "type": "quantitative"},
+    }
+    if kind == "arc":
+        encoding = {
+            "theta": {"field": y, "type": "quantitative"},
+            "color": {"field": x, "type": "nominal"},
+        }
+    if series and kind != "arc":
+        encoding["color"] = {"field": series, "type": "nominal"}
+
+    spec = {
+        "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+        "mark": kind,
+        "data": {"values": rows},
+        "encoding": encoding,
+    }
+    if title:
+        spec["title"] = str(title)
+    print("```vega-lite")
+    print(json.dumps(spec, ensure_ascii=False))
+    print("```")
+'''
+
+
 _TABLE_HELPER_SRC = '''
 
 def table(rows, columns=None, title=None, source_key="source"):
@@ -559,7 +618,9 @@ def generate_hermes_tools_module(enabled_tools: List[str],
     else:
         header = _UDS_TRANSPORT_HEADER
 
-    return header + "\n".join(stub_functions) + mcp_src + _TABLE_HELPER_SRC
+    return (
+        header + "\n".join(stub_functions) + mcp_src + _TABLE_HELPER_SRC + _CHART_HELPER_SRC
+    )
 
 
 # ---- Shared helpers section (embedded in both transport headers) ----------
