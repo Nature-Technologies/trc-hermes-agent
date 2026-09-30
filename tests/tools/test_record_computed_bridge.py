@@ -113,3 +113,80 @@ def test_a_backend_success_is_logged_as_sent(caplog):
     messages = [r.getMessage() for r in caplog.records if r.name == "tools.trc_sandbox_bridge"]
     assert any(m.startswith("record_computed: sent") for m in messages)
     assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+# ---------------------------------------------------------------------------
+# Retry behaviour (spec §4.4)
+# ---------------------------------------------------------------------------
+
+
+def test_a_transport_failure_retries_once(caplog):
+    """A transport failure (handler raises) triggers exactly one retry, then gives up
+    non-fatally.  The well-formed-error path must NOT be triggered."""
+    call_count = 0
+
+    def failing_handler(args):
+        nonlocal call_count
+        call_count += 1
+        raise ConnectionError("MCP transport down")
+
+    with (
+        caplog.at_level("WARNING", logger="tools.trc_sandbox_bridge"),
+        patch("tools.mcp_tool._servers", {"ragnarok": SimpleNamespace(tool_timeout=30)}),
+        patch("tools.mcp_tool._make_tool_handler", return_value=failing_handler),
+    ):
+        bridge.record_computed("1,000.00", "ragnarok")  # must not raise
+
+    assert call_count == 2, "expected initial attempt + exactly one retry"
+    warnings = [r.getMessage() for r in caplog.records
+                if r.name == "tools.trc_sandbox_bridge" and r.levelname == "WARNING"]
+    assert len(warnings) == 2, "one warning per attempt"
+    assert all("transport failure" in w for w in warnings)
+
+
+def test_a_well_formed_error_reply_does_not_retry(caplog):
+    """A well-formed error reply from the backend (not an exception) is NOT retried."""
+    call_count = 0
+    error_reply = json.dumps({"error": "MCP call failed: backend refused"})
+
+    def handler(args):
+        nonlocal call_count
+        call_count += 1
+        return error_reply
+
+    with (
+        caplog.at_level("WARNING", logger="tools.trc_sandbox_bridge"),
+        patch("tools.mcp_tool._servers", {"ragnarok": SimpleNamespace(tool_timeout=30)}),
+        patch("tools.mcp_tool._make_tool_handler", return_value=handler),
+    ):
+        bridge.record_computed("1,000.00", "ragnarok")
+
+    assert call_count == 1, "a well-formed error must not be retried"
+    warnings = [r.getMessage() for r in caplog.records
+                if r.name == "tools.trc_sandbox_bridge" and r.levelname == "WARNING"]
+    # Exactly one warning for the error reply — no transport-failure warnings.
+    assert len(warnings) == 1
+    assert "transport failure" not in warnings[0]
+
+
+def test_transport_failure_then_success(caplog):
+    """If the first attempt fails but the retry succeeds, the call is logged as sent."""
+    attempts = []
+    ok = json.dumps({"status": "ok", "count": 1, "promoted": 0})
+
+    def flaky_handler(args):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise ConnectionError("first attempt down")
+        return json.dumps({"result": ok, "structuredContent": {"status": "ok"}})
+
+    with (
+        caplog.at_level("INFO", logger="tools.trc_sandbox_bridge"),
+        patch("tools.mcp_tool._servers", {"ragnarok": SimpleNamespace(tool_timeout=30)}),
+        patch("tools.mcp_tool._make_tool_handler", return_value=flaky_handler),
+    ):
+        bridge.record_computed("1,000.00", "ragnarok")
+
+    assert len(attempts) == 2
+    messages = [r.getMessage() for r in caplog.records if r.name == "tools.trc_sandbox_bridge"]
+    assert any(m.startswith("record_computed: sent") for m in messages)

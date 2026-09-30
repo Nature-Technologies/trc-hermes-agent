@@ -462,6 +462,192 @@ def _mcp_namespace_identifier(server: str) -> str:
     return f"mcp_{server}"
 
 
+# A display helper generated into every stub module (trc-backend spec 2026-09-29 §5.2).
+# Pure stdlib, self-contained: the sandbox has no Hermes imports. A script calls
+# table(rows) and copies the printed markdown; because the rows' name tokens print, the
+# backend's delivered ledger promotes them so they un-mask (Part 0).
+# A chart helper generated into every stub module (trc-backend spec 2026-09-29 §6.2).
+# Builds a strict Vega-Lite subset (line/bar/arc, inline values, a handful of channels)
+# and prints it as a ```vega-lite block. The backend validates the subset and verifies
+# every number came from a tool or calculation this conversation; labels are tokens, so
+# the delivered ledger promotes them. Pure stdlib.
+_CHART_HELPER_SRC = '''
+
+def chart(kind, rows, x, y, series=None, title=None):
+    """Print a ```vega-lite chart of `rows` (a list of dicts).
+
+    kind: "line", "bar" or "arc". x/y: the row keys to plot. series: a key to colour by.
+    Only subset-legal keys are emitted (no url, no transform). Copy the printed block
+    into your answer, and pair it with a table. Print numbers/tokens verbatim so they
+    verify and restore.
+    """
+    if kind not in ("line", "bar", "arc"):
+        raise ValueError("chart kind must be line, bar or arc")
+    rows = list(rows or [])
+    if len(rows) > 200:
+        raise ValueError(
+            "chart supports at most 200 rows; aggregate or filter first"
+        )
+
+    def _is_iso_date(value):
+        if not isinstance(value, str) or len(value) < 8:
+            return False
+        head = value[:10]
+        parts = head.split("-")
+        return len(parts) == 3 and all(p.isdigit() for p in parts)
+
+    def _x_type():
+        for row in rows:
+            v = row.get(x)
+            if v is not None:
+                return "temporal" if _is_iso_date(v) else "nominal"
+        return "nominal"
+
+    encoding = {
+        "x": {"field": x, "type": _x_type()},
+        "y": {"field": y, "type": "quantitative"},
+    }
+    if kind == "arc":
+        encoding = {
+            "theta": {"field": y, "type": "quantitative"},
+            "color": {"field": x, "type": "nominal"},
+        }
+    if series and kind != "arc":
+        encoding["color"] = {"field": series, "type": "nominal"}
+
+    spec = {
+        "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+        "mark": kind,
+        "data": {"values": rows},
+        "encoding": encoding,
+    }
+    if title:
+        spec["title"] = str(title)
+    print("```vega-lite")
+    print(json.dumps(spec, ensure_ascii=False))
+    print("```")
+'''
+
+
+_TABLE_HELPER_SRC = '''
+
+def table(rows, columns=None, title=None, source_key="source"):
+    """Print `rows` (a list of dicts) as a GitHub-flavoured markdown table.
+
+    Numbers are thousands-separated with 2 decimals; a *_pct / *_percent field is a
+    signed 1-decimal percent; None or a missing value is an em dash (never 0); each
+    row's `source` becomes a Source column of [Sn] markers. Print figures with their
+    markers so they restore.
+    """
+    rows = list(rows or [])
+    if not rows:
+        print("(no rows)")
+        return
+    if columns is None:
+        columns = [k for k in rows[0].keys() if k != source_key]
+
+    def _fmt(key, value):
+        if value is None:
+            return "\\u2014"
+        if isinstance(value, bool):
+            return str(value)
+        if isinstance(value, (int, float)):
+            if key.endswith("_pct") or key.endswith("_percent"):
+                return "{:+.1f}%".format(value)
+            return "{:,.2f}".format(value)
+        return str(value)
+
+    def _src(value):
+        if not value:
+            return "\\u2014"
+        return "[{}]".format(str(value).strip().strip("[]"))
+
+    headers = [c.replace("_", " ").title() for c in columns] + ["Source"]
+    if title:
+        print("**{}**".format(title))
+        print()
+    print("| " + " | ".join(headers) + " |")
+    print("| " + " | ".join(["---"] * len(headers)) + " |")
+    for row in rows:
+        cells = [_fmt(c, row.get(c)) for c in columns] + [_src(row.get(source_key))]
+        print("| " + " | ".join(cells) + " |")
+'''
+
+
+# A report builder generated into the stub module only when render_report is available
+# (trc-backend spec 2026-09-29 §7.1). Assembles masked markdown from the same table()/
+# chart() helpers and publishes it through render_report; the backend restores the real
+# values inside its boundary and renders the PDF. Bound to the MCP namespace that exposes
+# render_report so a server rename cannot strand it.
+def _report_builder_src(namespace: str) -> str:
+    return '''
+
+def _capture(fn):
+    """Run a print-based helper (table/chart) and capture its stdout as a string."""
+    import io, contextlib
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        fn()
+    return buffer.getvalue().rstrip("\\n")
+
+
+class Report:
+    """Assemble a report and publish it as a downloadable PDF.
+
+    Build it up with .heading()/.text()/.bullets()/.table()/.chart() -- the tables and
+    charts reuse the table()/chart() helpers -- then call .publish(). The title and every
+    section keep their <PERSON_1>-style tokens verbatim; the backend restores the real
+    values inside its boundary and renders the PDF. publish() prints the report_id.
+    """
+
+    def __init__(self, title=""):
+        self._title = str(title)
+        self._parts = []
+
+    def heading(self, text, level=2):
+        try:
+            level = int(level)
+        except (TypeError, ValueError):
+            level = 2
+        level = 1 if level < 1 else (3 if level > 3 else level)
+        self._parts.append("#" * level + " " + str(text))
+        return self
+
+    def text(self, paragraph):
+        self._parts.append(str(paragraph))
+        return self
+
+    def bullets(self, items):
+        self._parts.append("\\n".join("- " + str(i) for i in (items or [])))
+        return self
+
+    def table(self, rows, columns=None, title=None, source_key="source"):
+        self._parts.append(_capture(lambda: table(rows, columns, title, source_key)))
+        return self
+
+    def chart(self, kind, rows, x, y, series=None, title=None):
+        self._parts.append(_capture(lambda: chart(kind, rows, x, y, series, title)))
+        return self
+
+    def _document(self):
+        return "\\n\\n".join(p for p in self._parts if p and p.strip())
+
+    def publish(self):
+        """Send the report to render_report and print the report_id."""
+        result = ''' + namespace + '''.render_report(
+            title=self._title, document=self._document())
+        if isinstance(result, dict) and result.get("status") == "ok":
+            print(
+                "Report ready: report_id=" + str(result.get("report_id"))
+                + " (" + str(result.get("page_count")) + " page(s), expires in "
+                + str(result.get("expires_in_minutes")) + " min)"
+            )
+        else:
+            print("Report not published: " + str(result))
+        return result
+'''
+
+
 def generate_hermes_tools_module(enabled_tools: List[str],
                                  transport: str = "uds") -> str:
     """
@@ -503,6 +689,14 @@ def generate_hermes_tools_module(enabled_tools: List[str],
             for server, tools in sorted(servers.items())
         )
 
+    # The Report builder is emitted only when render_report is reachable, bound to the
+    # namespace that exposes it — publish() calls `<namespace>.render_report(...)`.
+    report_src = ""
+    for server, tools in sorted(servers.items()):
+        if "render_report" in tools:
+            report_src = _report_builder_src(_mcp_namespace_identifier(server))
+            break
+
     if transport == "file":
         header = _FILE_TRANSPORT_HEADER
     elif transport == "pipe":
@@ -510,7 +704,14 @@ def generate_hermes_tools_module(enabled_tools: List[str],
     else:
         header = _UDS_TRANSPORT_HEADER
 
-    return header + "\n".join(stub_functions) + mcp_src
+    return (
+        header
+        + "\n".join(stub_functions)
+        + mcp_src
+        + _TABLE_HELPER_SRC
+        + _CHART_HELPER_SRC
+        + report_src
+    )
 
 
 # ---- Shared helpers section (embedded in both transport headers) ----------
@@ -745,56 +946,21 @@ def _serve_bridged_call(
     max_tool_calls: int,
     task_id: Optional[str],
 ) -> str:
-    """Serve one tool call a sandbox script made. The ONE place the rules live, shared
-    by the UDS loop, the file-RPC loop and the sidecar transport: allowlist, call cap,
-    argument rules (tools/trc_sandbox_bridge.py), per-turn cache, status frames."""
-    from model_tools import handle_function_call
+    """Delegate to trc_sandbox_bridge._serve_bridged_call — the one place the rules live.
+
+    The full implementation lives in trc_sandbox_bridge so the diff to upstream
+    code_execution_tool.py stays small.  This shim keeps the three call sites in
+    this file working without modification.
+    """
     from tools import trc_sandbox_bridge as bridge
-
-    if tool_name not in allowed_tools:
-        available = ", ".join(sorted(allowed_tools))
-        return json.dumps({
-            "error": (
-                f"Tool '{tool_name}' is not available in execute_code. "
-                f"Available: {available}"
-            )
-        })
-    if tool_call_counter[0] >= max_tool_calls:
-        return json.dumps({
-            "error": (
-                f"Tool call limit reached ({max_tool_calls}). "
-                "No more tool calls allowed in this execution."
-            )
-        })
-    if not isinstance(tool_args, dict):
-        tool_args = {}
-    if tool_name == "terminal":
-        for param in _TERMINAL_BLOCKED_PARAMS:
-            tool_args.pop(param, None)
-    tool_args = bridge.prepare_bridged_args(tool_name, tool_args)
-
-    def _dispatch() -> str:
-        call_id = bridge.notify_bridged_start(tool_name, tool_args)
-        _real_stdout, _real_stderr = sys.stdout, sys.stderr
-        devnull = open(os.devnull, "w", encoding="utf-8")
-        try:
-            sys.stdout = devnull
-            sys.stderr = devnull
-            result = handle_function_call(tool_name, tool_args, task_id=task_id)
-        except Exception as exc:
-            logger.error("Tool call failed in sandbox: %s", exc, exc_info=True)
-            result = tool_error(str(exc))
-        finally:
-            sys.stdout, sys.stderr = _real_stdout, _real_stderr
-            devnull.close()
-        if not isinstance(result, str):
-            result = json.dumps(result, ensure_ascii=False, default=str)
-        bridge.notify_bridged_complete(call_id, tool_name, tool_args, result)
-        return result
-
-    result = bridge.cached_bridged_call(tool_name, tool_args, _dispatch)
-    tool_call_counter[0] += 1
-    return result
+    return bridge._serve_bridged_call(
+        tool_name,
+        tool_args,
+        allowed_tools=allowed_tools,
+        tool_call_counter=tool_call_counter,
+        max_tool_calls=max_tool_calls,
+        task_id=task_id,
+    )
 
 
 def _rpc_server_loop(

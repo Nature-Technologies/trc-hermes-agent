@@ -36,6 +36,8 @@ code_execution:
     - mcp__ragnarok__read_document
     - mcp__ragnarok__list_entities
     - mcp__ragnarok__find_relationships
+    # A script publishes a computed report with report.publish() (trc-backend spec §7).
+    - mcp__ragnarok__render_report
   # Gateway-only backend tool fed each run's output, for the "calculated" figure note.
   # Deliberately NOT in mcp_servers.ragnarok.tools.include: the model must not call it.
   record_computed_server: ragnarok
@@ -159,6 +161,7 @@ mcp_servers:
         - read_document
         - list_entities
         - generate_report
+        - render_report
         - find_relationships
         - lookup_live
 
