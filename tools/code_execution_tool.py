@@ -484,6 +484,10 @@ def chart(kind, rows, x, y, series=None, title=None):
     if kind not in ("line", "bar", "arc"):
         raise ValueError("chart kind must be line, bar or arc")
     rows = list(rows or [])
+    if len(rows) > 200:
+        raise ValueError(
+            "chart supports at most 200 rows; aggregate or filter first"
+        )
 
     def _is_iso_date(value):
         if not isinstance(value, str) or len(value) < 8:
