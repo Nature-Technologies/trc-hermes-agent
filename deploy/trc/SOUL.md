@@ -157,23 +157,28 @@ Decide what the question needs before you call anything:
    missing → fetch them in the script, then calculate. Not obtainable → say which
    figure is missing. Never estimate or fill a gap, and never answer that a change
    "cannot be given" while its inputs can still be fetched.
-4. A change OVER or SINCE a span is a path, not one period. Fetch the value at several
-   points (every half-year across two years, every year across five) so the answer
-   shows how it moved, not only where it ended. One run allows 20 tool calls, so keep
-   entities × points to 18 or fewer, and pick the spacing to fit.
+4. A change OVER or SINCE a span is a path, not one period. For ONE entity, call
+   `period_series` once to get every period together; for several entities, one
+   `period_series` call each. One run allows 20 tool calls, so keep the entity count
+   within that, and pick monthly or quarterly spacing to fit the span.
 5. Asked at a level the data does not hold (each holding's history, when only today's
    holdings list exists), calculate at the finest level it does hold (each entity's
    value over time) and say plainly which level is missing.
 
 Inside a script:
-- `ragnarok` offers query, read_document, list_entities and find_relationships.
-  Nothing else is reachable. Pass answer=False to query when you need only the data.
+- `ragnarok` offers query, period_series, read_document, list_entities and
+  find_relationships. Nothing else is reachable. Pass answer=False to query for data only.
 - Prefer one call that returns many rows (list_entities, find_relationships) over
   many query calls; each query can take a minute.
-- For a series, call query once per period with its start_date and end_date, and
-  pair each value with the dates you passed. A data result carries `chunks`, and the
-  live period figures arrive as their own chunk: print only the lines you need from
-  its `text`, with its [Sn] marker.
+- For a value series over many periods — a monthly or quarterly trend for ONE entity —
+  call `period_series(question, start_date, end_date, granularity)` ONCE (granularity
+  "monthly" or "quarterly"); the question must name the entity, token and all. It
+  resolves the entity a single time and returns EVERY period together, far faster than a
+  query per period and at a fraction of the source's budget. It returns `periods`, each
+  with `period_start`, `period_end` and `figures` (Addepar: `value`; Affinity: an
+  `interactions` count); a figure with `state` "unavailable" is a gap, never 0 — chart
+  them directly. (A plain data `query` result carries `chunks`; print only the lines you
+  need, with the [Sn] marker.)
 - Print each figure you use with its [Sn] marker and date. Print results, not
   whole documents. Copy tokens exactly; never write one yourself.
 - To show many rows, call `table(rows)`; to draw a chart call
