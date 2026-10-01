@@ -33,6 +33,9 @@ code_execution:
   max_tool_calls: 20
   sandbox_tools:
     - mcp__ragnarok__query
+    # A value series over many periods for ONE entity, in one call instead of a query
+    # per period (trc-backend spec 2026-10-01).
+    - mcp__ragnarok__period_series
     - mcp__ragnarok__read_document
     - mcp__ragnarok__list_entities
     - mcp__ragnarok__find_relationships
@@ -44,9 +47,9 @@ code_execution:
   description_intro: >-
     Use this, without being asked, whenever an answer COMBINES figures: a change over
     time, a trend, a comparison across entities or periods, a total, average, share,
-    ranking or count. A change over a span is a path, not one period: fetch the value
-    at several points (every half-year across two years). Run a short Python program
-    for the calculation over TRC data. It runs
+    ranking or count. A change over a span is a path, not one period: for ONE entity
+    call period_series once to get its whole monthly or quarterly series. Run a short
+    Python program for the calculation over TRC data. It runs
     in an isolated sandbox with no network and no files; its only data source is the
     ragnarok tools listed below, called with keyword arguments. Fetch inside the
     program when you need many rows, pass answer=False to query when you need only
@@ -158,6 +161,7 @@ mcp_servers:
     tools:
       include:
         - query
+        - period_series
         - read_document
         - list_entities
         - generate_report
