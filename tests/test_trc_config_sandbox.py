@@ -14,9 +14,13 @@ _DATA_TOOLS = {
     "mcp__ragnarok__list_entities",
     "mcp__ragnarok__find_relationships",
 }
-# The full sandbox allowlist: the four read tools plus render_report, which a script calls
-# to publish a computed report (trc-backend spec §7).
-_SANDBOX_TOOLS = _DATA_TOOLS | {"mcp__ragnarok__render_report"}
+# The full sandbox allowlist: the four read tools plus render_report (a script calls it to
+# publish a computed report, trc-backend spec §7) and period_series (one call for a
+# multi-period series, trc-backend spec 2026-10-01).
+_SANDBOX_TOOLS = _DATA_TOOLS | {
+    "mcp__ragnarok__render_report",
+    "mcp__ragnarok__period_series",
+}
 
 
 def _cfg() -> dict:
@@ -39,12 +43,14 @@ def test_the_api_server_gets_ragnarok_and_code_execution_and_nothing_dangerous()
     assert not enabled & forbidden, enabled & forbidden
 
 
-def test_the_model_sees_exactly_the_seven_end_user_tools():
+def test_the_model_sees_exactly_the_eight_end_user_tools():
     """record_computed is gateway-only and ingest_document is gone (L2); render_report is
-    model-callable too (spec §7.1), so it is here as well as in sandbox_tools."""
+    model-callable too (spec §7.1), so it is here as well as in sandbox_tools; period_series
+    is the multi-period series tool (trc-backend spec 2026-10-01)."""
     include = set(_cfg()["mcp_servers"]["ragnarok"]["tools"]["include"])
     assert include == {
         "query",
+        "period_series",
         "read_document",
         "list_entities",
         "generate_report",
