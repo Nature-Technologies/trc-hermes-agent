@@ -272,6 +272,11 @@ jobs:
           ssh -i "$RUNNER_TEMP/id_rsa" -p "$SSH_PORT" "${USERNAME}@${HOST}" \
             "mv -f ${HOST_DIR}/SOUL.md.new ${HOST_DIR}/SOUL.md"
 
+          # The TRC playbooks (deploy/trc/skills), a DIRECTORY: streamed as a tar into
+          # skills.new, made world-readable (the container reads it as UID 10000), then
+          # swapped in. `mv -f` onto an existing directory would nest it, not replace it.
+          tar -C deploy/trc/skills -cf - . | ssh -i "$RUNNER_TEMP/id_rsa" -p "$SSH_PORT"             "${USERNAME}@${HOST}"             "rm -rf ${HOST_DIR}/skills.new && mkdir -p ${HOST_DIR}/skills.new && tar -C ${HOST_DIR}/skills.new -xf - && chmod -R a+rX ${HOST_DIR}/skills.new && rm -rf ${HOST_DIR}/skills.old && { [ ! -e ${HOST_DIR}/skills ] || mv ${HOST_DIR}/skills ${HOST_DIR}/skills.old; } && mv ${HOST_DIR}/skills.new ${HOST_DIR}/skills && rm -rf ${HOST_DIR}/skills.old"
+
       - name: Publish the shared-key fingerprint
         env:
           HERMES_API_KEY: ${{ secrets.HERMES_API_KEY }}
@@ -309,6 +314,8 @@ jobs:
           HERMES_CONFIG_PATH: ${{ env.HOST_DIR }}/config.yaml
           # Same mechanism, for the TRC system prompt (deploy/trc/README-SOUL.md).
           HERMES_SOUL_PATH: ${{ env.HOST_DIR }}/SOUL.md
+          # Same mechanism, for the TRC playbooks (deploy/trc/skills).
+          HERMES_SKILLS_PATH: ${{ env.HOST_DIR }}/skills
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           HERMES_API_KEY: ${{ secrets.HERMES_API_KEY }}
           HERMES_DASHBOARD_BASIC_AUTH_USERNAME: ${{ secrets.HERMES_DASHBOARD_BASIC_AUTH_USERNAME }}
@@ -382,6 +389,19 @@ jobs:
               print(f"::error::SOUL.md did not load as the TRC prompt; got: {soul[:160]!r}")
               sys.exit(1)
           print(f"SOUL.md loaded: {len(soul)} chars, starts with RULE ZERO")
+          PY
+
+          # Only the TRC playbooks are indexed, and the index carries no write-path
+          # instruction: a generic skill here means the mount is missing or shadowed.
+          docker exec -i -w /opt/hermes hermes-agent /opt/hermes/.venv/bin/python - <<'PY'
+          import sys
+          from agent.prompt_builder import build_skills_system_prompt
+          index = build_skills_system_prompt(available_tools={"skills_list", "skill_view"})
+          names = [l.strip()[2:].split(":", 1)[0] for l in index.splitlines() if l.strip().startswith("- ")]
+          if not names or any(not n.startswith("trc-") for n in names) or "skill_manage" in index:
+              print(f"::error::skills index is not the TRC playbooks only: {names!r}")
+              sys.exit(1)
+          print(f"skills indexed: {names}")
           PY
 
           # The sandbox's isolation, checked from the gateway's side on every deploy:

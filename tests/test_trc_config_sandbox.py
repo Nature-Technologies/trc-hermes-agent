@@ -35,10 +35,12 @@ def test_the_api_server_gets_ragnarok_and_code_execution_and_nothing_dangerous()
 
     discover_builtin_tools()
     enabled = _get_platform_tools(_cfg(), "api_server")
-    assert {"ragnarok", "code_execution"} <= enabled
+    assert {"ragnarok", "code_execution", "skills_readonly"} <= enabled
+    # `skills` would add skill_manage: a model-written skill is an unreviewed prompt
+    # that persists into every later session (deploy/trc/config.yaml, 2026-10-05).
     forbidden = {
         "terminal", "file", "web", "browser", "browser-cdp",
-        "delegation", "computer_use", "debugging", "coding",
+        "delegation", "computer_use", "debugging", "coding", "skills",
     }
     assert not enabled & forbidden, enabled & forbidden
 

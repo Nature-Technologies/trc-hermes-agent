@@ -14,11 +14,18 @@ model:
 # name as a toolset (toolsets.py, `get_toolset_alias_target`). If a deployed
 # build returns None for it, the fallback is `disabled_toolsets` listing every
 # non-MCP toolset — verify with `hermes tools --platform api_server`, which
-# must list seven tools: six `mcp__ragnarok__*` plus `execute_code`.
+# must list the `mcp__ragnarok__*` tools in `tools.include` below, `execute_code`,
+# `skills_list` and `skill_view` — and never `skill_manage`.
+#
+# `skills_readonly` (2026-10-05): the TRC playbooks in deploy/trc/skills, mounted
+# read-only over $HERMES_HOME/skills so they are the ONLY skills indexed. Read, never
+# written: a model-written skill would be an unreviewed prompt in every later session,
+# outside the redaction boundary's retention sweep — the reason memory is off below.
 platform_toolsets:
   api_server:
     - ragnarok
     - code_execution
+    - skills_readonly
 
 # ── Analysis sandbox (trc-backend spec 2026-09-28-hermes-analysis-sandbox-design) ──
 # execute_code runs scripts in the `hermes-sandbox` container (no network, no files,
@@ -70,6 +77,10 @@ agent:
   # length in front of the rules that matter and nothing else.
   task_completion_guidance: false
   parallel_tool_call_guidance: false
+  # "You run on Hermes Agent (by Nous Research) … docs at <url>": names the framework
+  # and points at a skill this deployment does not carry, against SOUL.md's rule
+  # that the assistant never describes how it works.
+  hermes_help_guidance: false
 tool_loop_guardrails:
   hard_stop_enabled: true
   hard_stop_after:
