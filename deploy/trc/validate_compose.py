@@ -869,7 +869,10 @@ def check_deploy_workflow() -> None:
     for job in (doc.get("jobs") or {}).values():
         for step in (job or {}).get("steps") or []:
             step_text = "\n".join(_script_lines((step or {}).get("run") or ""))
-            if "id_rsa" not in step_text or "rm " not in step_text:
+            # An `rm` whose ARGUMENTS name the key, not a step that merely uses it: the
+            # config upload step authenticates with id_rsa and also `rm -rf`s its own
+            # staging directory on the host (the skills swap), which is no key cleanup.
+            if not re.search(r"\brm\s[^;&|\n]*id_rsa", step_text):
                 continue
             check(
                 str((step or {}).get("if", "")).strip() == "always()",

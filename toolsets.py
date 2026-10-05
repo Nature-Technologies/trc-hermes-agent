@@ -171,6 +171,15 @@ TOOLSETS = {
         "tools": ["skills_list", "skill_view", "skill_manage"],
         "includes": []
     },
+
+    # Read and load skills, never write them. For a deployment whose skills are
+    # reviewed files (a read-only mount), where a model-written skill would be an
+    # unreviewed prompt that persists across every later session.
+    "skills_readonly": {
+        "description": "List and load skill documents (read-only; no create or edit)",
+        "tools": ["skills_list", "skill_view"],
+        "includes": []
+    },
     
     "browser": {
         "description": "Browser automation for web interaction (navigate, click, type, scroll, iframes, hold-click) with web search for finding URLs",

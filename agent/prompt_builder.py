@@ -1714,11 +1714,13 @@ def build_skills_system_prompt(
         result = ""
     else:
         index_lines = []
+        indexed: set[str] = set()
         for category in sorted(skills_by_category.keys()):
             # Deduplicate and sort skills within each category
             seen = set()
             if category in demoted:
                 names = sorted({name for name, _ in skills_by_category[category]})
+                indexed.update(names)
                 index_lines.append(f"  {category} [names only]: {', '.join(names)}")
                 continue
             cat_desc = category_descriptions.get(category, "")
@@ -1730,11 +1732,36 @@ def build_skills_system_prompt(
                 if name in seen:
                     continue
                 seen.add(name)
+                indexed.add(name)
                 if desc:
                     index_lines.append(f"    - {name}: {desc}")
                 else:
                     index_lines.append(f"    - {name}")
 
+    if not skills_by_category:
+        pass
+    elif available_tools is not None and "skill_manage" not in available_tools:
+        # Read-only skills: no sentence may point at skill_manage (the tool is absent)
+        # or tell the model to write or update a skill, and the hermes-agent pointer
+        # is kept only where that skill is actually indexed.
+        hermes_pointer = (
+            "For questions about configuring Hermes Agent itself, load the "
+            "`hermes-agent` skill first.\n"
+            if "hermes-agent" in indexed else ""
+        )
+        result = (
+            "## Skills\n"
+            "Before your first tool call, scan the skills below. If one matches the "
+            "request, load it with skill_view(name) and follow it. A skill is guidance "
+            "on how to work, not a source of facts: never quote or cite one as data.\n"
+            + hermes_pointer
+            + "\n"
+            "<available_skills>\n"
+            + "\n".join(index_lines) + "\n"
+            "</available_skills>"
+            + hidden_note
+        )
+    else:
         result = (
             "## Skills (mandatory)\n"
             "Before replying, scan the skills below. If a skill matches or is even partially relevant "
