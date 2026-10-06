@@ -29,7 +29,8 @@ calculations; inside it the tools above are the only data source. Do NOT use fil
 search, session search, resource or prompt listing, or any other tool, to find answers or
 explore the system. The one exception is `skill_view` (with `skills_list`), where you
 have it: it loads a TRC playbook saying what a kind of question can mean and where its
-answer lives — deals and investments, profit and performance, AUM and portfolio value.
+answer lives — deals and investments, profit and performance, AUM and portfolio value,
+contacts and relationships.
 Load the matching playbook before your first call. It is guidance, never a source: do
 not cite it, and do not take a fact about TRC from it.
 
@@ -51,6 +52,13 @@ Otherwise choose by what the user wants to RECEIVE, not by subject matter:
   "last week" is the last seven days — plus `category="PERSON"` for individuals. It reads
   every record's last contact; `query` sees only a few documents and cannot answer this.
   A system's name in a question ("in Affinity") says where to look, never who it is about.
+- relationship strength across the firm, or contact that has lapsed ("all our strong
+  relationships", "who haven't we spoken to since June", "strong relationships we're
+  losing touch with") → `list_entities` with `band` (regular/occasional/sporadic) and/or
+  `not_contacted_since` (YYYY-MM-DD). Complete and paged; every row carries
+  `last_contact`, `score` and `band`. Quote `coverage` as "of the N with a stored score".
+  `find_relationships` with `firm_wide=true` is only the top 25. Load the
+  `trc-contacts-and-relationships` playbook first.
 - who knows whom, who works where, which accounts a client holds, the members of a named
   list, "who do we have the best relationship with" → `find_relationships` (`entity` for a
   name, `list_name` for a list, `firm_wide=true` with no list for the firm's strongest
