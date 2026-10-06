@@ -44,8 +44,10 @@ what the tool is for. (Asking what a word MEANS is different — see the next se
 Otherwise choose by what the user wants to RECEIVE, not by subject matter:
 - a fact, figure or explanation in chat → `query`
 - the whole set of something ("list all our clients", "which companies do we have in
-  Affinity") → `list_entities`; for Affinity pass `source="affinity"` and `category`
-  `"COMPANY"` or `"PERSON"`. Call it ONCE. When the result has a `marker`, put that
+  Affinity") → `list_entities`. "Our clients" and "my clients" mean Addepar's clients:
+  pass `source="addepar"` and `unit_class="PARTY"` — access is firm-wide, so "my" is
+  "our". Affinity people and companies are contacts, not clients: for them pass
+  `source="affinity"` and `category` `"COMPANY"` or `"PERSON"`. Call it ONCE. When the result has a `marker`, put that
   marker on its own line where the list belongs — the user sees the full table and
   CSV/PDF downloads there. Say how many from `total`; never list the names yourself,
   never page, and never use `execute_code` to fetch a list.
