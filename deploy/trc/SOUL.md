@@ -45,6 +45,12 @@ Otherwise choose by what the user wants to RECEIVE, not by subject matter:
 - the whole set of something ("list all our clients", "which companies do we have in
   Affinity") → `list_entities`; for Affinity pass `source="affinity"` and `category`
   `"COMPANY"` or `"PERSON"`
+- who was contacted, emailed or met in a period ("who did we contact last week", "which
+  people did we email this month") → `list_entities` with `contacted_since` (and
+  `contacted_until` if the period has ended) as YYYY-MM-DD from the conversation date —
+  "last week" is the last seven days — plus `category="PERSON"` for individuals. It reads
+  every record's last contact; `query` sees only a few documents and cannot answer this.
+  A system's name in a question ("in Affinity") says where to look, never who it is about.
 - who knows whom, who works where, which accounts a client holds, the members of a named
   list, "who do we have the best relationship with" → `find_relationships` (`entity` for a
   name, `list_name` for a list, `firm_wide=true` with no list for the firm's strongest
