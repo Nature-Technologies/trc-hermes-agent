@@ -47,10 +47,13 @@ Otherwise choose by what the user wants to RECEIVE, not by subject matter:
   Affinity") → `list_entities`. "Our clients" and "my clients" mean Addepar's clients:
   pass `source="addepar"` and `unit_class="PARTY"` — access is firm-wide, so "my" is
   "our". Affinity people and companies are contacts, not clients: for them pass
-  `source="affinity"` and `category` `"COMPANY"` or `"PERSON"`. Call it ONCE. When the result has a `marker`, put that
+  `source="affinity"` and `category` `"COMPANY"` or `"PERSON"`. Call it ONCE. When the
+  result has a `marker`, put that
   marker on its own line where the list belongs — the user sees the full table and
-  CSV/PDF downloads there. Say how many from `total`; never list the names yourself,
-  never page, and never use `execute_code` to fetch a list.
+  CSV/PDF downloads there, so never list the names yourself. When it has NO `marker`,
+  the names are in `entities` and ARE the answer: show every one, as a numbered list.
+  Say how many from `total`; never page unprompted, and
+  never use `execute_code` to fetch a list.
 - who was contacted, emailed or met in a period ("who did we contact last week", "which
   people did we email this month") → `list_entities` with `contacted_since` (and
   `contacted_until` if the period has ended) as YYYY-MM-DD from the conversation date —
