@@ -68,7 +68,9 @@ class TestRuffConfig:
 
 
 class TestLintWorkflow:
-    WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "lint.yml"
+    # TRC fork: upstream's lint.yml is disabled to save CI minutes; the
+    # blocking ruff step lives in the slim trc-tests.yml instead.
+    WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "trc-tests.yml"
 
     def test_workflow_exists(self):
         assert self.WORKFLOW_PATH.exists(), (
@@ -95,7 +97,7 @@ class TestLintWorkflow:
                     found_blocking = True
                     break
         assert found_blocking, (
-            "lint.yml no longer contains a blocking ``ruff check .`` step "
+            "trc-tests.yml no longer contains a blocking ``ruff check .`` step "
             "(one without --exit-zero and not masked by || true).  "
             "Restore it — the PLW1514 rule is only useful if CI actually "
             "fails on violation."
@@ -109,6 +111,6 @@ class TestLintWorkflow:
         try:
             parsed = yaml.safe_load(content)
         except yaml.YAMLError as exc:
-            pytest.fail(f"lint.yml is not valid YAML: {exc}")
+            pytest.fail(f"trc-tests.yml is not valid YAML: {exc}")
         assert isinstance(parsed, dict)
         assert "jobs" in parsed

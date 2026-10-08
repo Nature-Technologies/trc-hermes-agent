@@ -3,8 +3,9 @@ name: TRC Tests
 # Slim replacement for upstream's ci.yml fan-out (8 test slices, docker,
 # e2e-desktop, supply-chain, etc.), which burned most of the fork's CI
 # minutes. Upstream's workflows are kept as *.disabled for fork syncs.
-# One runner, Python unit tests only; scripts/run_tests_parallel.py already
-# parallelises per test file across the runner's cores.
+# One runner: blocking ruff check + Python unit tests.
+# scripts/run_tests_parallel.py already parallelises per test file across
+# the runner's cores.
 
 on:
   pull_request:
@@ -45,6 +46,13 @@ jobs:
         run: |
           uv python install 3.11
           uv sync --locked --python 3.11 --extra all --extra dev
+
+      # Blocking: enforces [tool.ruff.lint.select] (PLW1514 explicit-encoding)
+      # that upstream's lint.yml used to gate. Guarded by tests/test_lint_config.py.
+      - name: Ruff check
+        run: |
+          source .venv/bin/activate
+          ruff check .
 
       - name: Run tests
         run: |
