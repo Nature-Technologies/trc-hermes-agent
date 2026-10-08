@@ -298,8 +298,12 @@ _STRICT_URL_PARAM_RE = re.compile(
 # Match userinfo in both absolute (``scheme://user:pass@host``) and
 # network-path (``//user:pass@host``) references. The authority boundary stops
 # at path/query/fragment delimiters so an ``@`` elsewhere in a URL is ignored.
+# The lookbehind pins the optional scheme to the start of a scheme-char run;
+# without it every position inside a long run re-scans the whole run
+# (quadratic -- a ~1MB compaction input hung for minutes). Group 1 is written
+# back verbatim, so where the scheme starts never changes the output.
 _STRICT_URL_USERINFO_RE = re.compile(
-    r"((?:[A-Za-z][A-Za-z0-9+.-]*:)?//)([^/\s?#@]+)@"
+    r"((?:(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*:)?//)([^/\s?#@]+)@"
 )
 
 # HTTP access logs often use a relative request target rather than a full URL:

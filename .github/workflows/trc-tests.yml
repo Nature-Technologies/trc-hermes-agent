@@ -1,0 +1,64 @@
+name: TRC Tests
+
+# Slim replacement for upstream's ci.yml fan-out (8 test slices, docker,
+# e2e-desktop, supply-chain, etc.), which burned most of the fork's CI
+# minutes. Upstream's workflows are kept as *.disabled for fork syncs.
+# One runner: blocking ruff check + Python unit tests.
+# scripts/run_tests_parallel.py already parallelises per test file across
+# the runner's cores.
+
+on:
+  pull_request:
+    branches: [dev, main]
+    paths-ignore:
+      - '**.md'
+      - 'website/**'
+      - 'docs/**'
+      - 'apps/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trc-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install ripgrep
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep
+
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Install dependencies
+        run: |
+          uv python install 3.11
+          uv sync --locked --python 3.11 --extra all --extra dev
+
+      # Blocking: enforces [tool.ruff.lint.select] (PLW1514 explicit-encoding)
+      # that upstream's lint.yml used to gate. Guarded by tests/test_lint_config.py.
+      - name: Ruff check
+        run: |
+          source .venv/bin/activate
+          ruff check .
+
+      - name: Run tests
+        run: |
+          source .venv/bin/activate
+          scripts/run_tests.sh
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
