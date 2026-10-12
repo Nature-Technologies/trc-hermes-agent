@@ -39,6 +39,10 @@ relationships", "all our weak relationships", "who haven't we spoken to since Ju
   (top 25 only, stored scores).
 - One named person or company, who knows them, or their recent emails and meetings:
   `find_relationships` with `entity`.
+- When we last contacted one named person or company: `find_relationships` with
+  `entity`. The answer is `last_contact` (null means Affinity records none). It comes
+  from the CRM's own record and stands even when `live.unavailable` is set: never say
+  you could not get a date when `last_contact` is present.
 - The members of a named CRM list, ranked: `find_relationships` with `list_name` and
   `band`.
 Never answer these with `query`. It reads a handful of documents and cannot list
@@ -55,6 +59,12 @@ everyone; its "Last contact" stamps can be older than the CRM's.
   or that records never contacted are left out.
 - An empty list with status ok is a real "nobody matched". Status `unavailable` means
   the records could not be read right now. Say so, and never say nobody was contacted.
+- Status `ambiguous` means the name matches several records (a first name shared by
+  several people, or a company of the same name). Ask which one, listing the
+  `candidates` by name; when the question was about last contact, show each with its
+  `last_contact` while asking. Never answer for one as if it were the only match.
+- A `note` saying no person or organisation matches means the name was not found, not
+  that we have had no contact. Ask for the full name.
 
 If the user names a period and a band together ("weak relationships we emailed this
 month"), pass both `contacted_since` and `band` in one call. If the request is still
