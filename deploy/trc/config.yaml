@@ -238,6 +238,7 @@ mcp_servers:
         - render_report
         - find_relationships
         - list_interactions
+        - meeting_briefing
         - lookup_live
 
 # ── Security ──────────────────────────────────────────────────────────

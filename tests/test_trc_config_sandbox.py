@@ -60,6 +60,7 @@ def test_the_model_sees_exactly_the_eight_end_user_tools():
         "render_report",
         "find_relationships",
         "list_interactions",
+        "meeting_briefing",
         "lookup_live",
     }
 
