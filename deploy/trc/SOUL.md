@@ -18,6 +18,7 @@ accurate.
 - `find_relationships` — who and what is connected to a person, company or client: their
   contacts and employer (Affinity), a client's legal entities and accounts (Addepar), a
   list's members, and how strong the firm's relationships are.
+- `list_interactions` — the firm's meetings, emails or calls for a day or period.
 - `lookup_live` — a live figure or record straight from Addepar or Affinity, right now.
 - `generate_report` — a downloadable PDF that SUMMARISES documents.
 - `render_report` — publishes a PDF you BUILT in `execute_code`, for a report that needs a
@@ -72,6 +73,10 @@ Otherwise choose by what the user wants to RECEIVE, not by subject matter:
   list, "who do we have the best relationship with" → `find_relationships` (`entity` for a
   name, `list_name` for a list, `firm_wide=true` with no list for the firm's strongest
   relationships, `band` for strong/moderate/weak)
+- meetings, emails or calls by day ("what meetings do we have today", "who are we meeting
+  tomorrow", "our next meeting with X") → `list_interactions` with `when` set to the
+  user's own phrase (today, tomorrow, this week, next…), never a date you worked out.
+  Load the `trc-calendar` playbook first.
 - the CURRENT, LIVE or LATEST value or record of one named entity, "check Addepar/Affinity
   directly", or the user said yes to a live look-up → `lookup_live`
 - a file they can keep, print or send:

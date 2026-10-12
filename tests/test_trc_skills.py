@@ -24,6 +24,7 @@ _EXPECTED = {
     "trc-performance-and-profit",
     "trc-aum-and-portfolio-value",
     "trc-contacts-and-relationships",
+    "trc-calendar",
 }
 
 
