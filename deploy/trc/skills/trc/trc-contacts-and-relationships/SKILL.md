@@ -65,6 +65,11 @@ everyone; its "Last contact" stamps can be older than the CRM's.
   `last_contact` while asking. Never answer for one as if it were the only match.
 - A `note` saying no person or organisation matches means the name was not found, not
   that we have had no contact. Ask for the full name.
+- Names need not be exact: a first name, a surname, the start of each word or a typo
+  still match. `matched_as` (or `matched_list`) set means the record read is not
+  named exactly as asked: say which name you looked up so the user can correct it.
+  An `ambiguous` result whose note says no record is named exactly lists the closest
+  names; ask "did you mean ...?" rather than choosing one.
 
 If the user names a period and a band together ("weak relationships we emailed this
 month"), pass both `contacted_since` and `band` in one call. If the request is still
