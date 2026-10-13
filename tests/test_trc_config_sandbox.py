@@ -29,18 +29,19 @@ def _cfg() -> dict:
 
 def test_the_api_server_gets_ragnarok_and_code_execution_and_nothing_dangerous():
     """Plugin toolsets are on by default upstream, so this pins what must be present
-    and what must never be, rather than exact equality."""
+    and what must never be, rather than exact equality. `delegation` is allowed since
+    spec 2026-10-13 §5: children inherit only these toolsets, minus delegate_task."""
     from hermes_cli.tools_config import _get_platform_tools
     from tools.registry import discover_builtin_tools
 
     discover_builtin_tools()
     enabled = _get_platform_tools(_cfg(), "api_server")
-    assert {"ragnarok", "code_execution", "skills_readonly"} <= enabled
+    assert {"ragnarok", "code_execution", "skills_readonly", "delegation"} <= enabled
     # `skills` would add skill_manage: a model-written skill is an unreviewed prompt
     # that persists into every later session (deploy/trc/config.yaml, 2026-10-05).
     forbidden = {
         "terminal", "file", "web", "browser", "browser-cdp",
-        "delegation", "computer_use", "debugging", "coding", "skills",
+        "computer_use", "debugging", "coding", "skills",
     }
     assert not enabled & forbidden, enabled & forbidden
 
@@ -72,3 +73,49 @@ def test_scripts_reach_the_read_tools_and_render_report_through_the_sidecar():
     assert ce["max_tool_calls"] == 20
     assert ce["timeout"] == 270
     assert ce["sidecar_limits"] == {"wall": 240, "cpu": 60, "mem_mb": 768}
+
+
+def test_subagents_are_foreground_bounded_and_leave_no_files(tmp_path, monkeypatch):
+    """Spec 2026-10-13 §5 C2/C3/C5/C6, read through the MERGED config the delegate tool
+    acts on, not just the raw file."""
+    import shutil
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    shutil.copy(_DEPLOYED, home / "config.yaml")
+
+    from tools import delegate_tool as dt
+
+    cfg = dt._load_config()
+    assert dt._background_enabled(cfg) is False
+    assert dt._live_log_enabled(cfg) is False
+    assert dt._spill_summaries_enabled(cfg) is False
+    assert dt._get_max_concurrent_children() == 3
+    assert dt._get_max_spawn_depth() == 1
+    # An LLM turn + up to 60 s Hermes admission + one 190 s ragnarok call + a compose
+    # turn (deploy/trc/config.yaml, final review 2026-10-13).
+    assert dt._get_child_timeout() == 330.0
+    assert cfg["load_soul"] is True
+    assert cfg["max_iterations"] == 6
+    # Unset, so children inherit the route's model and its provider filters.
+    raw = _cfg()["delegation"]
+    assert "model" not in raw and "provider" not in raw
+    assert not cfg.get("model") and not cfg.get("provider")
+    contract = cfg["result_instructions"]
+    for phrase in ("[Sn]", "placeholder", "figure"):
+        assert phrase in contract, phrase
+    # One batch of up to three lookups, issued together, then findings.
+    assert "at most one batch of up to three lookups" in contract
+    assert "issued together in one turn" in contract
+    # A child never produces a report: the parent owns publication.
+    assert (
+        "Never call generate_report or render_report and never publish a report; "
+        "return findings only." in contract
+    )
+
+
+def test_delegation_is_the_only_toolset_added_for_subagents():
+    assert _cfg()["platform_toolsets"]["api_server"] == [
+        "ragnarok", "code_execution", "skills_readonly", "delegation",
+    ]

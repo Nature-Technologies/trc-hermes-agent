@@ -60,12 +60,12 @@ _TERMINAL_BLOCKED_PARAMS: frozenset = frozenset(
 #   1. _serve_bridged_call (below) sets _BRIDGED to True for the duration of
 #      its dispatch — on the agent thread.
 #   2. _make_tool_handler (mcp_tool.py) reads _BRIDGED.get() on the agent
-#      thread in the same breath as identity / chat / request, and arms
-#      server._end_user_bridged as a PLAIN ATTRIBUTE.
+#      thread in the same breath as identity / chat / request, and stores it
+#      in that call's _CallIdentity entry (server._call_identities[call_id]).
 #   3. The outbound HTTP-request hook (_stamp_end_user_identity, mcp_tool.py)
-#      reads server._end_user_bridged on the MCP loop and stamps (or removes)
-#      X-Hermes-Bridged: 1.  _rpc_lock serialises calls so at most one value
-#      is ever armed, and the finally block clears it unconditionally.
+#      reads the entry named by the POST's params._meta.hermes_call and stamps
+#      (or removes) X-Hermes-Bridged: 1.  The entry is per call and removed in
+#      _call's finally, so concurrent calls never see each other's flag.
 #
 # A model-direct call never enters _serve_bridged_call, so _BRIDGED stays at
 # its default False and the header is actively REMOVED — a stale True can
@@ -200,14 +200,37 @@ def _turn_key() -> Optional[tuple]:
     return (identity_hash, chat, request)
 
 
+# Transient outcomes: a retry in the same turn must reach the server again.
+_UNCACHEABLE_STATUSES = frozenset({"busy", "timeout"})
+
+
+def _has_transient_status(value: Any) -> bool:
+    return isinstance(value, dict) and value.get("status") in _UNCACHEABLE_STATUSES
+
+
 def _is_cacheable(result: Any) -> bool:
+    """Errors and a ``busy`` / ``timeout`` status are not cached. The status is
+    read at the top level, in ``structuredContent``, and in an MCP ``result``
+    (a dict, or JSON text)."""
     if not isinstance(result, str):
         return False
     try:
         parsed = json.loads(result)
     except ValueError:
         return True
-    return not (isinstance(parsed, dict) and "error" in parsed)
+    if not isinstance(parsed, dict):
+        return True
+    if "error" in parsed:
+        return False
+    if _has_transient_status(parsed) or _has_transient_status(parsed.get("structuredContent")):
+        return False
+    inner = parsed.get("result")
+    if isinstance(inner, str):
+        try:
+            inner = json.loads(inner)
+        except ValueError:
+            return True
+    return not _has_transient_status(inner)
 
 
 def cached_bridged_call(tool_name: str, args: dict, call: Callable[[], str]) -> str:

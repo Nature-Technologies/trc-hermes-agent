@@ -20,6 +20,7 @@ never the child's intermediate tool calls or reasoning.
 import enum
 import json
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 import os
@@ -39,6 +40,7 @@ from toolsets import TOOLSETS
 _RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
+from tools.thread_context import propagate_contextvars_to_thread
 from utils import base_url_hostname, is_truthy_value
 
 
@@ -526,6 +528,62 @@ def _get_inherit_mcp_toolsets() -> bool:
     return is_truthy_value(cfg.get("inherit_mcp_toolsets"), default=True)
 
 
+def _background_enabled(cfg: Optional[dict] = None) -> bool:
+    """``delegation.background`` (default true).
+
+    When false, every delegation runs in the foreground, whatever the caller
+    asked for. The parent's tool call waits for the children and returns their
+    results. The children stay in ``parent._active_children``, so Stop
+    interrupts them. No async completion is queued, so ``gateway/wake.py`` has
+    nothing to self-POST. The TRC API server sets it: a detached result could
+    only come back as a new wake turn, outside the user's request and the
+    identity it carried.
+    """
+    if cfg is None:
+        cfg = _load_config()
+    return is_truthy_value(cfg.get("background"), default=True)
+
+
+def _spill_summaries_enabled(cfg: Optional[dict] = None) -> bool:
+    """``delegation.spill_summaries`` (default true).
+
+    False means an over-budget summary is trimmed in place and its full text is
+    NOT written to ``cache/delegation/``. The footer then names no file and no
+    ``read_file`` offset. A deployment whose parent has no ``read_file``, or
+    that keeps tool output only in the session DB (TRC, invariant I5), sets
+    false.
+    """
+    if cfg is None:
+        cfg = _load_config()
+    return is_truthy_value(cfg.get("spill_summaries"), default=True)
+
+
+def _live_log_enabled(cfg: Optional[dict] = None) -> bool:
+    """``delegation.live_log`` (default true).
+
+    False means no live transcripts under ``cache/delegation/live/`` and no
+    zero-API-call timeout diagnostic under ``logs/``. Both hold the child's
+    goal and tool traffic. A deployment that keeps that only in the session DB
+    (TRC, invariant I5) sets false. Child sessions are still recorded in the
+    session DB with ``parent_session_id``.
+    """
+    if cfg is None:
+        cfg = _load_config()
+    return is_truthy_value(cfg.get("live_log"), default=True)
+
+
+def _load_soul_enabled(cfg: Optional[dict] = None) -> bool:
+    """``delegation.load_soul`` (default false).
+
+    True gives every child the deployment's SOUL.md as its identity, in place
+    of the stock ``DEFAULT_AGENT_IDENTITY``. A deployment whose SOUL.md carries
+    rules every answer must follow (TRC: tokens, [Sn] markers) sets true.
+    """
+    if cfg is None:
+        cfg = _load_config()
+    return is_truthy_value(cfg.get("load_soul"), default=False)
+
+
 def _is_mcp_toolset_name(name: str) -> bool:
     """Return True for canonical MCP toolsets and their registered aliases."""
     if not name:
@@ -666,6 +724,7 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
+    result_instructions: Optional[str] = None,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -688,20 +747,30 @@ def _build_child_system_prompt(
             f"{workspace_path}\n"
             "Use this exact path for local repository/workdir operations unless the task explicitly says otherwise."
         )
-    parts.append(
-        "\nComplete this task using the tools available to you. "
-        "When finished, provide a clear, concise summary of:\n"
-        "- What you did\n"
-        "- What you found or accomplished\n"
-        "- Any files you created or modified\n"
-        "- Any issues encountered\n\n"
-        "Important workspace rule: Never assume a repository lives at /workspace/... or any other container-style path unless the task/context explicitly gives that path. "
-        "If no exact local path is provided, discover it first before issuing git/workdir-specific commands.\n\n"
-        "Keep your final summary tight: lead with outcomes, prefer bullet "
-        "points over paragraphs, and don't replay your whole process. Your "
-        "response is returned to the parent agent as a summary, and overlong "
-        "summaries crowd out the parent's context window."
-    )
+    if result_instructions and str(result_instructions).strip():
+        # Deployment-defined result contract (delegation.result_instructions).
+        # It replaces the generic "what you did / files modified" summary, the
+        # /workspace rule and the brevity advice, none of which fit a child
+        # without terminal or file tools.
+        parts.append(
+            "\nComplete this task using the tools available to you.\n\n"
+            + str(result_instructions).strip()
+        )
+    else:
+        parts.append(
+            "\nComplete this task using the tools available to you. "
+            "When finished, provide a clear, concise summary of:\n"
+            "- What you did\n"
+            "- What you found or accomplished\n"
+            "- Any files you created or modified\n"
+            "- Any issues encountered\n\n"
+            "Important workspace rule: Never assume a repository lives at /workspace/... or any other container-style path unless the task/context explicitly gives that path. "
+            "If no exact local path is provided, discover it first before issuing git/workdir-specific commands.\n\n"
+            "Keep your final summary tight: lead with outcomes, prefer bullet "
+            "points over paragraphs, and don't replay your whole process. Your "
+            "response is returned to the parent agent as a summary, and overlong "
+            "summaries crowd out the parent's context window."
+        )
     if role == "orchestrator":
         child_note = (
             "Your own children MUST be leaves (cannot delegate further) "
@@ -1025,6 +1094,47 @@ def _build_child_progress_callback(
     return _callback
 
 
+def _build_child_tool_relay(parent_agent, subagent_id: str):
+    """Relay a child's tool start/complete to the parent's structured callbacks.
+
+    API server only. There those callbacks feed the SSE tool-progress events and
+    the Open WebUI status line (gateway/platforms/turn_status.py). The parent
+    has no tool_progress_callback (api_server wires only this pair), so without
+    the relay the status line sits on the parent's own delegate_task line for
+    the whole run. Call ids are prefixed with the subagent id, because two
+    children's model-issued ids can collide. Elsewhere the parent's
+    tool_start_callback drives CLI inline diffs, which must not start showing a
+    child's edits, so this returns (None, None).
+    """
+    if getattr(parent_agent, "platform", None) != "api_server":
+        return None, None
+    parent_start = getattr(parent_agent, "tool_start_callback", None)
+    parent_complete = getattr(parent_agent, "tool_complete_callback", None)
+
+    def _start(tool_call_id, function_name, function_args):
+        if not tool_call_id:
+            return
+        try:
+            parent_start(f"{subagent_id}:{tool_call_id}", function_name, function_args)
+        except Exception as exc:
+            logger.debug("Child tool-start relay failed: %s", type(exc).__name__)
+
+    def _complete(tool_call_id, function_name, function_args, function_result):
+        if not tool_call_id:
+            return
+        try:
+            parent_complete(
+                f"{subagent_id}:{tool_call_id}", function_name, function_args, function_result
+            )
+        except Exception as exc:
+            logger.debug("Child tool-complete relay failed: %s", type(exc).__name__)
+
+    return (
+        _start if callable(parent_start) else None,
+        _complete if callable(parent_complete) else None,
+    )
+
+
 def _normalized_runtime_url(value: Any) -> str:
     return str(value or "").strip().rstrip("/")
 
@@ -1195,6 +1305,7 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+        result_instructions=delegation_cfg.get("result_instructions"),
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -1361,6 +1472,10 @@ def _build_child_agent(
     if isinstance(child_max_tokens, int):
         child_optional_kwargs["max_tokens"] = child_max_tokens
 
+    child_tool_start_cb, child_tool_complete_cb = _build_child_tool_relay(
+        parent_agent, subagent_id
+    )
+
     from agent.delegation_context import delegated_child_context
 
     with delegated_child_context():
@@ -1384,6 +1499,11 @@ def _build_child_agent(
             log_prefix=f"[subagent-{task_index}]",
             platform="subagent",
             skip_context_files=True,
+            # delegation.load_soul: SOUL.md is the deployment's identity and
+            # rules (TRC: masking, citations, security). Off (upstream), a
+            # child runs on the stock DEFAULT_AGENT_IDENTITY. cwd project
+            # files stay skipped either way.
+            load_soul_identity=_load_soul_enabled(),
             skip_memory=True,
             clarify_callback=None,
             thinking_callback=child_thinking_cb,
@@ -1402,6 +1522,8 @@ def _build_child_agent(
             ),
             openrouter_min_coding_score=child_openrouter_min_coding_score,
             tool_progress_callback=child_progress_cb,
+            tool_start_callback=child_tool_start_cb,
+            tool_complete_callback=child_tool_complete_cb,
             iteration_budget=None,  # fresh budget per subagent
             **child_optional_kwargs,
         )
@@ -1616,6 +1738,32 @@ def _dump_subagent_timeout_diagnostic(
         return None
 
 
+# Shapes a trim must never cut through. Half a placeholder token cannot be
+# unmasked, half a source marker cannot be cited, and half a list marker cannot
+# be rendered. Mirrors trc-backend: app/core/redaction/tokens.py `_TOKEN_RE`
+# (`<PERSON_1>`), app/core/agent/guardrail.py `_MARKER_RE` (`[S12]`) and
+# app/core/lists/service.py `MARKER_RE` (`[[list:lst_<22 chars>]]`).
+_PROTECTED_SPAN_RE = re.compile(
+    r"<[A-Z][A-Z0-9_]*>|\[S[0-9]+\]|\[\[list:lst_[A-Za-z0-9_-]{22}\]\]"
+)
+
+
+def _protected_safe_cut(text: str, pos: int, *, toward_end: bool) -> int:
+    """Move a cut at *pos* out of any protected span it falls inside.
+
+    ``toward_end=False`` (a head's end) moves it back to the span's start, so
+    the span is dropped whole. ``toward_end=True`` (a tail's start) moves it
+    forward to the span's end. A cut exactly on a boundary is kept.
+    """
+    pos = max(0, min(len(text), pos))
+    for match in _PROTECTED_SPAN_RE.finditer(text):
+        if match.start() >= pos:
+            break
+        if match.end() > pos:
+            return match.end() if toward_end else match.start()
+    return pos
+
+
 def _spill_summary_to_file(task_index: int, summary: str) -> Optional[str]:
     """Write a subagent's full summary to the delegation cache and return path.
 
@@ -1642,33 +1790,40 @@ def _spill_summary_to_file(task_index: int, summary: str) -> Optional[str]:
 
 
 def _trim_summary_with_footer(
-    summary: str, cap: int, task_index: int
+    summary: str, cap: int, task_index: int, *, spill: bool = True
 ) -> tuple[str, Optional[str]]:
     """Return (model_text, spill_path) for one over-budget summary.
 
-    Mirrors web_extract's ``_truncate_with_footer``: keep a head+tail window
-    (~75% head / ~25% tail, snapped to line boundaries) so the subagent's
-    opening AND its closing (outcomes / files-changed / issues, which live at
-    the end) both survive, spill the full text to disk, and append a footer
-    telling the parent exactly how much it's seeing and the precise
-    ``read_file offset=`` to page into the omitted middle. Deterministic.
+    Mirrors web_extract's ``_truncate_with_footer``. It keeps a head+tail window
+    (~75% head / ~25% tail, snapped to line boundaries), so the subagent's
+    opening and its closing both survive. Neither cut ever lands inside a
+    placeholder token or a marker (``_PROTECTED_SPAN_RE``). With ``spill`` the
+    full text goes to disk, and the footer gives the exact ``read_file
+    offset=`` for the omitted middle. Without it, nothing is written and the
+    footer names no path. Deterministic.
     """
     original_len = len(summary)
     head_budget = int(cap * 0.75)
     tail_budget = cap - head_budget
 
-    head = summary[:head_budget]
-    tail = summary[-tail_budget:]
+    head_end = head_budget
     # Snap the head cut back to the last newline so we don't slice mid-line.
-    nl = head.rfind("\n")
+    nl = summary.rfind("\n", 0, head_end)
     if nl > head_budget * 0.5:
-        head = head[:nl]
-    # Snap the tail cut forward to the next newline for the same reason.
-    nl = tail.find("\n")
-    if 0 <= nl < tail_budget * 0.5:
-        tail = tail[nl + 1:]
+        head_end = nl
+    head_end = _protected_safe_cut(summary, head_end, toward_end=False)
 
-    spill_path = _spill_summary_to_file(task_index, summary)
+    tail_start = original_len - tail_budget
+    # Snap the tail cut forward to the next newline for the same reason.
+    nl = summary.find("\n", tail_start)
+    if 0 <= nl - tail_start < tail_budget * 0.5:
+        tail_start = nl + 1
+    tail_start = _protected_safe_cut(summary, tail_start, toward_end=True)
+
+    head = summary[:head_end]
+    tail = summary[tail_start:]
+
+    spill_path = _spill_summary_to_file(task_index, summary) if spill else None
 
     footer_lines = [
         "",
@@ -1685,10 +1840,15 @@ def _trim_summary_with_footer(
             f"offset={middle_start_line} limit=200  (the file is the complete "
             f"summary; raise/lower offset to page through it)."
         )
-    else:
+    elif spill:
         footer_lines.append(
             "Full output could not be stored to disk; the head+tail above is "
             "all that was preserved."
+        )
+    else:
+        footer_lines.append(
+            "The middle of the findings was omitted for length and is not "
+            "available; do not state that those findings do not exist."
         )
     footer_lines.append("─" * 37)
 
@@ -1761,6 +1921,7 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
         static_ceiling = int(cfg.get("max_summary_chars", DEFAULT_MAX_SUMMARY_CHARS))
     except (TypeError, ValueError):
         static_ceiling = DEFAULT_MAX_SUMMARY_CHARS
+    spill = _spill_summaries_enabled(cfg)
 
     dynamic_budget = _parent_summary_char_budget(parent_agent, len(summaries))
 
@@ -1776,7 +1937,7 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
             continue
         original_len = len(summary)
         model_text, spill_path = _trim_summary_with_footer(
-            summary, cap, entry.get("task_index", -1)
+            summary, cap, entry.get("task_index", -1), spill=spill
         )
         entry["summary"] = model_text
         entry["summary_truncated"] = True
@@ -2014,7 +2175,14 @@ def _run_single_child(
                     stream_callback=_relay_child_text,
                 )
 
-        _child_future = _timeout_executor.submit(_run_with_thread_capture)
+        # The worker starts with an empty Context. Carry this request's
+        # ContextVars across so the child's tool calls see the end user's
+        # identity, chat id and request id (MCP identity is read from them on the
+        # calling thread). ContextVars only: the worker's approval callback is
+        # the subagent one installed by the initializer above.
+        _child_future = _timeout_executor.submit(
+            propagate_contextvars_to_thread(_run_with_thread_capture)
+        )
         try:
             result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:
@@ -2046,7 +2214,7 @@ def _run_single_child(
                 child_api_calls = int(_summary.get("api_call_count", 0) or 0)
             except Exception:
                 pass
-            if is_timeout and child_api_calls == 0:
+            if is_timeout and child_api_calls == 0 and _live_log_enabled():
                 diagnostic_path = _dump_subagent_timeout_diagnostic(
                     child=child,
                     task_index=task_index,
@@ -2495,6 +2663,11 @@ def delegate_task(
 
     # Load config
     cfg = _load_config()
+    # delegation.background=false: foreground, whatever the caller asked for.
+    # This covers the live model path (run_agent._dispatch_delegate_task
+    # always asks for background) and the registry fallback alike.
+    if background and not _background_enabled(cfg):
+        background = False
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     # Model-supplied max_iterations is ignored — the config value is authoritative
     # so users get predictable budgets. The kwarg is retained for internal callers
@@ -2572,9 +2745,12 @@ def delegate_task(
         wrap_progress_callback,
     )
 
-    live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context
-    )
+    if _live_log_enabled(cfg):
+        live_deleg_id, live_writers, live_paths = create_live_transcripts(
+            task_list, context
+        )
+    else:
+        live_deleg_id, live_writers, live_paths = None, [None] * len(task_list), []
 
     # Save parent tool names BEFORE any child construction mutates the global.
     # _build_child_agent() calls AIAgent() which calls get_tool_definitions(),
@@ -2670,8 +2846,10 @@ def delegate_task(
             with DaemonThreadPoolExecutor(max_workers=max_children) as executor:
                 futures = {}
                 for i, t, child in children:
+                    # One Context copy per child: a Context cannot be entered by
+                    # two threads at once. See _run_single_child for why.
                     future = executor.submit(
-                        _run_single_child,
+                        propagate_contextvars_to_thread(_run_single_child),
                         task_index=i,
                         goal=t["goal"],
                         child=child,
@@ -3415,6 +3593,54 @@ def _build_top_level_description() -> str:
             f"config.yaml to enable nesting."
         )
 
+    try:
+        delegation_cfg = _load_config()
+    except Exception:
+        delegation_cfg = {}
+
+    if _background_enabled(delegation_cfg):
+        run_mode_clause = (
+            "BOTH MODES RUN IN THE BACKGROUND. delegate_task returns immediately — "
+            "you and the user keep working, and the completed result re-enters "
+            "the conversation as a new message. A "
+            "batch returns one handle, runs N subagents concurrently, and delivers "
+            "one consolidated result after ALL of them finish. Do NOT wait or poll; "
+            "just continue with other work after dispatching.\n\n"
+        )
+    else:
+        run_mode_clause = (
+            "BOTH MODES RUN IN THE FOREGROUND. delegate_task waits for every "
+            "subagent and returns all of their results in this same tool call; "
+            "use them in your answer. There is nothing to wait for or poll "
+            "afterwards.\n\n"
+        )
+    if _background_enabled(delegation_cfg):
+        durable_clause = (
+            "- Durable long-running work that must outlive the current turn -> "
+            "use cronjob (action='create') or terminal(background=True, "
+            "notify_on_complete=True) instead. Background delegations are NOT "
+            "durable: if the parent session is closed (/new) or the process exits "
+            "before a subagent finishes, that subagent's work is discarded, and "
+            "/stop cancels every running background subagent.\n\n"
+        )
+    else:
+        durable_clause = (
+            "- Durable long-running work that must outlive the current turn -> "
+            "use cronjob (action='create') or terminal(background=True, "
+            "notify_on_complete=True) instead. Subagents run only inside this "
+            "tool call and their results return in this same call; Stop "
+            "cancels every running subagent.\n\n"
+        )
+    live_transcripts_clause = (
+        "LIVE TRANSCRIPTS: the dispatch response includes 'live_transcripts' — "
+        "one append-only human-readable log file per task (under "
+        "cache/delegation/live/<delegation_id>/). Each child streams its "
+        "assistant text, tool calls, and tool results there while it runs. "
+        "Read (or `tail -f` in a terminal) those paths any time you or the "
+        "user want to see what a subagent is actually doing instead of "
+        "waiting for the final summary.\n\n"
+    )
+
     return (
         "Spawn one or more subagents to work on tasks in isolated contexts. "
         "Each subagent gets its own conversation, terminal session, and toolset. "
@@ -3425,19 +3651,9 @@ def _build_top_level_description() -> str:
         f"2. Batch (parallel): provide 'tasks' array with up to {max_children} "
         f"items concurrently for this user (configured via "
         f"delegation.max_concurrent_children in config.yaml). {nesting_clause}\n\n"
-        "BOTH MODES RUN IN THE BACKGROUND. delegate_task returns immediately — "
-        "you and the user keep working, and the completed result re-enters "
-        "the conversation as a new message. A "
-        "batch returns one handle, runs N subagents concurrently, and delivers "
-        "one consolidated result after ALL of them finish. Do NOT wait or poll; "
-        "just continue with other work after dispatching.\n\n"
-        "LIVE TRANSCRIPTS: the dispatch response includes 'live_transcripts' — "
-        "one append-only human-readable log file per task (under "
-        "cache/delegation/live/<delegation_id>/). Each child streams its "
-        "assistant text, tool calls, and tool results there while it runs. "
-        "Read (or `tail -f` in a terminal) those paths any time you or the "
-        "user want to see what a subagent is actually doing instead of "
-        "waiting for the final summary.\n\n"
+        + run_mode_clause
+        + (live_transcripts_clause if _live_log_enabled(delegation_cfg) else "")
+        +
         "WHEN TO USE delegate_task:\n"
         "- Reasoning-heavy subtasks (debugging, code review, research synthesis)\n"
         "- Tasks that would flood your context with intermediate data\n"
@@ -3446,13 +3662,8 @@ def _build_top_level_description() -> str:
         "- Mechanical multi-step work with no reasoning needed -> use execute_code\n"
         "- Single tool call -> just call the tool directly\n"
         "- Tasks needing user interaction -> subagents cannot use clarify\n"
-        "- Durable long-running work that must outlive the current turn -> "
-        "use cronjob (action='create') or terminal(background=True, "
-        "notify_on_complete=True) instead. Background delegations are NOT "
-        "durable: if the parent session is closed (/new) or the process exits "
-        "before a subagent finishes, that subagent's work is discarded, and "
-        "/stop cancels every running background subagent.\n\n"
-        "IMPORTANT:\n"
+        + durable_clause
+        + "IMPORTANT:\n"
         "- Subagents have NO memory of your conversation. Pass all relevant "
         "info (file paths, error messages, constraints) via the 'context' field.\n"
         "- If the user is writing in a non-English language, or asked for "
@@ -3532,6 +3743,33 @@ def _build_role_param_description() -> str:
     )
 
 
+_BACKGROUND_PARAM_DESCRIPTION = (
+    "DEPRECATED / IGNORED. Top-level single and batch "
+    "delegations run in the background automatically — you do "
+    "not need to (and cannot) opt in or out. A single result or "
+    "consolidated batch result re-enters the conversation when "
+    "the work finishes; just continue working in the meantime. "
+    "Setting this has no effect; the parameter remains only for "
+    "backward compatibility."
+)
+
+
+def _build_background_param_description() -> str:
+    """The 'background' parameter description, following delegation.background."""
+    try:
+        background_on = _background_enabled()
+    except Exception:
+        background_on = True
+    if background_on:
+        return _BACKGROUND_PARAM_DESCRIPTION
+    return (
+        "DEPRECATED / IGNORED. Delegations run in the foreground on this "
+        "install: delegate_task waits for every subagent and returns their "
+        "results in this same tool call. Setting this has no effect; the "
+        "parameter remains only for backward compatibility."
+    )
+
+
 def _build_dynamic_schema_overrides() -> dict:
     """Return per-call schema overrides reflecting current config.
 
@@ -3548,6 +3786,9 @@ def _build_dynamic_schema_overrides() -> dict:
     }
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
+    overrides_params["properties"]["background"]["description"] = (
+        _build_background_param_description()
+    )
 
     return {
         "description": _build_top_level_description(),
@@ -3619,15 +3860,9 @@ DELEGATE_TASK_SCHEMA = {
             },
             "background": {
                 "type": "boolean",
-                "description": (
-                    "DEPRECATED / IGNORED. Top-level single and batch "
-                    "delegations run in the background automatically — you do "
-                    "not need to (and cannot) opt in or out. A single result or "
-                    "consolidated batch result re-enters the conversation when "
-                    "the work finishes; just continue working in the meantime. "
-                    "Setting this has no effect; the parameter remains only for "
-                    "backward compatibility."
-                ),
+                # Default (delegation.background=true) text; the per-call
+                # override swaps in foreground wording when it is false.
+                "description": _BACKGROUND_PARAM_DESCRIPTION,
             },
         },
         "required": [],

@@ -26,6 +26,9 @@ platform_toolsets:
     - ragnarok
     - code_execution
     - skills_readonly
+    # delegate_task (spec 2026-10-13 §5): children get the three above, never
+    # delegate_task itself. Kill switch: remove this line. See `delegation:` below.
+    - delegation
 
 # ── Analysis sandbox (trc-backend spec 2026-09-28-hermes-analysis-sandbox-design) ──
 # execute_code runs scripts in the `hermes-sandbox` container (no network, no files,
@@ -62,6 +65,46 @@ code_execution:
     program when you need many rows, pass answer=False to query when you need only
     the data, and print only results — each figure with its [Sn] marker and date.
     numpy and pandas are available.
+
+# ── Subagents (trc-orchestrator spec 2026-10-13 §5, Phase C) ──────────
+# delegate_task, for multi-section research and reports only (SOUL.md says when).
+# Enabled by `delegation` in platform_toolsets.api_server above.
+# Kill switch: remove it from there.
+delegation:
+  # Foreground only. The API server cannot hand a detached result back to the
+  # user's request: background would end the turn and answer later through a
+  # wake self-POST, a new turn outside the request that carried the identity.
+  background: false
+  # Nothing on disk outside the session DB (invariant I5): no live transcripts
+  # under cache/delegation/live, no summary spill files, no timeout diagnostic
+  # in logs/. Child sessions are in the session DB with parent_session_id.
+  live_log: false
+  spill_summaries: false
+  max_concurrent_children: 3
+  max_spawn_depth: 1
+  max_iterations: 6
+  # Covers one child's whole budget: an LLM turn, up to 60 s waiting for a
+  # Hermes admission slot (`admission_timeout` below), one 190 s ragnarok call
+  # (`timeout` below), and a compose turn. So a child's slow query returns, or
+  # gives up with a structured result, before the child itself is cut off.
+  child_timeout_seconds: 330
+  # Children get the TRC SOUL.md (rules on tokens, [Sn] markers, figures) as
+  # their identity. Upstream default is false.
+  load_soul: true
+  # model / provider deliberately unset: children inherit the route's model and
+  # its provider filters, the data-retention decision in "Served model" below.
+  result_instructions: >-
+    Your reply goes to the assistant that gave you this task, not to the user.
+    Return your findings, not an account of what you did. Give every figure
+    with its unit, its date or period, and its [Sn] marker, exactly as the tool
+    returned them. Copy every placeholder in angle brackets and every [Sn]
+    marker character for character: never rename, renumber, merge, split or
+    drop one, and never replace one with a description. Never summarise a
+    figure away: every figure that bears on the task appears in your reply.
+    Say plainly what you looked for and did not find. Make at most one batch
+    of up to three lookups, issued together in one turn, then return your
+    findings. Never call generate_report or render_report and never publish a
+    report; return findings only.
 
 # ── Loop guardrails (H4) ──────────────────────────────────────────────
 # `hard_stop_enabled` ships false and `max_turns` ships 90: a model looping on
@@ -155,16 +198,32 @@ mcp_servers:
   ragnarok:
     url: http://app:8000/mcp
     forward_user_identity: true
-    # H5. The default is 300 s and the backend now gives up at 150 s
-    # (`QUERY_DEADLINE_SECONDS`), so this sits just above it: the backend is
+    # H5. The default is 300 s. The backend's worst case is 180 s: up to 30 s
+    # waiting for its query admission slot plus the 150 s query deadline
+    # (`QUERY_DEADLINE_SECONDS`). 190 s sits just above that, so the backend is
     # always the side that gives up first, and it gives up with a structured
-    # `timeout` naming the stages that finished. At 300 s a user waited five
-    # minutes on a turn whose generation had finished after 52 s.
+    # result (`busy`, or a `timeout` naming the stages that finished). At 300 s
+    # a user waited five minutes on a turn whose generation had finished after
+    # 52 s.
     #
     # No automatic retry here on purpose — the model's own "let me try once
     # more" is acceptable; a second 150 s wait added by the client doubles the
     # damage without asking anyone.
-    timeout: 160
+    timeout: 190
+    # How long a call may wait for a Hermes concurrency slot (the caps below)
+    # before returning a structured `busy`. Set explicitly; it is part of the
+    # child budget in `delegation.child_timeout_seconds` above.
+    admission_timeout: 60
+    # Independent calls in one turn (one `query` per entity or period) run at
+    # once instead of queueing on one lock. The caps match the backend's query
+    # limiter (QUERY_MAX_CONCURRENT=6, QUERY_MAX_CONCURRENT_PER_USER=3), so a
+    # fourth same-user call waits here for a slot rather than being refused with
+    # `busy`. Each call carries its own end user's identity (per-call
+    # correlation, tools/mcp_tool.py). Rollback: `max_concurrent_calls: 1`, or
+    # `supports_parallel_tool_calls: false`.
+    supports_parallel_tool_calls: true
+    max_concurrent_calls: 6
+    max_concurrent_calls_per_user: 3
     # H1 follow-up: `tools/mcp_tool.py` honours `tools.include`/`exclude` per
     # MCP server. Pin the six end-user tools so `ingest_document` is off the
     # wire by construction. A NEW backend tool must be added here to reach the

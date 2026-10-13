@@ -118,3 +118,28 @@ def propagate_context_to_thread(target: Callable) -> Callable:
         return ctx.run(_inner)
 
     return _runner
+
+
+def propagate_contextvars_to_thread(target: Callable) -> Callable:
+    """Wrap *target* so it runs in a copy of the *current* thread's ContextVars.
+
+    Unlike :func:`propagate_context_to_thread`, this does NOT touch the
+    thread-local approval/sudo callbacks. Use it for workers that install their
+    own. The ``delegate_task`` child executors do
+    (``initializer=_set_subagent_approval_cb``): copying the parent's interactive
+    CLI callback over that one would bring back the subagent ``input()``
+    deadlock it exists to prevent, and the unconditional clear on exit would
+    strip it from the worker.
+
+    It carries everything request-scoped that lives in ContextVars: the end-user
+    identity, chat id and request id (``gateway.session_context``), the gateway
+    session vars, and the bridged-progress callbacks
+    (``tools.trc_sandbox_bridge``). Call it on the parent thread, once per
+    submit, because one ``Context`` cannot be entered by two threads at once.
+    """
+    ctx = contextvars.copy_context()
+
+    def _runner(*args, **kwargs):
+        return ctx.run(target, *args, **kwargs)
+
+    return _runner

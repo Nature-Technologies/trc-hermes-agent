@@ -90,6 +90,33 @@ def test_errors_are_not_cached():
     assert len(calls) == 2
 
 
+@pytest.mark.parametrize("status", ["busy", "timeout"])
+@pytest.mark.parametrize("shape", ["top", "structured", "result_text"])
+def test_busy_and_timeout_results_are_not_cached(status, shape):
+    """A refusal for capacity or a deadline is transient: a retry in the same turn must
+    reach the server again, not replay the refusal."""
+    body = {"status": status, "message": "try again"}
+    result = {
+        "top": body,
+        "structured": {"result": "try again", "structuredContent": body},
+        "result_text": {"result": json.dumps(body)},
+    }[shape]
+    calls = []
+
+    def call():
+        calls.append(1)
+        return json.dumps(result)
+
+    with (
+        patch("gateway.session_context.get_end_user_identity", return_value="tok-a"),
+        patch("gateway.session_context.get_end_user_chat_id", return_value="chat-1"),
+        patch("gateway.session_context.get_end_user_request_id", return_value="msg-b"),
+    ):
+        bridge.cached_bridged_call(Q, {"query": "q"}, call)
+        bridge.cached_bridged_call(Q, {"query": "q"}, call)
+    assert len(calls) == 2
+
+
 def test_different_identity_same_turn_ids_refetches():
     """I1: same chat+message ids but a different identity must NOT share a cached result."""
     calls = []

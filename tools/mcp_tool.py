@@ -46,6 +46,14 @@ Example config::
                               # credential and must not reach servers with no
                               # business seeing it. Streamable HTTP only.
                               # Default: false.
+        max_concurrent_calls: 6       # tools/call in flight at once on this
+                              # server (HTTP only; default 1 = one at a time)
+        max_concurrent_calls_per_user: 3  # per end user (default: the cap above)
+        admission_timeout: 60         # max wait for a slot; then {"status": "busy"}.
+                              # ``timeout`` starts only after admission.
+                              # Unset: 60 s with caps > 1; at cap 1 and on
+                              # stdio the wait is bounded only by the call's
+                              # outer deadline, as before admission control.
         user_identity_header: "X-Hermes-End-User-Jwt"  # outbound header name
                               # for the above (default shown). The value is the
                               # token verbatim — Hermes forwards, never mints.
@@ -105,9 +113,12 @@ Thread safety:
 """
 
 import asyncio
+import base64
+import contextlib
 import contextvars
 import concurrent.futures
 import errno
+import hashlib
 import inspect
 import json
 import logging
@@ -119,6 +130,8 @@ import shutil
 import sys
 import threading
 import time
+import uuid
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Callable
 from datetime import datetime
@@ -344,6 +357,24 @@ _MCP_LOG_LEVEL_MAP = {
 
 _DEFAULT_TOOL_TIMEOUT = 300      # seconds for tool calls
 _DEFAULT_CONNECT_TIMEOUT = 60    # seconds for initial connection per server
+
+# Admission control for tools/call (see MCPServerTask._configure_call_limits).
+# ``max_concurrent_calls`` caps one server's in-flight tools/call; 1 keeps the
+# historical one-at-a-time behaviour on ``_rpc_lock``. The per-user cap defaults
+# to the server cap. ``admission_timeout`` bounds the wait for a slot; it is
+# separate from ``timeout``, which starts only once the call is admitted. Unset,
+# the default applies only to the semaphore path (caps > 1): a call admitted on
+# ``_rpc_lock`` keeps the upstream wait, bounded only by the outer deadline.
+_DEFAULT_MAX_CONCURRENT_CALLS = 1
+_DEFAULT_ADMISSION_TIMEOUT = 60.0
+
+# Key under ``params._meta`` carrying one tools/call's correlation id to the
+# outbound request hook (see _make_end_user_identity_hook).
+_CALL_META_KEY = "hermes_call"
+
+# Slack on the outer _run_on_mcp_loop deadline so the inner admission and call
+# deadlines, which produce the precise errors, always fire first.
+_OUTER_DEADLINE_GRACE_SECONDS = 5.0
 
 # Outbound header carrying the forwarded per-request end-user identity on MCP
 # tool calls (opt-in per server via ``forward_user_identity``; override the name
@@ -1798,11 +1829,24 @@ class ElicitationHandler:
         #
         # The recv-loop task that fires this callback does NOT inherit
         # the agent's contextvars (HERMES_SESSION_PLATFORM etc.). When
-        # the MCP tool wrapper captured the agent's context onto
-        # owner._pending_call_context we replay it here via
+        # the MCP tool wrapper captured the agent's context per call
+        # (owner._call_contexts) we replay it here via
         # contextvars.Context.run so the gateway-platform detection in
         # request_elicitation_consent picks up the right session.
-        captured = getattr(self.owner, "_pending_call_context", None) if self.owner else None
+        resolver = getattr(self.owner, "_elicitation_context", None) if self.owner else None
+        if callable(resolver):
+            captured, ambiguous = resolver()
+        else:
+            captured = getattr(self.owner, "_pending_call_context", None) if self.owner else None
+            ambiguous = False
+        if ambiguous:
+            logger.warning(
+                "MCP server '%s' elicitation arrived with several tool calls in "
+                "flight; declining (cannot tell which session it belongs to)",
+                self.server_name,
+            )
+            self.metrics["declined"] += 1
+            return ElicitResult(action="decline")
 
         def _invoke_consent() -> str:
             if captured is None:
@@ -1873,11 +1917,11 @@ class MCPServerTask:
         "_sampling", "_elicitation",
         "_registered_tool_names", "_auth_type", "_refresh_lock",
         "_rpc_lock", "_pending_refresh_tasks",
-        "_pending_call_context",
-        "_forward_user_identity", "_user_identity_header", "_end_user_identity",
-        "_chat_id_header", "_end_user_chat_id",
-        "_request_id_header", "_end_user_request_id",
-        "_end_user_bridged",
+        "_call_contexts", "_call_identities",
+        "_max_concurrent_calls", "_max_concurrent_calls_per_user",
+        "_admission_timeout", "_call_semaphore", "_user_call_semaphores", "_user_call_holders",
+        "_forward_user_identity", "_user_identity_header",
+        "_chat_id_header", "_request_id_header",
         "_lifecycle_started_at", "_last_tool_call_at",
         "_idle_timeout_seconds", "_max_lifetime_seconds", "_recycled_reason",
         "initialize_result", "_ping_unsupported",
@@ -1926,40 +1970,34 @@ class MCPServerTask:
         # transports for conservative per-server ordering.
         self._rpc_lock = asyncio.Lock()
         self._pending_refresh_tasks: set[asyncio.Task] = set()
-        # contextvars snapshot of the agent task that's currently in
-        # session.call_tool(). The MCP recv loop dispatches incoming
-        # elicitation/create requests on a SEPARATE asyncio task whose
-        # context doesn't inherit HERMES_SESSION_PLATFORM, so the
-        # elicitation handler has no way to detect the gateway session
-        # that triggered the call. Capturing the agent's context here
-        # and replaying it inside the elicitation callback restores
-        # gateway-platform attribution and routes the approval prompt
-        # to the right surface (Telegram, Slack, etc.).
-        self._pending_call_context: Optional[contextvars.Context] = None
+        # contextvars snapshot of the AGENT THREAD for each in-flight tools/call,
+        # keyed like _call_identities. The MCP recv loop dispatches incoming
+        # elicitation/create requests on a separate asyncio task whose context
+        # has no HERMES_SESSION_PLATFORM; the elicitation handler replays the
+        # calling agent's snapshot (see _elicitation_context) so the approval
+        # prompt reaches the right surface (Telegram, Slack, api_server, ...).
+        self._call_contexts: Dict[str, contextvars.Context] = {}
+        # End-user identity / chat / request / bridged flag for each in-flight
+        # tools/call, keyed by the correlation id _make_tool_handler mints per
+        # attempt and removes in its finally. The outbound request hook reads
+        # the entry named in the POST's params._meta.hermes_call, so concurrent
+        # calls can never stamp each other's identity (invariant I1).
+        self._call_identities: Dict[str, "_CallIdentity"] = {}
+        # tools/call admission limits; see _configure_call_limits.
+        self._max_concurrent_calls: int = _DEFAULT_MAX_CONCURRENT_CALLS
+        self._max_concurrent_calls_per_user: int = _DEFAULT_MAX_CONCURRENT_CALLS
+        # None = not configured (see _admission_timeout_of).
+        self._admission_timeout: Optional[float] = None
+        self._call_semaphore: Optional[asyncio.Semaphore] = None
+        self._user_call_semaphores: Dict[str, asyncio.Semaphore] = {}
+        self._user_call_holders: Dict[str, int] = {}
         # Per-request end-user identity forwarding (opt-in, HTTP transport only).
-        # ``_forward_user_identity`` / ``_user_identity_header`` are resolved from
-        # config when the streamable-HTTP transport connects; ``_end_user_identity``
-        # is armed by the tool handler for the duration of ONE tools/call and read
-        # by the outbound httpx request hook.  See
-        # :func:`_make_end_user_identity_hook`.
+        # ``_forward_user_identity`` / the header names are resolved from config
+        # when the streamable-HTTP transport connects.
         self._forward_user_identity: bool = False
         self._user_identity_header: str = _DEFAULT_USER_IDENTITY_HEADER
-        self._end_user_identity: Optional[str] = None
-        # The conversation and turn ids ride the same opt-in, the same arming
-        # window and the same hook as the identity above.
         self._chat_id_header: str = _DEFAULT_CHAT_ID_HEADER
-        self._end_user_chat_id: Optional[str] = None
         self._request_id_header: str = _DEFAULT_REQUEST_ID_HEADER
-        self._end_user_request_id: Optional[str] = None
-        # Whether the current tools/call was issued by a sandboxed script rather than
-        # the model directly.  Armed by _make_tool_handler (on the agent thread, in the
-        # same breath as identity / chat / request) from the _BRIDGED ContextVar that
-        # tools/trc_sandbox_bridge._serve_bridged_call sets for the duration of its
-        # dispatch.  The outbound HTTP-request hook stamps X-Hermes-Bridged: 1 when
-        # this is True, and actively removes it when False, so a stale True from the
-        # previous call can never leak to the next one.  Never set without that hook
-        # running; always cleared in the same finally as identity.
-        self._end_user_bridged: bool = False
         now = time.monotonic()
         self._lifecycle_started_at: float = now
         self._last_tool_call_at: float = now
@@ -1982,6 +2020,65 @@ class MCPServerTask:
     def _is_http(self) -> bool:
         """Check if this server uses HTTP transport."""
         return "url" in self._config
+
+    def _configure_call_limits(self, config: dict) -> None:
+        """Read the tools/call admission limits from this server's config.
+
+        ``max_concurrent_calls`` (default 1) and ``max_concurrent_calls_per_user``
+        (default and ceiling: ``max_concurrent_calls``) apply to HTTP servers
+        only. A stdio server is one JSON-RPC stream and stays serialized on
+        ``_rpc_lock`` whatever the config says. An explicit ``admission_timeout``
+        bounds the wait for a slot on every transport. Unset, it is None: the
+        semaphore path then uses the 60 s default and the ``_rpc_lock`` path
+        keeps the upstream wait (see _admission_timeout_of).
+        """
+        max_calls = _safe_numeric(
+            config.get("max_concurrent_calls", _DEFAULT_MAX_CONCURRENT_CALLS),
+            _DEFAULT_MAX_CONCURRENT_CALLS, int,
+        )
+        per_user = _safe_numeric(
+            config.get("max_concurrent_calls_per_user", max_calls), max_calls, int,
+        )
+        if "url" not in config:
+            max_calls = per_user = 1
+        per_user = min(per_user, max_calls)
+        # Before the unchanged-caps return: a change to admission_timeout alone
+        # must still take effect on reconnect.
+        if config.get("admission_timeout") is None:
+            self._admission_timeout = None
+        else:
+            self._admission_timeout = _safe_numeric(
+                config["admission_timeout"],
+                _DEFAULT_ADMISSION_TIMEOUT, float, minimum=0.1,
+            )
+        unchanged = (
+            (max_calls, per_user)
+            == (self._max_concurrent_calls, self._max_concurrent_calls_per_user)
+            and (max_calls == 1 or self._call_semaphore is not None)
+        )
+        if unchanged:
+            # run() calls this on every (re)connect. Keep the live semaphores so
+            # calls already admitted still count against the caps.
+            return
+        self._max_concurrent_calls = max_calls
+        self._max_concurrent_calls_per_user = per_user
+        self._call_semaphore = asyncio.Semaphore(max_calls) if max_calls > 1 else None
+        self._user_call_semaphores = {}
+        self._user_call_holders = {}
+
+    def _elicitation_context(self) -> "tuple[Optional[contextvars.Context], bool]":
+        """``(context, ambiguous)`` for an elicitation arriving now.
+
+        The SDK does not tell the callback which tools/call an elicitation
+        belongs to. With exactly one call in flight it is that call's agent
+        context. With several it is ambiguous, and replaying the wrong one
+        would route an approval prompt to another user's session, so the
+        caller declines instead. With none there is nothing to replay.
+        """
+        contexts = list(self._call_contexts.values())
+        if len(contexts) == 1:
+            return contexts[0], False
+        return None, len(contexts) > 1
 
     def _advertises_tools(self) -> bool:
         """Whether the server advertises the ``tools`` capability.
@@ -3148,6 +3245,7 @@ class MCPServerTask:
         """
         self._config = config
         self.tool_timeout = config.get("timeout", _DEFAULT_TOOL_TIMEOUT)
+        self._configure_call_limits(config)
         self._auth_type = (config.get("auth") or "").lower().strip()
         self._idle_timeout_seconds = _get_lifecycle_seconds(config, "idle_timeout_seconds")
         self._max_lifetime_seconds = _get_lifecycle_seconds(config, "max_lifetime_seconds")
@@ -3996,6 +4094,10 @@ def _handle_auth_error_and_retry(
             except (json.JSONDecodeError, TypeError):
                 _reset_server_error(server_name)
                 return result
+        except MCPAdmissionTimeout:
+            # The retry queued for a slot and gave up: the server is full, not
+            # failing and not unauthorized. The caller answers busy, no strike.
+            raise
         except Exception as retry_exc:
             logger.warning(
                 "MCP %s/%s retry after auth recovery failed: %s",
@@ -4192,6 +4294,9 @@ def _handle_session_expired_and_retry(
         except (json.JSONDecodeError, TypeError):
             _reset_server_error(server_name)
             return result
+    except MCPAdmissionTimeout:
+        # Queued, never sent: let the caller answer busy, not count a failure.
+        raise
     except Exception as retry_exc:
         logger.warning(
             "MCP %s/%s retry after session reconnect failed: %s",
@@ -4325,64 +4430,242 @@ def _filter_mcp_children(pids: set) -> set:
     return filtered
 
 
+@dataclass(frozen=True)
+class _CallIdentity:
+    """End-user metadata for ONE tools/call, keyed by its correlation id."""
+
+    identity: Optional[str]
+    chat_id: Optional[str]
+    request_id: Optional[str]
+    bridged: bool
+
+
+class MCPAdmissionTimeout(Exception):
+    """A tools/call waited ``admission_timeout`` for a slot and gave up.
+
+    The server was never asked, so this is not a transport failure and the
+    circuit breaker must not count it.
+    """
+
+
+def _call_id_from_request(request) -> Optional[str]:
+    """The correlation id in an outbound JSON-RPC POST body, or ``None``.
+
+    Only a ``tools/call`` that _make_tool_handler issued carries one, under
+    ``params._meta.hermes_call``. initialize, list_tools, notifications, GET
+    and DELETE return ``None`` and are therefore stamped with NO identity. An
+    unreadable or unexpected body also returns ``None``: fail closed.
+    """
+    if request.method != "POST":
+        return None
+    try:
+        body = request.content
+    except Exception:  # httpx.RequestNotRead: a streamed body we cannot see
+        return None
+    if not body:
+        return None
+    try:
+        message = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(message, dict) or message.get("method") != "tools/call":
+        return None
+    params = message.get("params")
+    meta = params.get("_meta") if isinstance(params, dict) else None
+    call_id = meta.get(_CALL_META_KEY) if isinstance(meta, dict) else None
+    return call_id if isinstance(call_id, str) and call_id else None
+
+
+def _server_call_map(server: Any, attr: str) -> dict:
+    """The per-call dict *attr* on *server*, created on first use.
+
+    Duck-typed on purpose: tests and helpers hand in lightweight stand-ins
+    (SimpleNamespace, MagicMock) rather than an MCPServerTask.
+    """
+    calls = getattr(server, attr, None)
+    if not isinstance(calls, dict):
+        calls = {}
+        try:
+            setattr(server, attr, calls)
+        except AttributeError:
+            pass
+    return calls
+
+
+def _end_user_slot_key(identity: Optional[str]) -> str:
+    """The per-end-user admission key for *identity*. Never the token itself.
+
+    Open WebUI mints a fresh JWT per request (``iat``/``exp`` change), so the
+    raw token cannot key a per-user cap. Use the unverified ``sub`` claim: this
+    is a fairness key, not an authorization decision, and the MCP server still
+    verifies every POST's signature. An undecodable token falls back to a hash
+    of the token; no identity shares one anonymous bucket.
+    """
+    if not identity:
+        return "anon"
+    try:
+        payload = identity.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        sub = json.loads(base64.urlsafe_b64decode(payload)).get("sub")
+        if isinstance(sub, (str, int)) and str(sub):
+            return "sub:" + hashlib.sha256(str(sub).encode()).hexdigest()[:16]
+    except Exception:
+        pass
+    return "tok:" + hashlib.sha256(identity.encode()).hexdigest()[:16]
+
+
+def _admission_timeout_of(server: Any) -> Optional[float]:
+    """The bound on one tools/call's wait for a slot on *server*, or None.
+
+    An explicit ``admission_timeout`` applies on every path. Unset (or a
+    stand-in without one), a call admitted on ``_rpc_lock`` (cap 1, any stdio
+    server) gets None: the wait is bounded only by the outer call deadline, the
+    behaviour before admission control. The semaphore path (caps > 1) gets the
+    default.
+    """
+    value = getattr(server, "_admission_timeout", None)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if isinstance(getattr(server, "_call_semaphore", None), asyncio.Semaphore):
+        return _DEFAULT_ADMISSION_TIMEOUT
+    return None
+
+
+def _outer_call_deadline(tool_timeout: Optional[float], server: Any) -> Optional[float]:
+    """Safety-net deadline for _run_on_mcp_loop around one tools/call.
+
+    The real limits live inside _call: ``admission_timeout`` for the wait,
+    then ``tool_timeout`` from admission. This only has to outlast both. With
+    no admission bound (the default ``_rpc_lock`` path) it is ``tool_timeout``
+    plus grace, so lock wait and call share that one deadline as upstream.
+    """
+    if tool_timeout is None:
+        return None
+    admission = _admission_timeout_of(server) or 0.0
+    return float(tool_timeout) + admission + _OUTER_DEADLINE_GRACE_SECONDS
+
+
+@contextlib.asynccontextmanager
+async def _admit_call(server: Any, slot_key: str):
+    """Hold one tools/call admission slot on *server* for the block.
+
+    With ``max_concurrent_calls`` 1 (and on every stdio server) the slot is
+    ``_rpc_lock``, which keeps today's ordering against list_tools refreshes
+    and resource/prompt RPCs. Above 1 it is the end user's semaphore, then the
+    server's, always in that order so two calls can never each hold the one
+    the other waits for. The wait is bounded by ``admission_timeout``
+    (_admission_timeout_of; None = unbounded here, the outer deadline still
+    applies); on expiry whatever was taken is released and
+    MCPAdmissionTimeout raised.
+    """
+    admission = _admission_timeout_of(server)
+
+    def _busy() -> MCPAdmissionTimeout:
+        return MCPAdmissionTimeout(
+            f"MCP server '{getattr(server, 'name', '?')}' is busy: no call slot "
+            f"freed up within {admission:g}s. Retry shortly or make fewer calls "
+            f"at once."
+        )
+
+    server_sem = getattr(server, "_call_semaphore", None)
+    if not isinstance(server_sem, asyncio.Semaphore):
+        # Entered as an async context manager (not acquire()/release()) so
+        # duck-typed stand-ins whose _rpc_lock is a MagicMock keep working.
+        async with contextlib.AsyncExitStack() as held:
+            try:
+                async with asyncio.timeout(admission):
+                    await held.enter_async_context(server._rpc_lock)
+            except TimeoutError:
+                raise _busy() from None
+            yield
+        return
+
+    # Everything below runs on the single MCP event loop thread, so the two
+    # dicts need no lock. The holder count includes calls still waiting, so a
+    # user's semaphore is dropped only when nobody holds or awaits it.
+    user_sems = _server_call_map(server, "_user_call_semaphores")
+    holders = _server_call_map(server, "_user_call_holders")
+    user_sem = user_sems.get(slot_key)
+    if user_sem is None:
+        user_sem = asyncio.Semaphore(server._max_concurrent_calls_per_user)
+        user_sems[slot_key] = user_sem
+    holders[slot_key] = holders.get(slot_key, 0) + 1
+    try:
+        async with contextlib.AsyncExitStack() as held:
+            try:
+                async with asyncio.timeout(admission):
+                    await held.enter_async_context(user_sem)
+                    await held.enter_async_context(server_sem)
+            except TimeoutError:
+                raise _busy() from None
+            yield
+    finally:
+        left = holders.get(slot_key, 1) - 1
+        if left > 0:
+            holders[slot_key] = left
+        else:
+            holders.pop(slot_key, None)
+            if user_sems.get(slot_key) is user_sem:
+                user_sems.pop(slot_key, None)
+
+
 def _make_end_user_identity_hook(
     server: Any,
     header_name: str,
     session_header_name: Optional[str] = None,
     request_header_name: Optional[str] = None,
 ):
-    """Return an httpx ``request`` hook that stamps the armed end-user identity.
+    """Return an httpx ``request`` hook that stamps each call's own end user.
 
     Why a hook rather than a header on the client: the streamable-HTTP transport
     opens ONE long-lived ``httpx.AsyncClient`` per configured server at startup
     (see :meth:`MCPServerTask._run_http`), so its header block is process-wide by
-    construction and cannot carry a per-request value.  Each ``tools/call`` is
+    construction and cannot carry a per-request value. Each ``tools/call`` is
     still its own HTTP POST on that client, and this hook runs per POST.
 
-    Per-request correctness rests on one invariant: the identity is read from
-    ``server._end_user_identity``, which :func:`_make_tool_handler` arms for
-    exactly the duration of one ``tools/call`` while holding the per-server
-    ``_rpc_lock``.  That lock already serializes client-initiated RPCs, so at
-    most one identity is ever armed and it belongs to the call in flight.
+    Why the body rather than shared state: the SDK sends every POST from the
+    transport's own task, so neither a ContextVar nor a "currently armed"
+    attribute can say which call a POST belongs to once calls run
+    concurrently. :func:`_make_tool_handler` puts a correlation id in the call's
+    ``params._meta.hermes_call`` and the call's metadata in
+    ``server._call_identities`` under that id; this hook reads the id from the
+    JSON-RPC body it is about to send and stamps THAT entry.
 
-    When nothing is armed the header is actively removed rather than left alone,
-    so an absent identity can never inherit a client-level default or a value
-    from a previous caller.  Missing identity means no identity.
-
-    ``session_header_name`` / ``request_header_name`` stamp the conversation and
-    turn ids the same way, from ``server._end_user_chat_id`` /
-    ``server._end_user_request_id``. Those values are armed and cleared together
-    with the identity by :func:`_make_tool_handler`, so a POST carries all of
-    them or none — never a caller without their conversation, which is the shape
-    that silently breaks a namespace keyed on the pair.
+    A POST with no matching entry (initialize, list_tools, notifications, a
+    call already finished) gets every identity header actively removed, so it
+    can never inherit a client-level default or another caller's value.
+    Missing identity means no identity. Identity, chat id and request id come
+    from the same entry, so a POST carries all of them or none of them.
     """
     async def _stamp_end_user_identity(request) -> None:
-        token = getattr(server, "_end_user_identity", None)
+        call_id = _call_id_from_request(request)
+        entries = getattr(server, "_call_identities", None) or {}
+        entry = entries.get(call_id) if call_id else None
+
+        token = entry.identity if entry else None
         if token:
             request.headers[header_name] = token
         else:
             request.headers.pop(header_name, None)
 
         if session_header_name:
-            chat_id = getattr(server, "_end_user_chat_id", None)
+            chat_id = entry.chat_id if entry else None
             if chat_id:
                 request.headers[session_header_name] = chat_id
             else:
                 request.headers.pop(session_header_name, None)
 
         if request_header_name:
-            req_id = getattr(server, "_end_user_request_id", None)
+            req_id = entry.request_id if entry else None
             if req_id:
                 request.headers[request_header_name] = req_id
             else:
                 request.headers.pop(request_header_name, None)
 
-        # Bridged calls (tool calls a sandbox script makes) carry X-Hermes-Bridged: 1
-        # so the backend can hold their tokens PENDING rather than DELIVERED.  The
-        # header is actively REMOVED when not bridged — an absent or False value must
-        # never inherit a True from a previous call (the "arm for one call" invariant
-        # that identity enforces via _rpc_lock applies here too).
-        if getattr(server, "_end_user_bridged", False):
+        # Bridged calls (tool calls a sandbox script makes) carry
+        # X-Hermes-Bridged: 1 so the backend holds their tokens PENDING rather
+        # than DELIVERED. Removed whenever this POST's own entry is not bridged.
+        if entry is not None and entry.bridged:
             request.headers["X-Hermes-Bridged"] = "1"
         else:
             request.headers.pop("X-Hermes-Bridged", None)
@@ -4900,8 +5183,12 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         # (trc_sandbox_bridge._serve_bridged_call sets the ContextVar; a model-
         # direct call reads the default False).  Captured here, on the agent
         # thread, for the same reason as identity — the ContextVar cannot be
-        # read on the MCP loop, so we arm a plain attribute instead (below).
+        # read on the MCP loop, so it rides this call's _CallIdentity entry (below).
         end_user_bridged = _resolve_end_user_bridged()
+        # Elicitation context for THIS call, captured on the agent thread
+        # (the loop thread's context has no gateway session vars).
+        agent_context = contextvars.copy_context()
+        slot_key = _end_user_slot_key(end_user_identity)
 
         # One line per hop, so a broken metadata chain is visible without a
         # debugger. Identities, presence flags and names only -- never the token
@@ -4917,30 +5204,44 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         )
 
         async def _call():
+            # One id per attempt: an auth / session-expiry retry re-enters here
+            # and gets a fresh entry, never a half-finished one.
+            call_id = uuid.uuid4().hex
             _mark_server_call_started(server)
-            async with server._rpc_lock:
-                # Snapshot the agent's context so an elicitation callback
-                # triggered during this call (fired on the MCP recv loop
-                # task, which doesn't inherit our contextvars) can replay
-                # it and detect the gateway platform / session for routing.
-                server._pending_call_context = contextvars.copy_context()
-                # Arm for exactly this round trip. _rpc_lock is held across it,
-                # so the outbound POST the hook stamps is unambiguously this
-                # call's -- and the finally guarantees nothing stays armed for
-                # the next caller. All are cleared even if only one was set, so a
-                # later call can never inherit half a caller's context.
-                server._end_user_identity = end_user_identity
-                server._end_user_chat_id = end_user_chat_id
-                server._end_user_request_id = end_user_request_id
-                server._end_user_bridged = end_user_bridged
+            contexts = _server_call_map(server, "_call_contexts")
+            identities = _server_call_map(server, "_call_identities")
+            async with _admit_call(server, slot_key):
+                contexts[call_id] = agent_context
                 try:
-                    result = await server.session.call_tool(tool_name, arguments=args)
+                    if getattr(server, "_forward_user_identity", False) is True:
+                        identities[call_id] = _CallIdentity(
+                            identity=end_user_identity,
+                            chat_id=end_user_chat_id,
+                            request_id=end_user_request_id,
+                            bridged=end_user_bridged,
+                        )
+                        pending = server.session.call_tool(
+                            tool_name, arguments=args,
+                            meta={_CALL_META_KEY: call_id},
+                        )
+                    else:
+                        pending = server.session.call_tool(tool_name, arguments=args)
+                    # The call's own deadline starts here, after admission, so
+                    # time spent queued for a slot never eats into it.
+                    if tool_timeout is None:
+                        result = await pending
+                    else:
+                        try:
+                            async with asyncio.timeout(float(tool_timeout)):
+                                result = await pending
+                        except TimeoutError:
+                            raise TimeoutError(
+                                f"MCP call timed out after {float(tool_timeout):.1f}s "
+                                f"(configured timeout: {float(tool_timeout):.1f}s)"
+                            ) from None
                 finally:
-                    server._end_user_identity = None
-                    server._end_user_chat_id = None
-                    server._end_user_request_id = None
-                    server._end_user_bridged = False
-                    server._pending_call_context = None
+                    identities.pop(call_id, None)
+                    contexts.pop(call_id, None)
             # The RPC round-trip completed — the session is demonstrably
             # healthy at the transport level (even if the tool itself
             # returned isError). Clear the rapid-drop budget (#62212).
@@ -5030,7 +5331,13 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             return json.dumps({"result": text_result}, ensure_ascii=False)
 
         def _call_once():
-            return _run_on_mcp_loop(_call, timeout=tool_timeout)
+            return _run_on_mcp_loop(
+                _call, timeout=_outer_call_deadline(tool_timeout, server),
+            )
+
+        def _busy_result(exc: MCPAdmissionTimeout) -> str:
+            logger.warning("MCP tool %s/%s not admitted: %s", server_name, tool_name, exc)
+            return json.dumps({"status": "busy", "error": str(exc)}, ensure_ascii=False)
 
         try:
             result = _call_once()
@@ -5045,26 +5352,36 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             return result
         except InterruptedError:
             return _interrupted_call_result()
+        except MCPAdmissionTimeout as exc:
+            # Queued, never sent: the server is not failing, it is full. Not a
+            # breaker strike, and the same ``busy`` status the backend uses.
+            return _busy_result(exc)
         except Exception as exc:
-            # Auth-specific recovery path: consult the manager, signal
-            # reconnect if viable, retry once. Returns None to fall
-            # through for non-auth exceptions.
-            recovered = _handle_auth_error_and_retry(
-                server_name, exc, _call_once,
-                f"tools/call {tool_name}",
-            )
-            if recovered is not None:
-                return recovered
+            try:
+                # Auth-specific recovery path: consult the manager, signal
+                # reconnect if viable, retry once. Returns None to fall
+                # through for non-auth exceptions.
+                recovered = _handle_auth_error_and_retry(
+                    server_name, exc, _call_once,
+                    f"tools/call {tool_name}",
+                )
+                if recovered is not None:
+                    return recovered
 
-            # Transport session expiry (#13383): same reconnect flow
-            # but skips OAuth recovery because the access token is
-            # still valid — only the server-side session is stale.
-            recovered = _handle_session_expired_and_retry(
-                server_name, exc, _call_once,
-                f"tools/call {tool_name}",
-            )
-            if recovered is not None:
-                return recovered
+                # Transport session expiry (#13383): same reconnect flow
+                # but skips OAuth recovery because the access token is
+                # still valid — only the server-side session is stale.
+                recovered = _handle_session_expired_and_retry(
+                    server_name, exc, _call_once,
+                    f"tools/call {tool_name}",
+                )
+                if recovered is not None:
+                    return recovered
+            except MCPAdmissionTimeout as busy_exc:
+                # The retry after a reconnect queued behind the other calls
+                # retrying at once (a session expiry hits every in-flight call)
+                # and gave up waiting. Busy, not a breaker strike.
+                return _busy_result(busy_exc)
 
             _bump_server_error(server_name)
             logger.error(

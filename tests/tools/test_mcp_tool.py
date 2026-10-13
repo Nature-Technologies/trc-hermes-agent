@@ -2345,8 +2345,16 @@ class TestConfigurableTimeouts:
         asyncio.run(_test())
 
     def test_timeout_passed_to_handler(self):
-        """The tool handler uses the server's configured timeout."""
-        from tools.mcp_tool import _make_tool_handler, _servers
+        """The outer deadline covers the configured timeout (plus any admission wait).
+
+        The configured timeout itself is enforced inside the call, from the
+        moment the call is admitted (see test_mcp_parallel_calls.py).
+        """
+        from tools.mcp_tool import (
+            _OUTER_DEADLINE_GRACE_SECONDS,
+            _make_tool_handler,
+            _servers,
+        )
 
         mock_session = MagicMock()
         mock_session.call_tool = AsyncMock(
@@ -2365,11 +2373,12 @@ class TestConfigurableTimeouts:
 
                 mock_run.side_effect = fake_run
                 handler({})
-                # Verify timeout=180 was passed
-                call_kwargs = mock_run.call_args
-                assert call_kwargs.kwargs.get("timeout") == 180 or \
-                       (len(call_kwargs.args) > 1 and call_kwargs.args[1] == 180) or \
-                       call_kwargs[1].get("timeout") == 180
+                # No admission_timeout configured and a cap of 1: the call
+                # admits on _rpc_lock, bounded (as upstream) only by this
+                # deadline, so it adds no admission allowance.
+                assert mock_run.call_args.kwargs["timeout"] == (
+                    180 + _OUTER_DEADLINE_GRACE_SECONDS
+                )
         finally:
             _servers.pop("test_srv", None)
 

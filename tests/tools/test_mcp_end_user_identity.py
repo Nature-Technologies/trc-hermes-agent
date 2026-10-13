@@ -140,7 +140,11 @@ def _wire_outbound(server, client_kwargs: dict, outbound: list):
     hooks = dict(client_kwargs.get("event_hooks") or {})
     static_headers = dict(client_kwargs.get("headers") or {})
 
-    async def _call_tool(tool_name, arguments=None, **kwargs):
+    async def _call_tool(tool_name, arguments=None, *, meta=None, **kwargs):
+        # Same body shape the SDK sends: ``meta`` rides as ``params._meta``.
+        params = {"name": tool_name, "arguments": arguments or {}}
+        if meta is not None:
+            params["_meta"] = meta
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(_transport),
             headers=static_headers,
@@ -150,7 +154,7 @@ def _wire_outbound(server, client_kwargs: dict, outbound: list):
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "tools/call",
-                "params": {"name": tool_name, "arguments": arguments or {}},
+                "params": params,
             })
         return _ok_result()
 
@@ -266,7 +270,7 @@ def test_identity_is_released_after_each_call(ragnarok, identity):
     identity(TOKEN_ALICE)
     handler({"q": "x"})
 
-    assert server._end_user_identity is None
+    assert server._call_identities == {}
 
 
 def test_a_later_anonymous_call_does_not_inherit_the_previous_token(ragnarok):
@@ -335,7 +339,7 @@ def test_server_without_optin_never_receives_the_identity(ragnarok, identity):
 
     assert json.loads(result) == {"result": "ok"}
     assert OUTBOUND_HEADER not in outbound[0]
-    assert server._end_user_identity is None
+    assert server._call_identities == {}
 
 
 def test_optin_server_installs_a_request_hook_and_optout_does_not():

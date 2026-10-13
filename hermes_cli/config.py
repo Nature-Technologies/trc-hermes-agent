@@ -2434,6 +2434,27 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+        # Live per-child transcripts under cache/delegation/live/ and the
+        # zero-API-call timeout diagnostic under logs/. false = neither is
+        # written; child sessions still go to the session DB.
+        "live_log": True,
+        # Write an over-budget subagent summary's full text to
+        # cache/delegation/ and point the parent at it with read_file. false =
+        # trim in place, write nothing, name no path.
+        "spill_summaries": True,
+        # Replaces the generic end-of-task summary instruction in every child's
+        # prompt (what you did / files modified). Empty = the generic one.
+        "result_instructions": "",
+        # Model-issued delegations run in the background by default: the result
+        # comes back as a new message later. false = always foreground: the tool
+        # call returns the children's results in the same turn, children stay
+        # interruptible by Stop, and nothing is queued for a wake. A stateless
+        # HTTP deployment that must answer within the request (TRC) sets false.
+        "background": True,
+        # Give each child the deployment's SOUL.md as its identity. false
+        # (default) = children run on the stock agent identity. A deployment
+        # whose SOUL.md holds rules every answer must follow sets true.
+        "load_soul": False,
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
