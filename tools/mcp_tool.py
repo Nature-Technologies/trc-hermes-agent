@@ -4060,6 +4060,10 @@ def _handle_auth_error_and_retry(
             except (json.JSONDecodeError, TypeError):
                 _reset_server_error(server_name)
                 return result
+        except MCPAdmissionTimeout:
+            # The retry queued for a slot and gave up: the server is full, not
+            # failing and not unauthorized. The caller answers busy, no strike.
+            raise
         except Exception as retry_exc:
             logger.warning(
                 "MCP %s/%s retry after auth recovery failed: %s",
@@ -4256,6 +4260,9 @@ def _handle_session_expired_and_retry(
         except (json.JSONDecodeError, TypeError):
             _reset_server_error(server_name)
             return result
+    except MCPAdmissionTimeout:
+        # Queued, never sent: let the caller answer busy, not count a failure.
+        raise
     except Exception as retry_exc:
         logger.warning(
             "MCP %s/%s retry after session reconnect failed: %s",
@@ -5278,6 +5285,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 _call, timeout=_outer_call_deadline(tool_timeout, server),
             )
 
+        def _busy_result(exc: MCPAdmissionTimeout) -> str:
+            logger.warning("MCP tool %s/%s not admitted: %s", server_name, tool_name, exc)
+            return json.dumps({"status": "busy", "error": str(exc)}, ensure_ascii=False)
+
         try:
             result = _call_once()
             # _call_once returned, so the round trip completed: the server is
@@ -5294,28 +5305,33 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         except MCPAdmissionTimeout as exc:
             # Queued, never sent: the server is not failing, it is full. Not a
             # breaker strike, and the same ``busy`` status the backend uses.
-            logger.warning("MCP tool %s/%s not admitted: %s", server_name, tool_name, exc)
-            return json.dumps({"status": "busy", "error": str(exc)}, ensure_ascii=False)
+            return _busy_result(exc)
         except Exception as exc:
-            # Auth-specific recovery path: consult the manager, signal
-            # reconnect if viable, retry once. Returns None to fall
-            # through for non-auth exceptions.
-            recovered = _handle_auth_error_and_retry(
-                server_name, exc, _call_once,
-                f"tools/call {tool_name}",
-            )
-            if recovered is not None:
-                return recovered
+            try:
+                # Auth-specific recovery path: consult the manager, signal
+                # reconnect if viable, retry once. Returns None to fall
+                # through for non-auth exceptions.
+                recovered = _handle_auth_error_and_retry(
+                    server_name, exc, _call_once,
+                    f"tools/call {tool_name}",
+                )
+                if recovered is not None:
+                    return recovered
 
-            # Transport session expiry (#13383): same reconnect flow
-            # but skips OAuth recovery because the access token is
-            # still valid — only the server-side session is stale.
-            recovered = _handle_session_expired_and_retry(
-                server_name, exc, _call_once,
-                f"tools/call {tool_name}",
-            )
-            if recovered is not None:
-                return recovered
+                # Transport session expiry (#13383): same reconnect flow
+                # but skips OAuth recovery because the access token is
+                # still valid — only the server-side session is stale.
+                recovered = _handle_session_expired_and_retry(
+                    server_name, exc, _call_once,
+                    f"tools/call {tool_name}",
+                )
+                if recovered is not None:
+                    return recovered
+            except MCPAdmissionTimeout as busy_exc:
+                # The retry after a reconnect queued behind the other calls
+                # retrying at once (a session expiry hits every in-flight call)
+                # and gave up waiting. Busy, not a breaker strike.
+                return _busy_result(busy_exc)
 
             _bump_server_error(server_name)
             logger.error(

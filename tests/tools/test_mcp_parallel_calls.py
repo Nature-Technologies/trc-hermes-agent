@@ -684,3 +684,69 @@ def test_an_admission_timeout_on_the_rpc_lock_path_raises_busy_and_frees_the_loc
         assert not server._rpc_lock.locked()
 
     asyncio.run(_go())
+
+
+@pytest.mark.parametrize("first_error", ["auth", "session_expired"])
+def test_a_retry_that_times_out_in_admission_is_busy_not_a_breaker_strike(
+    monkeypatch, first_error,
+):
+    """Review fix (B3): a session expiry or 401 hits every in-flight call at
+    once, so their post-reconnect retries pile into one queue. A retry that
+    gives up waiting for a slot must answer busy and leave the breaker alone,
+    never ``needs_reauth`` or a transport failure."""
+    import asyncio
+
+    from mcp.client.auth import OAuthFlowError
+
+    from tests.tools.test_mcp_circuit_breaker import _cleanup, _install_stub_server
+    from tools import mcp_tool
+    from tools.mcp_oauth_manager import get_manager, reset_manager_for_tests
+
+    name = "srv-retry-busy"
+    calls = {"n": 0}
+
+    async def _call_tool(*a, **kw):
+        calls["n"] += 1
+        if first_error == "auth":
+            raise OAuthFlowError("token rejected")
+        raise RuntimeError("Invalid params: Invalid or expired session")
+
+    reset_manager_for_tests()
+
+    async def _h401(name, token=None):
+        return True
+
+    monkeypatch.setattr(get_manager(), "handle_401", _h401)
+
+    server = _install_stub_server(mcp_tool, name, _call_tool)
+    server._rpc_lock = asyncio.Lock()
+    server._admission_timeout = 0.1
+    mcp_tool._ensure_mcp_loop()
+
+    # The reconnect "succeeds", but meanwhile the other retrying calls have
+    # taken the slot, so this call's retry waits and gives up.
+    def _reconnect_while_others_take_the_slot(*a, **kw):
+        async def _take():
+            await server._rpc_lock.acquire()
+        mcp_tool._run_on_mcp_loop(_take, timeout=5)
+        return True
+
+    monkeypatch.setattr(
+        mcp_tool, "_signal_reconnect_and_wait", _reconnect_while_others_take_the_slot,
+    )
+    try:
+        handler = mcp_tool._make_tool_handler(name, "tool1", 5.0)
+        result = json.loads(handler({}))
+    finally:
+        async def _free():
+            if server._rpc_lock.locked():
+                server._rpc_lock.release()
+        mcp_tool._run_on_mcp_loop(_free, timeout=5)
+        counts = mcp_tool._server_error_counts.get(name, 0)
+        _cleanup(mcp_tool, name)
+
+    assert result.get("status") == "busy", result
+    assert "busy" in result["error"]
+    assert "needs_reauth" not in result
+    assert calls["n"] == 1  # the retry never reached the server
+    assert counts == 0
