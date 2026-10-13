@@ -196,7 +196,9 @@ platforms:
 
 mcp_servers:
   ragnarok:
-    url: http://app:8000/mcp
+    # Trailing slash: RAGnarok mounts MCP at `/mcp/`, so `/mcp` costs a 307 on
+    # every call (and that redirect once dropped the end-user identity).
+    url: http://app:8000/mcp/
     forward_user_identity: true
     # H5. The default is 300 s. The backend's worst case is 180 s: up to 30 s
     # waiting for its query admission slot plus the 150 s query deadline

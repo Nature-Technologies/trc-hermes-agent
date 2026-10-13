@@ -273,6 +273,54 @@ def test_a_request_without_a_live_entry_carries_no_identity(body):
     assert BRIDGED_HEADER not in headers
 
 
+def test_identity_survives_a_redirect_to_the_trailing_slash_endpoint():
+    """RAGnarok mounts MCP at ``/mcp/``, so a POST to ``/mcp`` is 307-redirected.
+
+    httpx rebuilds the redirected request from the original's *stream* and runs
+    the request hook again; that request's ``.content`` is unread. The hook must
+    still find the call id there, or the hop that actually reaches the tool
+    goes out with no identity (staging: ``reason=missing_token`` on every
+    parallel call, 2026-10-13).
+    """
+    import asyncio
+
+    from tools.mcp_tool import _make_end_user_identity_hook
+
+    server = SimpleNamespace(_call_identities=_live_entries())
+    hook = _make_end_user_identity_hook(
+        server, "X-Hermes-End-User-Jwt", "X-Hermes-Chat-Id", "X-Hermes-Request-Id",
+    )
+    served: list = []
+    base = MCP_URL.rstrip("/")
+
+    def _transport(request: httpx.Request) -> httpx.Response:
+        if not request.url.path.endswith("/"):
+            return httpx.Response(307, headers={"location": base + "/"})
+        served.append((request.headers, json.loads(request.read())))
+        return httpx.Response(200, json={})
+
+    async def _go():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_transport),
+            follow_redirects=True,
+            event_hooks={"request": [hook]},
+        ) as client:
+            await client.post(base, json={
+                "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                "params": {"name": "query", "arguments": {},
+                           "_meta": {"hermes_call": "call-a"}},
+            })
+
+    asyncio.run(_go())
+
+    headers, body = served[0]
+    assert headers[IDENTITY_HEADER] == ALICE_1
+    assert headers[CHAT_HEADER] == CHAT_A
+    assert headers[REQUEST_HEADER] == "req-a"
+    # The body still reaches the server intact after the hook read it.
+    assert body["params"]["_meta"]["hermes_call"] == "call-a"
+
+
 def test_each_call_sends_its_own_correlation_id_and_leaves_nothing_armed(ragnarok_factory):
     handler, wire, server = ragnarok_factory()
 
