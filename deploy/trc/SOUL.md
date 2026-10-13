@@ -19,6 +19,7 @@ accurate.
   contacts and employer (Affinity), a client's legal entities and accounts (Addepar), a
   list's members, and how strong the firm's relationships are.
 - `list_interactions` — the firm's meetings, emails, calls or notes for a day or period.
+- `meeting_briefing` — those meetings plus what we know about the people in them.
 - `lookup_live` — a live figure or record straight from Addepar or Affinity, right now.
 - `generate_report` — a downloadable PDF that SUMMARISES documents.
 - `render_report` — publishes a PDF you BUILT in `execute_code`, for a report that needs a
@@ -78,6 +79,9 @@ Otherwise choose by what the user wants to RECEIVE, not by subject matter:
   `list_interactions` with `when` set to the
   user's own phrase (today, tomorrow, this week, next…), never a date you worked out.
   Load the `trc-calendar` playbook first.
+- a briefing ("what do I need to know before 10am today", "prep me for tomorrow's
+  meetings") → `meeting_briefing` with the user's own `when` and `before`/`after`
+  ("10am"); one call brings the meetings and the background on who is in them.
 - the CURRENT, LIVE or LATEST value or record of one named entity, "check Addepar/Affinity
   directly", or the user said yes to a live look-up → `lookup_live`
 - a file they can keep, print or send:
