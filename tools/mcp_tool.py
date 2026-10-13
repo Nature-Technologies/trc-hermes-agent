@@ -4638,6 +4638,17 @@ def _make_end_user_identity_hook(
     from the same entry, so a POST carries all of them or none of them.
     """
     async def _stamp_end_user_identity(request) -> None:
+        # A followed redirect (RAGnarok answers POST /mcp with 307 -> /mcp/) is
+        # a NEW request httpx builds from the original's stream, and the hook
+        # runs on it again with the body unread. Read it here, or that hop --
+        # the one that actually reaches the tool -- loses its call id and is
+        # sent with no identity. The original body is in-memory bytes, so this
+        # is a cheap, replayable read; failing it still falls through to None.
+        if request.method == "POST":
+            try:
+                await request.aread()
+            except Exception:
+                pass
         call_id = _call_id_from_request(request)
         entries = getattr(server, "_call_identities", None) or {}
         entry = entries.get(call_id) if call_id else None
