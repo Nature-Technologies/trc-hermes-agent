@@ -49,6 +49,8 @@ Example config::
         max_concurrent_calls: 6       # tools/call in flight at once on this
                               # server (HTTP only; default 1 = one at a time)
         max_concurrent_calls_per_user: 3  # per end user (default: the cap above)
+        admission_timeout: 60         # max wait for a slot; then {"status": "busy"}.
+                              # ``timeout`` starts only after admission.
         user_identity_header: "X-Hermes-End-User-Jwt"  # outbound header name
                               # for the above (default shown). The value is the
                               # token verbatim — Hermes forwards, never mints.
@@ -356,12 +358,18 @@ _DEFAULT_CONNECT_TIMEOUT = 60    # seconds for initial connection per server
 # Admission control for tools/call (see MCPServerTask._configure_call_limits).
 # ``max_concurrent_calls`` caps one server's in-flight tools/call; 1 keeps the
 # historical one-at-a-time behaviour on ``_rpc_lock``. The per-user cap defaults
-# to the server cap.
+# to the server cap. ``admission_timeout`` bounds the wait for a slot; it is
+# separate from ``timeout``, which starts only once the call is admitted.
 _DEFAULT_MAX_CONCURRENT_CALLS = 1
+_DEFAULT_ADMISSION_TIMEOUT = 60.0
 
 # Key under ``params._meta`` carrying one tools/call's correlation id to the
 # outbound request hook (see _make_end_user_identity_hook).
 _CALL_META_KEY = "hermes_call"
+
+# Slack on the outer _run_on_mcp_loop deadline so the inner admission and call
+# deadlines, which produce the precise errors, always fire first.
+_OUTER_DEADLINE_GRACE_SECONDS = 5.0
 
 # Outbound header carrying the forwarded per-request end-user identity on MCP
 # tool calls (opt-in per server via ``forward_user_identity``; override the name
@@ -1894,7 +1902,7 @@ class MCPServerTask:
         "_pending_call_context",
         "_call_identities",
         "_max_concurrent_calls", "_max_concurrent_calls_per_user",
-        "_call_semaphore", "_user_call_semaphores", "_user_call_holders",
+        "_admission_timeout", "_call_semaphore", "_user_call_semaphores", "_user_call_holders",
         "_forward_user_identity", "_user_identity_header",
         "_chat_id_header", "_request_id_header",
         "_lifecycle_started_at", "_last_tool_call_at",
@@ -1964,6 +1972,7 @@ class MCPServerTask:
         # tools/call admission limits; see _configure_call_limits.
         self._max_concurrent_calls: int = _DEFAULT_MAX_CONCURRENT_CALLS
         self._max_concurrent_calls_per_user: int = _DEFAULT_MAX_CONCURRENT_CALLS
+        self._admission_timeout: float = _DEFAULT_ADMISSION_TIMEOUT
         self._call_semaphore: Optional[asyncio.Semaphore] = None
         self._user_call_semaphores: Dict[str, asyncio.Semaphore] = {}
         self._user_call_holders: Dict[str, int] = {}
@@ -2003,7 +2012,8 @@ class MCPServerTask:
         ``max_concurrent_calls`` (default 1) and ``max_concurrent_calls_per_user``
         (default and ceiling: ``max_concurrent_calls``) apply to HTTP servers
         only. A stdio server is one JSON-RPC stream and stays serialized on
-        ``_rpc_lock`` whatever the config says.
+        ``_rpc_lock`` whatever the config says. ``admission_timeout`` (default
+        60 s) bounds the wait for a slot on every transport.
         """
         max_calls = _safe_numeric(
             config.get("max_concurrent_calls", _DEFAULT_MAX_CONCURRENT_CALLS),
@@ -2015,6 +2025,12 @@ class MCPServerTask:
         if "url" not in config:
             max_calls = per_user = 1
         per_user = min(per_user, max_calls)
+        # Before the unchanged-caps return: a change to admission_timeout alone
+        # must still take effect on reconnect.
+        self._admission_timeout = _safe_numeric(
+            config.get("admission_timeout", _DEFAULT_ADMISSION_TIMEOUT),
+            _DEFAULT_ADMISSION_TIMEOUT, float, minimum=0.1,
+        )
         unchanged = (
             (max_calls, per_user)
             == (self._max_concurrent_calls, self._max_concurrent_calls_per_user)
@@ -4383,6 +4399,14 @@ class _CallIdentity:
     bridged: bool
 
 
+class MCPAdmissionTimeout(Exception):
+    """A tools/call waited ``admission_timeout`` for a slot and gave up.
+
+    The server was never asked, so this is not a transport failure and the
+    circuit breaker must not count it.
+    """
+
+
 def _call_id_from_request(request) -> Optional[str]:
     """The correlation id in an outbound JSON-RPC POST body, or ``None``.
 
@@ -4449,6 +4473,25 @@ def _end_user_slot_key(identity: Optional[str]) -> str:
     return "tok:" + hashlib.sha256(identity.encode()).hexdigest()[:16]
 
 
+def _admission_timeout_of(server: Any) -> float:
+    """*server*'s ``admission_timeout``, or the default for a stand-in."""
+    value = getattr(server, "_admission_timeout", None)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return _DEFAULT_ADMISSION_TIMEOUT
+
+
+def _outer_call_deadline(tool_timeout: Optional[float], server: Any) -> Optional[float]:
+    """Safety-net deadline for _run_on_mcp_loop around one tools/call.
+
+    The real limits live inside _call: ``admission_timeout`` for the wait,
+    then ``tool_timeout`` from admission. This only has to outlast both.
+    """
+    if tool_timeout is None:
+        return None
+    return float(tool_timeout) + _admission_timeout_of(server) + _OUTER_DEADLINE_GRACE_SECONDS
+
+
 @contextlib.asynccontextmanager
 async def _admit_call(server: Any, slot_key: str):
     """Hold one tools/call admission slot on *server* for the block.
@@ -4457,11 +4500,28 @@ async def _admit_call(server: Any, slot_key: str):
     ``_rpc_lock``, which keeps today's ordering against list_tools refreshes
     and resource/prompt RPCs. Above 1 it is the end user's semaphore, then the
     server's, always in that order so two calls can never each hold the one
-    the other waits for.
+    the other waits for. The wait is bounded by ``admission_timeout``; on
+    expiry whatever was taken is released and MCPAdmissionTimeout raised.
     """
+    admission = _admission_timeout_of(server)
+
+    def _busy() -> MCPAdmissionTimeout:
+        return MCPAdmissionTimeout(
+            f"MCP server '{getattr(server, 'name', '?')}' is busy: no call slot "
+            f"freed up within {admission:g}s. Retry shortly or make fewer calls "
+            f"at once."
+        )
+
     server_sem = getattr(server, "_call_semaphore", None)
     if not isinstance(server_sem, asyncio.Semaphore):
-        async with server._rpc_lock:
+        # Entered as an async context manager (not acquire()/release()) so
+        # duck-typed stand-ins whose _rpc_lock is a MagicMock keep working.
+        async with contextlib.AsyncExitStack() as held:
+            try:
+                async with asyncio.timeout(admission):
+                    await held.enter_async_context(server._rpc_lock)
+            except TimeoutError:
+                raise _busy() from None
             yield
         return
 
@@ -4476,9 +4536,14 @@ async def _admit_call(server: Any, slot_key: str):
         user_sems[slot_key] = user_sem
     holders[slot_key] = holders.get(slot_key, 0) + 1
     try:
-        async with user_sem:
-            async with server_sem:
-                yield
+        async with contextlib.AsyncExitStack() as held:
+            try:
+                async with asyncio.timeout(admission):
+                    await held.enter_async_context(user_sem)
+                    await held.enter_async_context(server_sem)
+            except TimeoutError:
+                raise _busy() from None
+            yield
     finally:
         left = holders.get(slot_key, 1) - 1
         if left > 0:
@@ -5098,12 +5163,25 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                             request_id=end_user_request_id,
                             bridged=end_user_bridged,
                         )
-                        result = await server.session.call_tool(
+                        pending = server.session.call_tool(
                             tool_name, arguments=args,
                             meta={_CALL_META_KEY: call_id},
                         )
                     else:
-                        result = await server.session.call_tool(tool_name, arguments=args)
+                        pending = server.session.call_tool(tool_name, arguments=args)
+                    # The call's own deadline starts here, after admission, so
+                    # time spent queued for a slot never eats into it.
+                    if tool_timeout is None:
+                        result = await pending
+                    else:
+                        try:
+                            async with asyncio.timeout(float(tool_timeout)):
+                                result = await pending
+                        except TimeoutError:
+                            raise TimeoutError(
+                                f"MCP call timed out after {float(tool_timeout):.1f}s "
+                                f"(configured timeout: {float(tool_timeout):.1f}s)"
+                            ) from None
                 finally:
                     identities.pop(call_id, None)
                     server._pending_call_context = None
@@ -5196,7 +5274,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             return json.dumps({"result": text_result}, ensure_ascii=False)
 
         def _call_once():
-            return _run_on_mcp_loop(_call, timeout=tool_timeout)
+            return _run_on_mcp_loop(
+                _call, timeout=_outer_call_deadline(tool_timeout, server),
+            )
 
         try:
             result = _call_once()
@@ -5211,6 +5291,11 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             return result
         except InterruptedError:
             return _interrupted_call_result()
+        except MCPAdmissionTimeout as exc:
+            # Queued, never sent: the server is not failing, it is full. Not a
+            # breaker strike, and the same ``busy`` status the backend uses.
+            logger.warning("MCP tool %s/%s not admitted: %s", server_name, tool_name, exc)
+            return json.dumps({"status": "busy", "error": str(exc)}, ensure_ascii=False)
         except Exception as exc:
             # Auth-specific recovery path: consult the manager, signal
             # reconnect if viable, retry once. Returns None to fall

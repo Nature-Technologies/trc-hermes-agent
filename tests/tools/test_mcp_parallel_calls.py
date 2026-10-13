@@ -538,3 +538,149 @@ def test_reconfiguring_with_the_same_limits_keeps_the_live_slots():
 
     server._configure_call_limits({"url": MCP_URL, "max_concurrent_calls": 2})
     assert server._call_semaphore is not server_sem  # a real change rebuilds them
+
+
+# ---------------------------------------------------------------------------
+# B3 — the call timeout starts after admission; waiting is not failing
+# ---------------------------------------------------------------------------
+
+
+def test_admission_wait_does_not_consume_the_call_timeout(ragnarok_factory):
+    """Third call queues ~2 s for a slot, then runs 1 s: inside its own 2.5 s."""
+    from tools import mcp_tool
+
+    handler, wire, _server = ragnarok_factory(
+        limits={"max_concurrent_calls": 3, "max_concurrent_calls_per_user": 1},
+        tool_timeout=2.5, delay=1.0,
+    )
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [
+            pool.submit(_as_user(handler, tok, CHAT_A, f"r-{i}", {"q": i}))
+            for i, tok in enumerate((ALICE_1, ALICE_2, ALICE_3))
+        ]
+        results = [json.loads(f.result(timeout=30)) for f in futures]
+
+    assert results == [{"result": "ok"}] * 3
+    assert wire.max_in_flight == 1  # per-user cap 1: strictly one after another
+    assert mcp_tool._server_error_counts.get("ragnarok", 0) == 0
+
+
+def test_admission_timeout_returns_busy_and_does_not_trip_the_breaker(ragnarok_factory):
+    from tools import mcp_tool
+
+    handler, wire, _server = ragnarok_factory(
+        limits={"max_concurrent_calls": 2, "max_concurrent_calls_per_user": 1,
+                "admission_timeout": 0.2},
+        tool_timeout=3.0, hold=True,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        try:
+            holder = pool.submit(_as_user(handler, ALICE_1, CHAT_A, "r-0", {"q": 0}))
+            assert wire.wait_for(lambda w: w.in_flight == 1)
+            refused = [
+                json.loads(_as_user(handler, tok, CHAT_A, f"r-{i}", {"q": i})())
+                for i, tok in enumerate((ALICE_2, ALICE_3, ALICE_4), start=1)
+            ]
+        finally:
+            wire.open_gate(_mcp())
+        held = json.loads(holder.result(timeout=30))
+
+    assert [r.get("status") for r in refused] == ["busy"] * 3
+    assert all("busy" in r["error"] for r in refused)
+    assert len(wire.records) == 1  # the refused calls never reached the server
+    assert mcp_tool._server_error_counts.get("ragnarok", 0) == 0
+    assert held == {"result": "ok"}
+    # Breaker still closed: the next call goes straight through.
+    after = json.loads(_as_user(handler, ALICE_2, CHAT_A, "r-9", {"q": 9})())
+    assert after == {"result": "ok"}
+
+
+def test_a_backend_busy_result_is_not_a_breaker_failure(ragnarok_factory):
+    from tools import mcp_tool
+
+    busy = json.dumps({"status": "busy", "error": "the search is at capacity"})
+    handler, _wire, _server = ragnarok_factory(limits=PARALLEL, text=busy)
+    mcp_tool._server_error_counts["ragnarok"] = mcp_tool._CIRCUIT_BREAKER_THRESHOLD - 1
+
+    for i in range(3):
+        result = json.loads(_as_user(handler, ALICE_1, CHAT_A, f"r-{i}", {"q": i})())
+        assert result == {"result": busy}
+
+    assert mcp_tool._server_error_counts.get("ragnarok", 0) == 0
+
+
+def test_the_call_timeout_still_bounds_an_admitted_call(ragnarok_factory):
+    from tools import mcp_tool
+
+    handler, _wire, _server = ragnarok_factory(limits=PARALLEL, tool_timeout=0.5, delay=3.0)
+
+    result = json.loads(_as_user(handler, ALICE_1, CHAT_A, "r-0", {"q": 0})())
+
+    assert "timed out after 0.5s" in result["error"]
+    assert mcp_tool._server_error_counts.get("ragnarok", 0) == 1
+
+
+def test_an_admission_timeout_leaves_no_holder_or_semaphore_behind():
+    """Review Focus (ruling B3): a refused waiter must release its holder count,
+    so an idle user's semaphore is still forgotten. A config change touching
+    only ``admission_timeout`` takes effect despite the unchanged-caps return."""
+    import asyncio
+
+    from tools.mcp_tool import MCPAdmissionTimeout, MCPServerTask, _admit_call
+
+    server = MCPServerTask("x")
+    server._configure_call_limits({"url": MCP_URL, **PARALLEL})
+    assert server._admission_timeout == 60.0
+    server_sem = server._call_semaphore
+    server._configure_call_limits({"url": MCP_URL, **PARALLEL, "admission_timeout": 0.1})
+    assert server._admission_timeout == 0.1
+    assert server._call_semaphore is server_sem  # caps unchanged: slots kept
+
+    async def _go():
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _hold():
+            async with _admit_call(server, "sub:a"):
+                entered.set()
+                await release.wait()
+
+        holders = [asyncio.create_task(_hold()) for _ in range(3)]
+        await entered.wait()
+        await asyncio.sleep(0.05)
+        with pytest.raises(MCPAdmissionTimeout, match="busy"):
+            async with _admit_call(server, "sub:a"):
+                pytest.fail("a fourth call from one user must not be admitted")
+        assert server._user_call_holders["sub:a"] == 3
+        release.set()
+        await asyncio.gather(*holders)
+
+    asyncio.run(_go())
+
+    assert server._user_call_holders == {}
+    assert server._user_call_semaphores == {}
+
+
+def test_an_admission_timeout_on_the_rpc_lock_path_raises_busy_and_frees_the_lock():
+    """Default cap 1 (and stdio) admits on ``_rpc_lock``; the wait is bounded too."""
+    import asyncio
+
+    from tools.mcp_tool import MCPAdmissionTimeout, MCPServerTask, _admit_call
+
+    server = MCPServerTask("x")
+    server._configure_call_limits({"url": MCP_URL, "admission_timeout": 0.1})
+    assert server._call_semaphore is None
+
+    async def _go():
+        await server._rpc_lock.acquire()
+        with pytest.raises(MCPAdmissionTimeout, match="busy"):
+            async with _admit_call(server, "sub:a"):
+                pytest.fail("must not be admitted while _rpc_lock is held")
+        server._rpc_lock.release()
+        async with _admit_call(server, "sub:a"):
+            assert server._rpc_lock.locked()
+        assert not server._rpc_lock.locked()
+
+    asyncio.run(_go())
