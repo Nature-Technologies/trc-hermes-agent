@@ -1082,6 +1082,47 @@ def _build_child_progress_callback(
     return _callback
 
 
+def _build_child_tool_relay(parent_agent, subagent_id: str):
+    """Relay a child's tool start/complete to the parent's structured callbacks.
+
+    API server only. There those callbacks feed the SSE tool-progress events and
+    the Open WebUI status line (gateway/platforms/turn_status.py). The parent
+    has no tool_progress_callback (api_server wires only this pair), so without
+    the relay the status line sits on the parent's own delegate_task line for
+    the whole run. Call ids are prefixed with the subagent id, because two
+    children's model-issued ids can collide. Elsewhere the parent's
+    tool_start_callback drives CLI inline diffs, which must not start showing a
+    child's edits, so this returns (None, None).
+    """
+    if getattr(parent_agent, "platform", None) != "api_server":
+        return None, None
+    parent_start = getattr(parent_agent, "tool_start_callback", None)
+    parent_complete = getattr(parent_agent, "tool_complete_callback", None)
+
+    def _start(tool_call_id, function_name, function_args):
+        if not tool_call_id:
+            return
+        try:
+            parent_start(f"{subagent_id}:{tool_call_id}", function_name, function_args)
+        except Exception as exc:
+            logger.debug("Child tool-start relay failed: %s", type(exc).__name__)
+
+    def _complete(tool_call_id, function_name, function_args, function_result):
+        if not tool_call_id:
+            return
+        try:
+            parent_complete(
+                f"{subagent_id}:{tool_call_id}", function_name, function_args, function_result
+            )
+        except Exception as exc:
+            logger.debug("Child tool-complete relay failed: %s", type(exc).__name__)
+
+    return (
+        _start if callable(parent_start) else None,
+        _complete if callable(parent_complete) else None,
+    )
+
+
 def _normalized_runtime_url(value: Any) -> str:
     return str(value or "").strip().rstrip("/")
 
@@ -1419,6 +1460,10 @@ def _build_child_agent(
     if isinstance(child_max_tokens, int):
         child_optional_kwargs["max_tokens"] = child_max_tokens
 
+    child_tool_start_cb, child_tool_complete_cb = _build_child_tool_relay(
+        parent_agent, subagent_id
+    )
+
     from agent.delegation_context import delegated_child_context
 
     with delegated_child_context():
@@ -1464,6 +1509,8 @@ def _build_child_agent(
             ),
             openrouter_min_coding_score=child_openrouter_min_coding_score,
             tool_progress_callback=child_progress_cb,
+            tool_start_callback=child_tool_start_cb,
+            tool_complete_callback=child_tool_complete_cb,
             iteration_budget=None,  # fresh budget per subagent
             **child_optional_kwargs,
         )

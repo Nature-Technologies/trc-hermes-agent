@@ -734,3 +734,46 @@ def test_live_log_defaults_on():
     from hermes_cli.config import DEFAULT_CONFIG
 
     assert DEFAULT_CONFIG["delegation"]["live_log"] is True
+
+
+# --- C7: the status line moves while children work ---------------------------------------
+
+
+def test_child_tool_events_move_the_open_webui_status_line():
+    from gateway.platforms.turn_status import (
+        COMPOSING_LINE, OPENERS, OTHER_TOOL_LINE, TurnStatus,
+    )
+
+    events = []
+    parent = _make_mock_parent()
+    parent.platform = "api_server"
+    parent.tool_start_callback = lambda cid, name, args: events.append(("running", cid, name))
+    parent.tool_complete_callback = (
+        lambda cid, name, args, result: events.append(("completed", cid, name))
+    )
+
+    kwargs = _build_one_child(parent)
+    kwargs["tool_start_callback"]("call_1", "mcp__ragnarok__query", {"query": "q"})
+    kwargs["tool_complete_callback"]("call_1", "mcp__ragnarok__query", {"query": "q"}, "{}")
+
+    assert [e[0] for e in events] == ["running", "completed"]
+    relayed_id = events[0][1]
+    assert relayed_id.startswith("sa-0-") and relayed_id.endswith(":call_1")
+    assert events[1][1] == relayed_id  # start and complete correlate
+
+    # What the SSE writer does with them: the line leaves the parent's
+    # "Working on it…" (delegate_task) for the child's own search line.
+    status = TurnStatus(clock=lambda: 0.0)
+    lines = [p["description"] for p in status.on_tool_start("delegate_task")]
+    for kind, _cid, name in events:
+        step = status.on_tool_start if kind == "running" else status.on_tool_complete
+        lines += [p["description"] for p in step(name)]
+    assert lines == [OTHER_TOOL_LINE, OPENERS["query"], COMPOSING_LINE]
+
+
+def test_no_relay_outside_the_api_server():
+    parent = _make_mock_parent()  # platform "cli": tool_start_callback drives inline diffs there
+    parent.tool_start_callback = MagicMock()
+    kwargs = _build_one_child(parent)
+    assert kwargs["tool_start_callback"] is None
+    assert kwargs["tool_complete_callback"] is None
