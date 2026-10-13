@@ -387,9 +387,23 @@ def _build_one_child(parent=None):
     return MockAgent.call_args.kwargs
 
 
+def test_children_skip_soul_by_default(monkeypatch):
+    """Upstream behaviour: a child runs on the stock identity unless load_soul is set."""
+    monkeypatch.setattr(dt, "_load_config", lambda: {})
+    assert _build_one_child()["load_soul_identity"] is False
+
+
+def test_the_upstream_default_config_leaves_load_soul_off():
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["delegation"]["load_soul"] is False
+
+
 def test_children_are_built_with_soul_and_the_configured_contract(monkeypatch):
     monkeypatch.setattr(
-        dt, "_load_config", lambda: {"result_instructions": "CONTRACT: copy tokens verbatim."}
+        dt,
+        "_load_config",
+        lambda: {"load_soul": True, "result_instructions": "CONTRACT: copy tokens verbatim."},
     )
     kwargs = _build_one_child()
     assert kwargs["load_soul_identity"] is True
@@ -410,7 +424,8 @@ def test_a_child_system_prompt_carries_the_trc_soul_rules(tmp_path, monkeypatch)
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     shutil.copy(_TRC_SOUL, home / "SOUL.md")
-    monkeypatch.setattr(dt, "_load_config", lambda: {})
+    # The TRC setting (deploy/trc/config.yaml delegation.load_soul: true).
+    monkeypatch.setattr(dt, "_load_config", lambda: {"load_soul": True})
 
     kwargs = _build_one_child()
     child_like = SimpleNamespace(
@@ -479,6 +494,18 @@ def test_truncation_without_spill_names_no_path_and_no_read_file(tmp_path, monke
     for leak in ("read_file", "saved to", "disk", str(home)):
         assert leak not in model_text, leak
     assert not (home / "cache" / "delegation").exists()
+
+
+def test_spill_off_footer_says_the_middle_was_omitted_not_absent(tmp_path, monkeypatch):
+    """The parent must not read a trimmed middle as 'no such findings'. No suggestion to
+    delegate again: the turn's budget is spent."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    model_text, _ = dt._trim_summary_with_footer(_UNIT * 300, 2000, 0, spill=False)
+    assert "middle of the findings was omitted for length" in model_text
+    assert "do not state that those findings do not exist" in model_text
+    assert "delegate a narrower task" not in model_text
 
 
 def test_summary_budget_honours_spill_summaries_false(tmp_path, monkeypatch):

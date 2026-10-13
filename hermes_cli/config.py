@@ -2451,6 +2451,10 @@ DEFAULT_CONFIG = {
         # interruptible by Stop, and nothing is queued for a wake. A stateless
         # HTTP deployment that must answer within the request (TRC) sets false.
         "background": True,
+        # Give each child the deployment's SOUL.md as its identity. false
+        # (default) = children run on the stock agent identity. A deployment
+        # whose SOUL.md holds rules every answer must follow sets true.
+        "load_soul": False,
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts

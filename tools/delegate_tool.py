@@ -572,6 +572,18 @@ def _live_log_enabled(cfg: Optional[dict] = None) -> bool:
     return is_truthy_value(cfg.get("live_log"), default=True)
 
 
+def _load_soul_enabled(cfg: Optional[dict] = None) -> bool:
+    """``delegation.load_soul`` (default false).
+
+    True gives every child the deployment's SOUL.md as its identity, in place
+    of the stock ``DEFAULT_AGENT_IDENTITY``. A deployment whose SOUL.md carries
+    rules every answer must follow (TRC: tokens, [Sn] markers) sets true.
+    """
+    if cfg is None:
+        cfg = _load_config()
+    return is_truthy_value(cfg.get("load_soul"), default=False)
+
+
 def _is_mcp_toolset_name(name: str) -> bool:
     """Return True for canonical MCP toolsets and their registered aliases."""
     if not name:
@@ -1487,10 +1499,11 @@ def _build_child_agent(
             log_prefix=f"[subagent-{task_index}]",
             platform="subagent",
             skip_context_files=True,
-            # SOUL.md is the deployment's identity and rules (TRC: masking,
-            # citations, security). A child without it runs on the stock
-            # DEFAULT_AGENT_IDENTITY. cwd project files stay skipped.
-            load_soul_identity=True,
+            # delegation.load_soul: SOUL.md is the deployment's identity and
+            # rules (TRC: masking, citations, security). Off (upstream), a
+            # child runs on the stock DEFAULT_AGENT_IDENTITY. cwd project
+            # files stay skipped either way.
+            load_soul_identity=_load_soul_enabled(),
             skip_memory=True,
             clarify_callback=None,
             thinking_callback=child_thinking_cb,
@@ -1834,8 +1847,8 @@ def _trim_summary_with_footer(
         )
     else:
         footer_lines.append(
-            "The omitted middle is not available. If you need it, delegate a "
-            "narrower task."
+            "The middle of the findings was omitted for length and is not "
+            "available; do not state that those findings do not exist."
         )
     footer_lines.append("─" * 37)
 
