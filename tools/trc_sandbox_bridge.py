@@ -60,12 +60,12 @@ _TERMINAL_BLOCKED_PARAMS: frozenset = frozenset(
 #   1. _serve_bridged_call (below) sets _BRIDGED to True for the duration of
 #      its dispatch — on the agent thread.
 #   2. _make_tool_handler (mcp_tool.py) reads _BRIDGED.get() on the agent
-#      thread in the same breath as identity / chat / request, and arms
-#      server._end_user_bridged as a PLAIN ATTRIBUTE.
+#      thread in the same breath as identity / chat / request, and stores it
+#      in that call's _CallIdentity entry (server._call_identities[call_id]).
 #   3. The outbound HTTP-request hook (_stamp_end_user_identity, mcp_tool.py)
-#      reads server._end_user_bridged on the MCP loop and stamps (or removes)
-#      X-Hermes-Bridged: 1.  _rpc_lock serialises calls so at most one value
-#      is ever armed, and the finally block clears it unconditionally.
+#      reads the entry named by the POST's params._meta.hermes_call and stamps
+#      (or removes) X-Hermes-Bridged: 1.  The entry is per call and removed in
+#      _call's finally, so concurrent calls never see each other's flag.
 #
 # A model-direct call never enters _serve_bridged_call, so _BRIDGED stays at
 # its default False and the header is actively REMOVED — a stale True can

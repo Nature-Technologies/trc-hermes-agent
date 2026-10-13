@@ -119,6 +119,8 @@ import shutil
 import sys
 import threading
 import time
+import uuid
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Callable
 from datetime import datetime
@@ -344,6 +346,10 @@ _MCP_LOG_LEVEL_MAP = {
 
 _DEFAULT_TOOL_TIMEOUT = 300      # seconds for tool calls
 _DEFAULT_CONNECT_TIMEOUT = 60    # seconds for initial connection per server
+
+# Key under ``params._meta`` carrying one tools/call's correlation id to the
+# outbound request hook (see _make_end_user_identity_hook).
+_CALL_META_KEY = "hermes_call"
 
 # Outbound header carrying the forwarded per-request end-user identity on MCP
 # tool calls (opt-in per server via ``forward_user_identity``; override the name
@@ -1874,10 +1880,9 @@ class MCPServerTask:
         "_registered_tool_names", "_auth_type", "_refresh_lock",
         "_rpc_lock", "_pending_refresh_tasks",
         "_pending_call_context",
-        "_forward_user_identity", "_user_identity_header", "_end_user_identity",
-        "_chat_id_header", "_end_user_chat_id",
-        "_request_id_header", "_end_user_request_id",
-        "_end_user_bridged",
+        "_call_identities",
+        "_forward_user_identity", "_user_identity_header",
+        "_chat_id_header", "_request_id_header",
         "_lifecycle_started_at", "_last_tool_call_at",
         "_idle_timeout_seconds", "_max_lifetime_seconds", "_recycled_reason",
         "initialize_result", "_ping_unsupported",
@@ -1936,30 +1941,19 @@ class MCPServerTask:
         # gateway-platform attribution and routes the approval prompt
         # to the right surface (Telegram, Slack, etc.).
         self._pending_call_context: Optional[contextvars.Context] = None
+        # End-user identity / chat / request / bridged flag for each in-flight
+        # tools/call, keyed by the correlation id _make_tool_handler mints per
+        # attempt and removes in its finally. The outbound request hook reads
+        # the entry named in the POST's params._meta.hermes_call, so concurrent
+        # calls can never stamp each other's identity (invariant I1).
+        self._call_identities: Dict[str, "_CallIdentity"] = {}
         # Per-request end-user identity forwarding (opt-in, HTTP transport only).
-        # ``_forward_user_identity`` / ``_user_identity_header`` are resolved from
-        # config when the streamable-HTTP transport connects; ``_end_user_identity``
-        # is armed by the tool handler for the duration of ONE tools/call and read
-        # by the outbound httpx request hook.  See
-        # :func:`_make_end_user_identity_hook`.
+        # ``_forward_user_identity`` / the header names are resolved from config
+        # when the streamable-HTTP transport connects.
         self._forward_user_identity: bool = False
         self._user_identity_header: str = _DEFAULT_USER_IDENTITY_HEADER
-        self._end_user_identity: Optional[str] = None
-        # The conversation and turn ids ride the same opt-in, the same arming
-        # window and the same hook as the identity above.
         self._chat_id_header: str = _DEFAULT_CHAT_ID_HEADER
-        self._end_user_chat_id: Optional[str] = None
         self._request_id_header: str = _DEFAULT_REQUEST_ID_HEADER
-        self._end_user_request_id: Optional[str] = None
-        # Whether the current tools/call was issued by a sandboxed script rather than
-        # the model directly.  Armed by _make_tool_handler (on the agent thread, in the
-        # same breath as identity / chat / request) from the _BRIDGED ContextVar that
-        # tools/trc_sandbox_bridge._serve_bridged_call sets for the duration of its
-        # dispatch.  The outbound HTTP-request hook stamps X-Hermes-Bridged: 1 when
-        # this is True, and actively removes it when False, so a stale True from the
-        # previous call can never leak to the next one.  Never set without that hook
-        # running; always cleared in the same finally as identity.
-        self._end_user_bridged: bool = False
         now = time.monotonic()
         self._lifecycle_started_at: float = now
         self._last_tool_call_at: float = now
@@ -4325,64 +4319,117 @@ def _filter_mcp_children(pids: set) -> set:
     return filtered
 
 
+@dataclass(frozen=True)
+class _CallIdentity:
+    """End-user metadata for ONE tools/call, keyed by its correlation id."""
+
+    identity: Optional[str]
+    chat_id: Optional[str]
+    request_id: Optional[str]
+    bridged: bool
+
+
+def _call_id_from_request(request) -> Optional[str]:
+    """The correlation id in an outbound JSON-RPC POST body, or ``None``.
+
+    Only a ``tools/call`` that _make_tool_handler issued carries one, under
+    ``params._meta.hermes_call``. initialize, list_tools, notifications, GET
+    and DELETE return ``None`` and are therefore stamped with NO identity. An
+    unreadable or unexpected body also returns ``None``: fail closed.
+    """
+    if request.method != "POST":
+        return None
+    try:
+        body = request.content
+    except Exception:  # httpx.RequestNotRead: a streamed body we cannot see
+        return None
+    if not body:
+        return None
+    try:
+        message = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(message, dict) or message.get("method") != "tools/call":
+        return None
+    params = message.get("params")
+    meta = params.get("_meta") if isinstance(params, dict) else None
+    call_id = meta.get(_CALL_META_KEY) if isinstance(meta, dict) else None
+    return call_id if isinstance(call_id, str) and call_id else None
+
+
+def _server_call_map(server: Any, attr: str) -> dict:
+    """The per-call dict *attr* on *server*, created on first use.
+
+    Duck-typed on purpose: tests and helpers hand in lightweight stand-ins
+    (SimpleNamespace, MagicMock) rather than an MCPServerTask.
+    """
+    calls = getattr(server, attr, None)
+    if not isinstance(calls, dict):
+        calls = {}
+        try:
+            setattr(server, attr, calls)
+        except AttributeError:
+            pass
+    return calls
+
+
 def _make_end_user_identity_hook(
     server: Any,
     header_name: str,
     session_header_name: Optional[str] = None,
     request_header_name: Optional[str] = None,
 ):
-    """Return an httpx ``request`` hook that stamps the armed end-user identity.
+    """Return an httpx ``request`` hook that stamps each call's own end user.
 
     Why a hook rather than a header on the client: the streamable-HTTP transport
     opens ONE long-lived ``httpx.AsyncClient`` per configured server at startup
     (see :meth:`MCPServerTask._run_http`), so its header block is process-wide by
-    construction and cannot carry a per-request value.  Each ``tools/call`` is
+    construction and cannot carry a per-request value. Each ``tools/call`` is
     still its own HTTP POST on that client, and this hook runs per POST.
 
-    Per-request correctness rests on one invariant: the identity is read from
-    ``server._end_user_identity``, which :func:`_make_tool_handler` arms for
-    exactly the duration of one ``tools/call`` while holding the per-server
-    ``_rpc_lock``.  That lock already serializes client-initiated RPCs, so at
-    most one identity is ever armed and it belongs to the call in flight.
+    Why the body rather than shared state: the SDK sends every POST from the
+    transport's own task, so neither a ContextVar nor a "currently armed"
+    attribute can say which call a POST belongs to once calls run
+    concurrently. :func:`_make_tool_handler` puts a correlation id in the call's
+    ``params._meta.hermes_call`` and the call's metadata in
+    ``server._call_identities`` under that id; this hook reads the id from the
+    JSON-RPC body it is about to send and stamps THAT entry.
 
-    When nothing is armed the header is actively removed rather than left alone,
-    so an absent identity can never inherit a client-level default or a value
-    from a previous caller.  Missing identity means no identity.
-
-    ``session_header_name`` / ``request_header_name`` stamp the conversation and
-    turn ids the same way, from ``server._end_user_chat_id`` /
-    ``server._end_user_request_id``. Those values are armed and cleared together
-    with the identity by :func:`_make_tool_handler`, so a POST carries all of
-    them or none — never a caller without their conversation, which is the shape
-    that silently breaks a namespace keyed on the pair.
+    A POST with no matching entry (initialize, list_tools, notifications, a
+    call already finished) gets every identity header actively removed, so it
+    can never inherit a client-level default or another caller's value.
+    Missing identity means no identity. Identity, chat id and request id come
+    from the same entry, so a POST carries all of them or none of them.
     """
     async def _stamp_end_user_identity(request) -> None:
-        token = getattr(server, "_end_user_identity", None)
+        call_id = _call_id_from_request(request)
+        entries = getattr(server, "_call_identities", None) or {}
+        entry = entries.get(call_id) if call_id else None
+
+        token = entry.identity if entry else None
         if token:
             request.headers[header_name] = token
         else:
             request.headers.pop(header_name, None)
 
         if session_header_name:
-            chat_id = getattr(server, "_end_user_chat_id", None)
+            chat_id = entry.chat_id if entry else None
             if chat_id:
                 request.headers[session_header_name] = chat_id
             else:
                 request.headers.pop(session_header_name, None)
 
         if request_header_name:
-            req_id = getattr(server, "_end_user_request_id", None)
+            req_id = entry.request_id if entry else None
             if req_id:
                 request.headers[request_header_name] = req_id
             else:
                 request.headers.pop(request_header_name, None)
 
-        # Bridged calls (tool calls a sandbox script makes) carry X-Hermes-Bridged: 1
-        # so the backend can hold their tokens PENDING rather than DELIVERED.  The
-        # header is actively REMOVED when not bridged — an absent or False value must
-        # never inherit a True from a previous call (the "arm for one call" invariant
-        # that identity enforces via _rpc_lock applies here too).
-        if getattr(server, "_end_user_bridged", False):
+        # Bridged calls (tool calls a sandbox script makes) carry
+        # X-Hermes-Bridged: 1 so the backend holds their tokens PENDING rather
+        # than DELIVERED. Removed whenever this POST's own entry is not bridged.
+        if entry is not None and entry.bridged:
             request.headers["X-Hermes-Bridged"] = "1"
         else:
             request.headers.pop("X-Hermes-Bridged", None)
@@ -4900,7 +4947,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         # (trc_sandbox_bridge._serve_bridged_call sets the ContextVar; a model-
         # direct call reads the default False).  Captured here, on the agent
         # thread, for the same reason as identity — the ContextVar cannot be
-        # read on the MCP loop, so we arm a plain attribute instead (below).
+        # read on the MCP loop, so it rides this call's _CallIdentity entry (below).
         end_user_bridged = _resolve_end_user_bridged()
 
         # One line per hop, so a broken metadata chain is visible without a
@@ -4917,29 +4964,31 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         )
 
         async def _call():
+            # One id per attempt: an auth / session-expiry retry re-enters here
+            # and gets a fresh entry, never a half-finished one.
+            call_id = uuid.uuid4().hex
+            identities = _server_call_map(server, "_call_identities")
             _mark_server_call_started(server)
             async with server._rpc_lock:
                 # Snapshot the agent's context so an elicitation callback
-                # triggered during this call (fired on the MCP recv loop
-                # task, which doesn't inherit our contextvars) can replay
-                # it and detect the gateway platform / session for routing.
+                # triggered during this call can replay it (moved per call in B4).
                 server._pending_call_context = contextvars.copy_context()
-                # Arm for exactly this round trip. _rpc_lock is held across it,
-                # so the outbound POST the hook stamps is unambiguously this
-                # call's -- and the finally guarantees nothing stays armed for
-                # the next caller. All are cleared even if only one was set, so a
-                # later call can never inherit half a caller's context.
-                server._end_user_identity = end_user_identity
-                server._end_user_chat_id = end_user_chat_id
-                server._end_user_request_id = end_user_request_id
-                server._end_user_bridged = end_user_bridged
                 try:
-                    result = await server.session.call_tool(tool_name, arguments=args)
+                    if getattr(server, "_forward_user_identity", False) is True:
+                        identities[call_id] = _CallIdentity(
+                            identity=end_user_identity,
+                            chat_id=end_user_chat_id,
+                            request_id=end_user_request_id,
+                            bridged=end_user_bridged,
+                        )
+                        result = await server.session.call_tool(
+                            tool_name, arguments=args,
+                            meta={_CALL_META_KEY: call_id},
+                        )
+                    else:
+                        result = await server.session.call_tool(tool_name, arguments=args)
                 finally:
-                    server._end_user_identity = None
-                    server._end_user_chat_id = None
-                    server._end_user_request_id = None
-                    server._end_user_bridged = False
+                    identities.pop(call_id, None)
                     server._pending_call_context = None
             # The RPC round-trip completed — the session is demonstrably
             # healthy at the transport level (even if the tool itself

@@ -139,7 +139,7 @@ def test_chat_id_is_released_after_each_call(ragnarok, chat_ctx):
     chat_ctx(CHAT_A)
     handler({"q": "x"})
 
-    assert server._end_user_chat_id is None
+    assert server._call_identities == {}
 
 
 def test_a_later_call_without_a_chat_id_does_not_inherit(ragnarok):
@@ -178,7 +178,7 @@ def test_server_without_optin_never_receives_the_chat_id(ragnarok, chat_ctx):
     handler({"q": "x"})
 
     assert CHAT_HEADER not in outbound[0]
-    assert server._end_user_chat_id is None
+    assert server._call_identities == {}
 
 
 def test_hermes_does_not_synthesize_a_chat_id_from_session_vars(ragnarok):
