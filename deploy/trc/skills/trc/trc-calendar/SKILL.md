@@ -31,7 +31,7 @@ week", "notes about a company this month", "what do I need to know before 10am t
   mean either, prefer `author` for a colleague and `company`/`person` for anyone else.
 
 ## Which call answers it
-- A named `person`, `company` or `author`: settle who it is with `resolve_entity` first
+- A named `person` or `company` (not a colleague as `author`): settle who it is with `resolve_entity` first
   and pass the chosen name; a near match or several → ask which one, never choose for them.
 - A briefing (what to know before a time, prep for a day's meetings): one
   `meeting_briefing` call with `when` and `before`/`after` as the user said them

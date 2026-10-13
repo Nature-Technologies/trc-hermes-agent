@@ -121,7 +121,7 @@ def test_the_soul_asks_by_the_clarification_policy_in_plain_words(tmp_path, monk
     assert "\"in Addepar\" or \"in Affinity\"" in section
     # Row 4: none → say so, ask for the name, no broad search.
     assert "`not_found` → say no record matches that name" in section
-    assert "Never run a broad search to find it." in section
+    assert "or should I look for it in the documents?\" Make no broad search unless the user says so." in section
     # Nothing expensive first; the user chooses; no tool talk.
     assert "Make no other call before the user answers, and never choose for them." in section
     assert "naming no tool or search" in section
@@ -131,7 +131,7 @@ def test_one_broad_call_first_is_for_unclear_topics_never_for_names(tmp_path, mo
     """Spec §8: the rule-2 conflict is removed; a token is resolved, not queried."""
     loaded = _load(tmp_path, monkeypatch)
     rules = _flat(_section(loaded, "# When a question can mean more than one thing"))
-    assert "different answers on WHAT or WHEN → make ONE broad call" in rules
+    assert "different answers on WHAT, WHEN, or a WHO that names no one → make ONE broad call" in rules
     assert "a name is never settled this way" in rules
     tokens = _flat(_section(loaded, "# Placeholder tokens"))
     assert "is an ordinary question: call `resolve_entity` with it." in tokens
@@ -175,3 +175,21 @@ def test_connections_ownership_and_files_route_to_knowledge_graph(tmp_path, monk
     assert "`knowledge_graph`: `nodes` and `edges` are the data" in reading
     assert "never that X has no connections or files" in reading
     assert "find_relationships, resolve_entity and knowledge_graph. Nothing else is reachable." in flat
+
+
+def test_resolve_first_covers_scripts_generate_report_and_several_names(tmp_path, monkeypatch):
+    """Fix round 1: no path around resolve-first, and resolving is never a second call."""
+    loaded = _load(tmp_path, monkeypatch)
+    flat = _flat(loaded)
+    assert (
+        "Then, once every name in it is settled (see \"A name: settle WHO before anything "
+        "else\"), go straight to `execute_code`" in flat
+    )
+    section = _flat(_section(loaded, "# A name: settle WHO before anything else"))
+    assert "`list_interactions`, `meeting_briefing`, `generate_report`, `knowledge_graph` or `execute_code`." in section
+    assert (
+        "Several names unsettled → resolve them all in the same turn and ask about all "
+        "of them in one message." in section
+    )
+    assert "Names are settled in chat before the script; a script never chooses between candidates." in flat
+    assert "Never pair `generate_report` with any tool but `resolve_entity`" in flat

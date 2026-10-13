@@ -121,3 +121,8 @@ def test_entity_playbooks_settle_the_name_with_resolve_entity_first(name):
     text = " ".join((_SKILLS / "trc" / name / "SKILL.md").read_text(encoding="utf-8").split())
     assert "settle who it is with `resolve_entity` first" in text
     assert "never choose for them" in text
+
+
+def test_calendar_playbook_resolves_people_and_companies_not_colleague_authors():
+    text = " ".join((_SKILLS / "trc" / "trc-calendar" / "SKILL.md").read_text(encoding="utf-8").split())
+    assert "A named `person` or `company` (not a colleague as `author`): settle who it is" in text
