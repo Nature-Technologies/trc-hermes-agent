@@ -49,4 +49,6 @@ def test_the_soul_keeps_subagents_for_reports_and_comparisons_in_one_turn(tmp_pa
     assert "Never use" in section and "comparison" in section
     assert "all of them in the same turn" in section
     assert "two or three entities" in section and "execute_code" in section
+    assert "four or more entities or periods" in section
+    assert "one `execute_code` run" in section
     assert "Never mention helpers or subagents to the user." in section

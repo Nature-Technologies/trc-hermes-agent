@@ -93,7 +93,10 @@ def test_subagents_are_foreground_bounded_and_leave_no_files(tmp_path, monkeypat
     assert dt._spill_summaries_enabled(cfg) is False
     assert dt._get_max_concurrent_children() == 3
     assert dt._get_max_spawn_depth() == 1
-    assert dt._get_child_timeout() == 170.0
+    # An LLM turn + up to 60 s Hermes admission + one 190 s ragnarok call + a compose
+    # turn (deploy/trc/config.yaml, final review 2026-10-13).
+    assert dt._get_child_timeout() == 330.0
+    assert cfg["load_soul"] is True
     assert cfg["max_iterations"] == 6
     # Unset, so children inherit the route's model and its provider filters.
     raw = _cfg()["delegation"]
@@ -102,6 +105,14 @@ def test_subagents_are_foreground_bounded_and_leave_no_files(tmp_path, monkeypat
     contract = cfg["result_instructions"]
     for phrase in ("[Sn]", "placeholder", "figure"):
         assert phrase in contract, phrase
+    # One batch of up to three lookups, issued together, then findings.
+    assert "at most one batch of up to three lookups" in contract
+    assert "issued together in one turn" in contract
+    # A child never produces a report: the parent owns publication.
+    assert (
+        "Never call generate_report or render_report and never publish a report; "
+        "return findings only." in contract
+    )
 
 
 def test_delegation_is_the_only_toolset_added_for_subagents():

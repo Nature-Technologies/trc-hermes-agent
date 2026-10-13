@@ -42,6 +42,16 @@ def test_ragnarok_calls_run_in_parallel_within_the_backend_caps(tmp_path, monkey
     assert ragnarok["forward_user_identity"] is True
 
 
+def test_ragnarok_timing_sits_above_the_backend_worst_case(tmp_path, monkeypatch):
+    """Backend worst case is 30 s admission wait + 150 s query deadline = 180 s, so the
+    backend always gives up first with a structured result. Hermes' own admission wait
+    is explicit, not the code default."""
+    ragnarok = _merged_config(tmp_path, monkeypatch)["mcp_servers"]["ragnarok"]
+
+    assert ragnarok["timeout"] == 190
+    assert ragnarok["admission_timeout"] == 60
+
+
 def test_the_generic_parallel_guidance_block_stays_off(tmp_path, monkeypatch):
     """The TRC rule lives in SOUL.md; Hermes' generic block only adds prompt length."""
     agent = _merged_config(tmp_path, monkeypatch)["agent"]
