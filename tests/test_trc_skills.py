@@ -104,3 +104,20 @@ def test_the_full_index_is_unchanged_when_skill_manage_is_present(tmp_path, monk
 def test_the_deployment_drops_the_hermes_help_paragraph():
     cfg = yaml.safe_load(_DEPLOYED_CONFIG.read_text(encoding="utf-8"))
     assert cfg["agent"]["hermes_help_guidance"] is False
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "trc-aum-and-portfolio-value",
+        "trc-calendar",
+        "trc-contacts-and-relationships",
+        "trc-performance-and-profit",
+    ],
+)
+def test_entity_playbooks_settle_the_name_with_resolve_entity_first(name):
+    """Orchestrator spec 2026-10-13 entity resolution §8 Skills: one line each, and the
+    user chooses between candidates."""
+    text = " ".join((_SKILLS / "trc" / name / "SKILL.md").read_text(encoding="utf-8").split())
+    assert "settle who it is with `resolve_entity` first" in text
+    assert "never choose for them" in text

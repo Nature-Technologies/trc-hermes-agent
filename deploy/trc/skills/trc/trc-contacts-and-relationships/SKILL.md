@@ -29,6 +29,8 @@ relationships", "all our weak relationships", "who haven't we spoken to since Ju
   Omit `category` when the user means both.
 
 ## Which call answers it
+- A person or company named in the question: settle who it is with `resolve_entity`
+  first; a near match or several → ask the user which one, never choose for them.
 - Who was contacted in a period: `list_entities` with `contacted_since` (and
   `contacted_until` if the period has ended).
 - Who has not been contacted since a date: `list_entities` with `not_contacted_since`.
