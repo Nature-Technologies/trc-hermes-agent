@@ -558,6 +558,20 @@ def _spill_summaries_enabled(cfg: Optional[dict] = None) -> bool:
     return is_truthy_value(cfg.get("spill_summaries"), default=True)
 
 
+def _live_log_enabled(cfg: Optional[dict] = None) -> bool:
+    """``delegation.live_log`` (default true).
+
+    False means no live transcripts under ``cache/delegation/live/`` and no
+    zero-API-call timeout diagnostic under ``logs/``. Both hold the child's
+    goal and tool traffic. A deployment that keeps that only in the session DB
+    (TRC, invariant I5) sets false. Child sessions are still recorded in the
+    session DB with ``parent_session_id``.
+    """
+    if cfg is None:
+        cfg = _load_config()
+    return is_truthy_value(cfg.get("live_log"), default=True)
+
+
 def _is_mcp_toolset_name(name: str) -> bool:
     """Return True for canonical MCP toolsets and their registered aliases."""
     if not name:
@@ -2140,7 +2154,7 @@ def _run_single_child(
                 child_api_calls = int(_summary.get("api_call_count", 0) or 0)
             except Exception:
                 pass
-            if is_timeout and child_api_calls == 0:
+            if is_timeout and child_api_calls == 0 and _live_log_enabled():
                 diagnostic_path = _dump_subagent_timeout_diagnostic(
                     child=child,
                     task_index=task_index,
@@ -2671,9 +2685,12 @@ def delegate_task(
         wrap_progress_callback,
     )
 
-    live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context
-    )
+    if _live_log_enabled(cfg):
+        live_deleg_id, live_writers, live_paths = create_live_transcripts(
+            task_list, context
+        )
+    else:
+        live_deleg_id, live_writers, live_paths = None, [None] * len(task_list), []
 
     # Save parent tool names BEFORE any child construction mutates the global.
     # _build_child_agent() calls AIAgent() which calls get_tool_definitions(),
@@ -3537,6 +3554,23 @@ def _build_top_level_description() -> str:
             "use them in your answer. There is nothing to wait for or poll "
             "afterwards.\n\n"
         )
+    if _background_enabled(delegation_cfg):
+        durable_clause = (
+            "- Durable long-running work that must outlive the current turn -> "
+            "use cronjob (action='create') or terminal(background=True, "
+            "notify_on_complete=True) instead. Background delegations are NOT "
+            "durable: if the parent session is closed (/new) or the process exits "
+            "before a subagent finishes, that subagent's work is discarded, and "
+            "/stop cancels every running background subagent.\n\n"
+        )
+    else:
+        durable_clause = (
+            "- Durable long-running work that must outlive the current turn -> "
+            "use cronjob (action='create') or terminal(background=True, "
+            "notify_on_complete=True) instead. Subagents run only inside this "
+            "tool call and their results return in this same call; Stop "
+            "cancels every running subagent.\n\n"
+        )
     live_transcripts_clause = (
         "LIVE TRANSCRIPTS: the dispatch response includes 'live_transcripts' — "
         "one append-only human-readable log file per task (under "
@@ -3558,7 +3592,7 @@ def _build_top_level_description() -> str:
         f"items concurrently for this user (configured via "
         f"delegation.max_concurrent_children in config.yaml). {nesting_clause}\n\n"
         + run_mode_clause
-        + live_transcripts_clause
+        + (live_transcripts_clause if _live_log_enabled(delegation_cfg) else "")
         +
         "WHEN TO USE delegate_task:\n"
         "- Reasoning-heavy subtasks (debugging, code review, research synthesis)\n"
@@ -3568,13 +3602,8 @@ def _build_top_level_description() -> str:
         "- Mechanical multi-step work with no reasoning needed -> use execute_code\n"
         "- Single tool call -> just call the tool directly\n"
         "- Tasks needing user interaction -> subagents cannot use clarify\n"
-        "- Durable long-running work that must outlive the current turn -> "
-        "use cronjob (action='create') or terminal(background=True, "
-        "notify_on_complete=True) instead. Background delegations are NOT "
-        "durable: if the parent session is closed (/new) or the process exits "
-        "before a subagent finishes, that subagent's work is discarded, and "
-        "/stop cancels every running background subagent.\n\n"
-        "IMPORTANT:\n"
+        + durable_clause
+        + "IMPORTANT:\n"
         "- Subagents have NO memory of your conversation. Pass all relevant "
         "info (file paths, error messages, constraints) via the 'context' field.\n"
         "- If the user is writing in a non-English language, or asked for "
@@ -3654,6 +3683,33 @@ def _build_role_param_description() -> str:
     )
 
 
+_BACKGROUND_PARAM_DESCRIPTION = (
+    "DEPRECATED / IGNORED. Top-level single and batch "
+    "delegations run in the background automatically — you do "
+    "not need to (and cannot) opt in or out. A single result or "
+    "consolidated batch result re-enters the conversation when "
+    "the work finishes; just continue working in the meantime. "
+    "Setting this has no effect; the parameter remains only for "
+    "backward compatibility."
+)
+
+
+def _build_background_param_description() -> str:
+    """The 'background' parameter description, following delegation.background."""
+    try:
+        background_on = _background_enabled()
+    except Exception:
+        background_on = True
+    if background_on:
+        return _BACKGROUND_PARAM_DESCRIPTION
+    return (
+        "DEPRECATED / IGNORED. Delegations run in the foreground on this "
+        "install: delegate_task waits for every subagent and returns their "
+        "results in this same tool call. Setting this has no effect; the "
+        "parameter remains only for backward compatibility."
+    )
+
+
 def _build_dynamic_schema_overrides() -> dict:
     """Return per-call schema overrides reflecting current config.
 
@@ -3670,6 +3726,9 @@ def _build_dynamic_schema_overrides() -> dict:
     }
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
+    overrides_params["properties"]["background"]["description"] = (
+        _build_background_param_description()
+    )
 
     return {
         "description": _build_top_level_description(),
@@ -3741,15 +3800,9 @@ DELEGATE_TASK_SCHEMA = {
             },
             "background": {
                 "type": "boolean",
-                "description": (
-                    "DEPRECATED / IGNORED. Top-level single and batch "
-                    "delegations run in the background automatically — you do "
-                    "not need to (and cannot) opt in or out. A single result or "
-                    "consolidated batch result re-enters the conversation when "
-                    "the work finishes; just continue working in the meantime. "
-                    "Setting this has no effect; the parameter remains only for "
-                    "backward compatibility."
-                ),
+                # Default (delegation.background=true) text; the per-call
+                # override swaps in foreground wording when it is false.
+                "description": _BACKGROUND_PARAM_DESCRIPTION,
             },
         },
         "required": [],

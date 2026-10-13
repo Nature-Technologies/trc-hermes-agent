@@ -566,3 +566,171 @@ def test_spill_summaries_defaults_on():
     from hermes_cli.config import DEFAULT_CONFIG
 
     assert DEFAULT_CONFIG["delegation"]["spill_summaries"] is True
+
+
+# --- C5: nothing on disk outside the session DB ------------------------------------------
+
+
+def _delegation_files(home):
+    root = home / "cache"
+    return [p for p in root.rglob("*") if "delegation" in p.parts] if root.exists() else []
+
+
+def test_with_both_switches_off_no_delegation_files_are_written(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    (home / "config.yaml").write_text(
+        "delegation:\n  live_log: false\n  spill_summaries: false\n  max_summary_chars: 2000\n",
+        encoding="utf-8",
+    )
+
+    def _factory(*args, **kwargs):
+        child = MagicMock()
+        child.model = "m"
+        child.session_prompt_tokens = 0
+        child.session_completion_tokens = 0
+        child.session_estimated_cost_usd = 0.0
+        child._credential_pool = None
+        child.run_conversation.return_value = {
+            "final_response": _UNIT * 300, "completed": True, "interrupted": False,
+            "api_calls": 1, "messages": [],
+        }
+        return child
+
+    with patch("run_agent.AIAgent", side_effect=_factory):
+        out = json.loads(dt.delegate_task(
+            tasks=[{"goal": "a"}, {"goal": "b"}], parent_agent=_make_mock_parent()
+        ))
+
+    assert [r["summary_truncated"] for r in out["results"]] == [True, True]
+    assert "live_transcripts" not in out
+    for r in out["results"]:
+        assert "live_transcript" not in r and "summary_full_path" not in r
+    assert _delegation_files(home) == []
+
+
+class _HangingChild:
+    """The minimal subagent stand-in from test_delegate_subagent_timeout_diagnostic.py."""
+
+    def __init__(self):
+        self._subagent_id = "sa-0-trc0001"
+        self._delegate_depth = 1
+        self._delegate_role = "leaf"
+        self.model = "test/model"
+        self.provider = "testprov"
+        self.api_mode = "chat_completions"
+        self.base_url = "https://example.test/v1"
+        self.max_iterations = 6
+        self.quiet_mode = True
+        self.skip_memory = True
+        self.skip_context_files = True
+        self.platform = "subagent"
+        self.ephemeral_system_prompt = "sys prompt"
+        self.enabled_toolsets = ["ragnarok"]
+        self.valid_tool_names = {"mcp__ragnarok__query"}
+        self.tools = []
+        self._hang = threading.Event()
+
+    def get_activity_summary(self):
+        return {"api_call_count": 0, "max_iterations": 6, "current_tool": None,
+                "seconds_since_activity": 60}
+
+    def run_conversation(self, user_message, task_id=None, stream_callback=None):
+        self._hang.wait(10.0)
+        return {"final_response": "", "completed": False, "api_calls": 0}
+
+    def interrupt(self, *args):
+        self._hang.set()
+
+
+def test_live_log_off_also_skips_the_timeout_diagnostic(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(dt, "_load_config", lambda: {"live_log": False})
+    monkeypatch.setattr(dt, "_get_child_timeout", lambda: 0.3)
+    parent = MagicMock()
+    parent._touch_activity = MagicMock()
+    parent._current_task_id = None
+
+    result = dt._run_single_child(
+        task_index=0, goal="brief on <PERSON_1>", child=_HangingChild(), parent_agent=parent
+    )
+
+    assert result["status"] == "timeout"
+    assert result.get("diagnostic_path") is None
+    logs = home / "logs"
+    assert not (logs.is_dir() and list(logs.glob("subagent-timeout-*.log")))
+
+
+def test_live_log_off_drops_the_transcripts_paragraph(monkeypatch):
+    monkeypatch.setattr(dt, "_load_config", lambda: {"live_log": False})
+    assert "LIVE TRANSCRIPTS" not in dt._build_top_level_description()
+    monkeypatch.setattr(dt, "_load_config", lambda: {})
+    assert "LIVE TRANSCRIPTS" in dt._build_top_level_description()
+
+
+def test_child_sessions_go_to_the_parents_session_db():
+    parent = _make_mock_parent()
+    parent._session_db = MagicMock(name="session_db")
+    kwargs = _build_one_child(parent)
+    assert kwargs["session_db"] is parent._session_db
+    assert kwargs["parent_session_id"] == "parent-sess"
+
+
+# --- C5 (controller ruling): no background wording when delegation.background=false -----
+
+_BG_PARAM_DEFAULT = (
+    "DEPRECATED / IGNORED. Top-level single and batch "
+    "delegations run in the background automatically — you do "
+    "not need to (and cannot) opt in or out. A single result or "
+    "consolidated batch result re-enters the conversation when "
+    "the work finishes; just continue working in the meantime. "
+    "Setting this has no effect; the parameter remains only for "
+    "backward compatibility."
+)
+_WHEN_NOT_DURABLE_DEFAULT = (
+    "- Durable long-running work that must outlive the current turn -> "
+    "use cronjob (action='create') or terminal(background=True, "
+    "notify_on_complete=True) instead. Background delegations are NOT "
+    "durable: if the parent session is closed (/new) or the process exits "
+    "before a subagent finishes, that subagent's work is discarded, and "
+    "/stop cancels every running background subagent.\n\n"
+)
+
+
+def test_background_off_schema_has_no_background_or_re_enter_wording(monkeypatch):
+    monkeypatch.setattr(dt, "_load_config", lambda: {"background": False})
+    overrides = dt._build_dynamic_schema_overrides()
+    bg_param = overrides["parameters"]["properties"]["background"]["description"]
+    text = overrides["description"] + "\n" + bg_param
+    for phrase in (
+        "IN THE BACKGROUND", "in the background", "re-enter", "Background delegations",
+        "background subagent", "continue working in the meantime",
+    ):
+        assert phrase not in text, phrase
+    assert "this same tool call" in bg_param
+    assert "Stop cancels every running subagent" in overrides["description"]
+    # The static schema is never mutated by the per-call override.
+    assert dt.DELEGATE_TASK_SCHEMA["parameters"]["properties"]["background"][
+        "description"
+    ] == _BG_PARAM_DEFAULT
+
+
+def test_background_on_by_default_keeps_the_upstream_text(monkeypatch):
+    monkeypatch.setattr(dt, "_load_config", lambda: {})
+    overrides = dt._build_dynamic_schema_overrides()
+    assert overrides["parameters"]["properties"]["background"]["description"] == _BG_PARAM_DEFAULT
+    assert _WHEN_NOT_DURABLE_DEFAULT in overrides["description"]
+    assert dt.DELEGATE_TASK_SCHEMA["parameters"]["properties"]["background"][
+        "description"
+    ] == _BG_PARAM_DEFAULT
+
+
+def test_live_log_defaults_on():
+    assert dt._live_log_enabled({}) is True
+    assert dt._live_log_enabled({"live_log": False}) is False
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["delegation"]["live_log"] is True
