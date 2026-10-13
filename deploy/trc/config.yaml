@@ -32,7 +32,7 @@ platform_toolsets:
 
 # ── Analysis sandbox (trc-backend spec 2026-09-28-hermes-analysis-sandbox-design) ──
 # execute_code runs scripts in the `hermes-sandbox` container (no network, no files,
-# no secrets) and never in this process. Scripts reach data ONLY through the four
+# no secrets) and never in this process. Scripts reach data ONLY through the eight
 # tools below, via the gateway's bridge, with this request's verified identity.
 # Kill switch: remove `code_execution` from platform_toolsets.api_server.
 code_execution:
@@ -51,6 +51,10 @@ code_execution:
     - mcp__ragnarok__find_relationships
     # A script publishes a computed report with report.publish() (trc-backend spec §7).
     - mcp__ragnarok__render_report
+    # A name's candidates, and a record's neighbours or files, inside a script
+    # (orchestrator spec 2026-10-13 entity resolution §8).
+    - mcp__ragnarok__resolve_entity
+    - mcp__ragnarok__knowledge_graph
   # Gateway-only backend tool fed each run's output, for the "calculated" figure note.
   # Deliberately NOT in mcp_servers.ragnarok.tools.include: the model must not call it.
   record_computed_server: ragnarok
@@ -64,7 +68,8 @@ code_execution:
     ragnarok tools listed below, called with keyword arguments. Fetch inside the
     program when you need many rows, pass answer=False to query when you need only
     the data, and print only results — each figure with its [Sn] marker and date.
-    numpy and pandas are available.
+    numpy and pandas are available. For an entity's holdings, owners or record files, call
+    knowledge_graph with its ref rather than query.
 
 # ── Subagents (trc-orchestrator spec 2026-10-13 §5, Phase C) ──────────
 # delegate_task, for multi-section research and reports only (SOUL.md says when).
@@ -227,7 +232,7 @@ mcp_servers:
     max_concurrent_calls: 6
     max_concurrent_calls_per_user: 3
     # H1 follow-up: `tools/mcp_tool.py` honours `tools.include`/`exclude` per
-    # MCP server. Pin the six end-user tools so `ingest_document` is off the
+    # MCP server. Pin the twelve end-user tools so `ingest_document` is off the
     # wire by construction. A NEW backend tool must be added here to reach the
     # model — the allowlist is the gate, not the prompt ban.
     tools:
@@ -242,6 +247,11 @@ mcp_servers:
         - list_interactions
         - meeting_briefing
         - lookup_live
+        # Settle WHICH record a name means in one quick call before any expensive one,
+        # and walk a record's connections and files (orchestrator spec 2026-10-13 §8).
+        # Kill switch: remove these two lines; the model falls back to today's flow.
+        - resolve_entity
+        - knowledge_graph
 
 # ── Security ──────────────────────────────────────────────────────────
 # Secret redaction is ON by default — strings that look like API keys,

@@ -19,6 +19,8 @@ For: "total AUM", "how much do we manage", "assets in Q2", "portfolio value of X
 - WHEN: AUM is a point in time. "AUM in Q2 2024" means at the quarter end, 2024-06-30,
   unless the user asks for an average. State the date you used.
 - WHAT counts: assets managed (market value) versus capital committed or invested.
+- A named client, fund or entity: settle who it is with `resolve_entity` first; a near
+  match or several → ask which one, never choose for them.
 
 ## Where the answer usually is
 - A document that STATES the firm's AUM: quarterly letters, investor or board decks,

@@ -20,6 +20,10 @@ _DATA_TOOLS = {
 _SANDBOX_TOOLS = _DATA_TOOLS | {
     "mcp__ragnarok__render_report",
     "mcp__ragnarok__period_series",
+    # A name's candidates, and a record's neighbours or files, inside a script
+    # (orchestrator spec 2026-10-13 entity resolution §8).
+    "mcp__ragnarok__resolve_entity",
+    "mcp__ragnarok__knowledge_graph",
 }
 
 
@@ -46,10 +50,11 @@ def test_the_api_server_gets_ragnarok_and_code_execution_and_nothing_dangerous()
     assert not enabled & forbidden, enabled & forbidden
 
 
-def test_the_model_sees_exactly_the_eight_end_user_tools():
+def test_the_model_sees_exactly_the_end_user_tools():
     """record_computed is gateway-only and ingest_document is gone (L2); render_report is
     model-callable too (spec §7.1), so it is here as well as in sandbox_tools; period_series
-    is the multi-period series tool (trc-backend spec 2026-10-01)."""
+    is the multi-period series tool (trc-backend spec 2026-10-01); resolve_entity and
+    knowledge_graph settle a name and walk a record (orchestrator spec 2026-10-13 §8)."""
     include = set(_cfg()["mcp_servers"]["ragnarok"]["tools"]["include"])
     assert include == {
         "query",
@@ -62,6 +67,8 @@ def test_the_model_sees_exactly_the_eight_end_user_tools():
         "list_interactions",
         "meeting_briefing",
         "lookup_live",
+        "resolve_entity",
+        "knowledge_graph",
     }
 
 
@@ -74,6 +81,23 @@ def test_scripts_reach_the_read_tools_and_render_report_through_the_sidecar():
     assert ce["max_tool_calls"] == 20
     assert ce["timeout"] == 270
     assert ce["sidecar_limits"] == {"wall": 240, "cpu": 60, "mem_mb": 768}
+
+
+def test_every_ragnarok_tool_the_sandbox_intro_names_is_reachable_from_a_script():
+    """The intro is prose the model reads before writing a script: a tool it names that a
+    script cannot call costs a failed run (orchestrator spec 2026-10-13 §8)."""
+    import re
+
+    cfg = _cfg()
+    intro = cfg["code_execution"]["description_intro"]
+    sandbox = set(cfg["code_execution"]["sandbox_tools"])
+    named = {
+        tool
+        for tool in cfg["mcp_servers"]["ragnarok"]["tools"]["include"]
+        if re.search(rf"\b{tool}\b", intro)
+    }
+    assert "knowledge_graph" in named
+    assert {f"mcp__ragnarok__{tool}" for tool in named} <= sandbox
 
 
 def test_subagents_are_foreground_bounded_and_leave_no_files(tmp_path, monkeypatch):
