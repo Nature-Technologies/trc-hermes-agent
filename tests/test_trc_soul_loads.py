@@ -103,6 +103,20 @@ def test_the_soul_settles_a_name_with_resolve_entity_before_any_expensive_call(
         assert f"`{tool}`" in section, tool
     assert "TRC itself is the firm, not a name to resolve" in section
     assert "its `ref` for `knowledge_graph`" in section
+    # I1: the chosen candidate carries its source into lookup_live, never into query.
+    assert "its `ref` for `knowledge_graph`, and for `lookup_live` its source as `source`" in section
+    assert "figures and holdings \"addepar\", contacts and meetings \"affinity\"" in section
+    # I2: the non-answer outcomes each have a rule.
+    assert "`ambiguous` with no candidates → records match but none can be shown: ask for the full name." in section
+    assert "never say no record exists" in section
+    assert "`invalid` → correct the argument (drop `category` or `source`)" in section
+    # I3: an author is not a name to resolve.
+    assert "(`author` in `list_interactions`)" in section
+    # M4 / M7 / M3.
+    assert "If `match_note` says the record is named differently" in section
+    assert "trust it over the kind of token the name arrived as" in section
+    assert "several unsettled names are one question" in _flat(loaded)
+    assert "except that a name settled by `resolve_entity` is passed as the candidate's `name`" in _flat(loaded)
     # Listed with the other tools, before any routing rule uses it.
     tools = _flat(_section(loaded, '# The "ragnarok" tools'))
     assert "- `resolve_entity` —" in tools and "- `knowledge_graph` —" in tools
@@ -123,7 +137,7 @@ def test_the_soul_asks_by_the_clarification_policy_in_plain_words(tmp_path, monk
     assert "`not_found` → say no record matches that name" in section
     assert "or should I look for it in the documents?\" Make no broad search unless the user says so." in section
     # Nothing expensive first; the user chooses; no tool talk.
-    assert "Make no other call before the user answers, and never choose for them." in section
+    assert "When you ask, make no other call before the user answers, and never choose for them." in section
     assert "naming no tool or search" in section
 
 
@@ -205,3 +219,20 @@ def test_a_stale_knowledge_graph_ref_is_invalid_or_not_found_never_missing(tmp_p
         "and never tell the user the record does not exist." in flat
     )
     assert "`invalid` means a stale `ref`: resolve the name again." not in flat
+
+
+def test_graph_files_are_record_files_only_and_withheld_nodes_stay_unnamed(tmp_path, monkeypatch):
+    """I4 and M5/M8: `files` is not every document; null names and refs stay hidden."""
+    loaded = _load(tmp_path, monkeypatch)
+    flat = _flat(loaded)
+    assert (
+        "`op=\"files\"` covers only X's Addepar and Affinity records and its connections': "
+        "documents about X filed elsewhere (letters, reports, Dropbox) are found with `query`."
+    ) in flat
+    reading = _flat(_section(loaded, "# Reading a `lookup_live`, `find_relationships` or `knowledge_graph` result"))
+    assert "`files` lists X's Addepar and Affinity record files only; never present them as every document on X" in reading
+    assert "A node or file whose `name` is null is withheld: count it, never name it." in reading
+    assert "A `ref` is for tools only; never show one to the user." in reading
+    assert "Either tool's `ambiguous`: one candidate in `did_you_mean` → ask \"Did you mean X?\"" in reading
+    assert "see \"When a question can mean more than one thing\"" in flat
+    assert "a client's legal entities and accounts (Addepar)" not in flat
