@@ -51,6 +51,10 @@ code_execution:
     - mcp__ragnarok__find_relationships
     # A script publishes a computed report with report.publish() (trc-backend spec §7).
     - mcp__ragnarok__render_report
+    # A name's candidates, and a record's neighbours or files, inside a script
+    # (orchestrator spec 2026-10-13 entity resolution §8).
+    - mcp__ragnarok__resolve_entity
+    - mcp__ragnarok__knowledge_graph
   # Gateway-only backend tool fed each run's output, for the "calculated" figure note.
   # Deliberately NOT in mcp_servers.ragnarok.tools.include: the model must not call it.
   record_computed_server: ragnarok
@@ -64,7 +68,8 @@ code_execution:
     ragnarok tools listed below, called with keyword arguments. Fetch inside the
     program when you need many rows, pass answer=False to query when you need only
     the data, and print only results — each figure with its [Sn] marker and date.
-    numpy and pandas are available.
+    numpy and pandas are available. For an entity's holdings, owners or files, call
+    knowledge_graph once rather than a query per entity.
 
 # ── Subagents (trc-orchestrator spec 2026-10-13 §5, Phase C) ──────────
 # delegate_task, for multi-section research and reports only (SOUL.md says when).
@@ -240,6 +245,11 @@ mcp_servers:
         - list_interactions
         - meeting_briefing
         - lookup_live
+        # Settle WHICH record a name means in one quick call before any expensive one,
+        # and walk a record's connections and files (orchestrator spec 2026-10-13 §8).
+        # Kill switch: remove these two lines; the model falls back to today's flow.
+        - resolve_entity
+        - knowledge_graph
 
 # ── Security ──────────────────────────────────────────────────────────
 # Secret redaction is ON by default — strings that look like API keys,
