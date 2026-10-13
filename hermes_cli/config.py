@@ -2434,6 +2434,10 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+        # Write an over-budget subagent summary's full text to
+        # cache/delegation/ and point the parent at it with read_file. false =
+        # trim in place, write nothing, name no path.
+        "spill_summaries": True,
         # Replaces the generic end-of-task summary instruction in every child's
         # prompt (what you did / files modified). Empty = the generic one.
         "result_instructions": "",

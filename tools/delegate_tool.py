@@ -20,6 +20,7 @@ never the child's intermediate tool calls or reasoning.
 import enum
 import json
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 import os
@@ -541,6 +542,20 @@ def _background_enabled(cfg: Optional[dict] = None) -> bool:
     if cfg is None:
         cfg = _load_config()
     return is_truthy_value(cfg.get("background"), default=True)
+
+
+def _spill_summaries_enabled(cfg: Optional[dict] = None) -> bool:
+    """``delegation.spill_summaries`` (default true).
+
+    False means an over-budget summary is trimmed in place and its full text is
+    NOT written to ``cache/delegation/``. The footer then names no file and no
+    ``read_file`` offset. A deployment whose parent has no ``read_file``, or
+    that keeps tool output only in the session DB (TRC, invariant I5), sets
+    false.
+    """
+    if cfg is None:
+        cfg = _load_config()
+    return is_truthy_value(cfg.get("spill_summaries"), default=True)
 
 
 def _is_mcp_toolset_name(name: str) -> bool:
@@ -1649,6 +1664,32 @@ def _dump_subagent_timeout_diagnostic(
         return None
 
 
+# Shapes a trim must never cut through. Half a placeholder token cannot be
+# unmasked, half a source marker cannot be cited, and half a list marker cannot
+# be rendered. Mirrors trc-backend: app/core/redaction/tokens.py `_TOKEN_RE`
+# (`<PERSON_1>`), app/core/agent/guardrail.py `_MARKER_RE` (`[S12]`) and
+# app/core/lists/service.py `MARKER_RE` (`[[list:lst_<22 chars>]]`).
+_PROTECTED_SPAN_RE = re.compile(
+    r"<[A-Z][A-Z0-9_]*>|\[S[0-9]+\]|\[\[list:lst_[A-Za-z0-9_-]{22}\]\]"
+)
+
+
+def _protected_safe_cut(text: str, pos: int, *, toward_end: bool) -> int:
+    """Move a cut at *pos* out of any protected span it falls inside.
+
+    ``toward_end=False`` (a head's end) moves it back to the span's start, so
+    the span is dropped whole. ``toward_end=True`` (a tail's start) moves it
+    forward to the span's end. A cut exactly on a boundary is kept.
+    """
+    pos = max(0, min(len(text), pos))
+    for match in _PROTECTED_SPAN_RE.finditer(text):
+        if match.start() >= pos:
+            break
+        if match.end() > pos:
+            return match.end() if toward_end else match.start()
+    return pos
+
+
 def _spill_summary_to_file(task_index: int, summary: str) -> Optional[str]:
     """Write a subagent's full summary to the delegation cache and return path.
 
@@ -1675,33 +1716,40 @@ def _spill_summary_to_file(task_index: int, summary: str) -> Optional[str]:
 
 
 def _trim_summary_with_footer(
-    summary: str, cap: int, task_index: int
+    summary: str, cap: int, task_index: int, *, spill: bool = True
 ) -> tuple[str, Optional[str]]:
     """Return (model_text, spill_path) for one over-budget summary.
 
-    Mirrors web_extract's ``_truncate_with_footer``: keep a head+tail window
-    (~75% head / ~25% tail, snapped to line boundaries) so the subagent's
-    opening AND its closing (outcomes / files-changed / issues, which live at
-    the end) both survive, spill the full text to disk, and append a footer
-    telling the parent exactly how much it's seeing and the precise
-    ``read_file offset=`` to page into the omitted middle. Deterministic.
+    Mirrors web_extract's ``_truncate_with_footer``. It keeps a head+tail window
+    (~75% head / ~25% tail, snapped to line boundaries), so the subagent's
+    opening and its closing both survive. Neither cut ever lands inside a
+    placeholder token or a marker (``_PROTECTED_SPAN_RE``). With ``spill`` the
+    full text goes to disk, and the footer gives the exact ``read_file
+    offset=`` for the omitted middle. Without it, nothing is written and the
+    footer names no path. Deterministic.
     """
     original_len = len(summary)
     head_budget = int(cap * 0.75)
     tail_budget = cap - head_budget
 
-    head = summary[:head_budget]
-    tail = summary[-tail_budget:]
+    head_end = head_budget
     # Snap the head cut back to the last newline so we don't slice mid-line.
-    nl = head.rfind("\n")
+    nl = summary.rfind("\n", 0, head_end)
     if nl > head_budget * 0.5:
-        head = head[:nl]
-    # Snap the tail cut forward to the next newline for the same reason.
-    nl = tail.find("\n")
-    if 0 <= nl < tail_budget * 0.5:
-        tail = tail[nl + 1:]
+        head_end = nl
+    head_end = _protected_safe_cut(summary, head_end, toward_end=False)
 
-    spill_path = _spill_summary_to_file(task_index, summary)
+    tail_start = original_len - tail_budget
+    # Snap the tail cut forward to the next newline for the same reason.
+    nl = summary.find("\n", tail_start)
+    if 0 <= nl - tail_start < tail_budget * 0.5:
+        tail_start = nl + 1
+    tail_start = _protected_safe_cut(summary, tail_start, toward_end=True)
+
+    head = summary[:head_end]
+    tail = summary[tail_start:]
+
+    spill_path = _spill_summary_to_file(task_index, summary) if spill else None
 
     footer_lines = [
         "",
@@ -1718,10 +1766,15 @@ def _trim_summary_with_footer(
             f"offset={middle_start_line} limit=200  (the file is the complete "
             f"summary; raise/lower offset to page through it)."
         )
-    else:
+    elif spill:
         footer_lines.append(
             "Full output could not be stored to disk; the head+tail above is "
             "all that was preserved."
+        )
+    else:
+        footer_lines.append(
+            "The omitted middle is not available. If you need it, delegate a "
+            "narrower task."
         )
     footer_lines.append("─" * 37)
 
@@ -1794,6 +1847,7 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
         static_ceiling = int(cfg.get("max_summary_chars", DEFAULT_MAX_SUMMARY_CHARS))
     except (TypeError, ValueError):
         static_ceiling = DEFAULT_MAX_SUMMARY_CHARS
+    spill = _spill_summaries_enabled(cfg)
 
     dynamic_budget = _parent_summary_char_budget(parent_agent, len(summaries))
 
@@ -1809,7 +1863,7 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
             continue
         original_len = len(summary)
         model_text, spill_path = _trim_summary_with_footer(
-            summary, cap, entry.get("task_index", -1)
+            summary, cap, entry.get("task_index", -1), spill=spill
         )
         entry["summary"] = model_text
         entry["summary_truncated"] = True

@@ -437,3 +437,132 @@ def test_a_child_system_prompt_carries_the_trc_soul_rules(tmp_path, monkeypatch)
         stable = build_system_prompt_parts(child_like)["stable"]
     assert stable.startswith("RULE ZERO")
     assert DEFAULT_AGENT_IDENTITY not in stable
+
+
+# --- C4: token/marker-safe truncation ----------------------------------------------------
+
+_SEP = "\n\n[... middle omitted — see footer ...]\n\n"
+_UNIT = (
+    "Revenue at <ORGANIZATION_12> rose to <MONEY_4> [S3]; holders "
+    "[[list:lst_" + "A" * 22 + "]] and <PERSON_105> [S27]. "
+)
+
+
+def _head_and_tail(model_text):
+    head, rest = model_text.split(_SEP, 1)
+    return head, rest.split("\n" + "─" * 8, 1)[0]
+
+
+def _has_partial_span(part):
+    """Any '<', '>', '[' or ']' left after removing every whole token/marker is a fragment."""
+    rest = dt._PROTECTED_SPAN_RE.sub("", part)
+    return any(ch in rest for ch in "<>[]")
+
+
+def test_truncation_never_splits_a_token_or_marker():
+    text = _UNIT * 300  # no newlines: the line snap cannot rescue a bad cut
+    for cap in range(2000, 2400, 7):
+        model_text, _ = dt._trim_summary_with_footer(text, cap, 0, spill=False)
+        head, tail = _head_and_tail(model_text)
+        assert text.startswith(head) and text.endswith(tail), cap
+        assert not _has_partial_span(head), (cap, head[-40:])
+        assert not _has_partial_span(tail), (cap, tail[:40])
+
+
+def test_truncation_without_spill_names_no_path_and_no_read_file(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    model_text, path = dt._trim_summary_with_footer(_UNIT * 300, 2000, 0, spill=False)
+    assert path is None
+    assert "[SUMMARY TRUNCATED]" in model_text
+    for leak in ("read_file", "saved to", "disk", str(home)):
+        assert leak not in model_text, leak
+    assert not (home / "cache" / "delegation").exists()
+
+
+def test_summary_budget_honours_spill_summaries_false(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(
+        dt, "_load_config", lambda: {"max_summary_chars": 2000, "spill_summaries": False}
+    )
+
+    class _Bare:
+        pass
+
+    results = [{"task_index": 0, "summary": _UNIT * 300, "status": "completed"}]
+    dt._apply_summary_budget(results, _Bare())
+    entry = results[0]
+    assert entry["summary_truncated"] is True
+    assert "summary_full_path" not in entry
+    assert "read_file" not in entry["summary"]
+    head, tail = _head_and_tail(entry["summary"])
+    assert not _has_partial_span(head) and not _has_partial_span(tail)
+    assert not (home / "cache" / "delegation").exists()
+
+
+def test_a_result_with_tokens_and_markers_reaches_the_parent_byte_for_byte():
+    findings = (
+        "<ORGANIZATION_3> NAV was $4.2m at 30 June 2026 [S1]; <PERSON_12> holds 40% [S2]. "
+        "Holders: [[list:lst_" + "B" * 22 + "]]"
+    )
+
+    def _factory(*args, **kwargs):
+        child = MagicMock()
+        child.model = "m"
+        child.session_prompt_tokens = 0
+        child.session_completion_tokens = 0
+        child.session_estimated_cost_usd = 0.0
+        child._credential_pool = None
+        child.run_conversation.return_value = {
+            "final_response": findings, "completed": True, "interrupted": False,
+            "api_calls": 1, "messages": [],
+        }
+        return child
+
+    with patch("run_agent.AIAgent", side_effect=_factory):
+        out = json.loads(dt.delegate_task(goal="brief", parent_agent=_make_mock_parent()))
+    assert out["results"][0]["summary"] == findings
+
+
+@pytest.mark.parametrize("offset", range(1, len("<ORGANIZATION_12>")))
+def test_protected_safe_cut_inside_a_token_moves_to_its_edges(offset):
+    text = "abc <ORGANIZATION_12> xyz"
+    start = text.index("<")
+    end = start + len("<ORGANIZATION_12>")
+    pos = start + offset
+    assert dt._protected_safe_cut(text, pos, toward_end=False) == start
+    assert dt._protected_safe_cut(text, pos, toward_end=True) == end
+    # A cut exactly on a boundary is kept.
+    assert dt._protected_safe_cut(text, start, toward_end=False) == start
+    assert dt._protected_safe_cut(text, end, toward_end=True) == end
+
+
+def test_protected_safe_cut_between_adjacent_tokens_is_kept():
+    text = "<PERSON_1><MONEY_2>[S3][[list:lst_" + "C" * 22 + "]]"
+    for boundary in (0, 10, 19, 23, len(text)):
+        assert dt._protected_safe_cut(text, boundary, toward_end=False) == boundary
+        assert dt._protected_safe_cut(text, boundary, toward_end=True) == boundary
+    # Inside the second token of an adjacent pair: snaps to that token, not the first.
+    assert dt._protected_safe_cut(text, 13, toward_end=False) == 10
+    assert dt._protected_safe_cut(text, 13, toward_end=True) == 19
+
+
+def test_truncation_of_a_summary_that_is_nearly_all_tokens():
+    text = ("<PERSON_105><ORGANIZATION_12>[S27][[list:lst_" + "D" * 22 + "]]") * 200 + "end"
+    for cap in range(2000, 2100, 3):
+        model_text, _ = dt._trim_summary_with_footer(text, cap, 0, spill=False)
+        head, tail = _head_and_tail(model_text)
+        assert text.startswith(head) and text.endswith(tail), cap
+        assert not _has_partial_span(head), (cap, head[-40:])
+        assert not _has_partial_span(tail), (cap, tail[:40])
+
+
+def test_spill_summaries_defaults_on():
+    assert dt._spill_summaries_enabled({}) is True
+    assert dt._spill_summaries_enabled({"spill_summaries": False}) is False
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["delegation"]["spill_summaries"] is True
