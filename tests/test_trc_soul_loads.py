@@ -160,3 +160,18 @@ def test_the_soul_never_picks_a_candidate_for_the_user(tmp_path, monkeypatch):
     assert "re-call with that one's `subject_user_id`" in query_rules
     live_rules = _flat(_section(loaded, "# Reading a `lookup_live`, `find_relationships`"))
     assert "lists `candidates`: ask the user which one, listing them; never choose for them." in live_rules
+
+
+def test_connections_ownership_and_files_route_to_knowledge_graph(tmp_path, monkeypatch):
+    """Spec §8 "Use the graph tool"; `query` stays for what documents say."""
+    loaded = _load(tmp_path, monkeypatch)
+    flat = _flat(loaded)
+    assert (
+        "what X owns or who owns it, which accounts a client holds, who or what X is "
+        "connected to, the files about X → `knowledge_graph` with X's `ref`" in flat
+    )
+    assert "What the documents SAY about X is still `query`." in flat
+    reading = _flat(_section(loaded, "# Reading a `lookup_live`, `find_relationships` or `knowledge_graph` result"))
+    assert "`knowledge_graph`: `nodes` and `edges` are the data" in reading
+    assert "never that X has no connections or files" in reading
+    assert "find_relationships, resolve_entity and knowledge_graph. Nothing else is reachable." in flat
