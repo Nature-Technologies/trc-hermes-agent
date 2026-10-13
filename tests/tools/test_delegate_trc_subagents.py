@@ -352,3 +352,88 @@ def test_foreground_mode_tells_the_model_the_results_arrive_in_this_call(monkeyp
     assert "this same tool call" in desc
     monkeypatch.setattr(dt, "_load_config", lambda: {})
     assert "RUN IN THE BACKGROUND" in dt._build_top_level_description()
+
+
+# --- C3: TRC rules in children -----------------------------------------------------------
+
+from pathlib import Path as _Path
+
+_TRC_SOUL = _Path(__file__).resolve().parents[2] / "deploy" / "trc" / "SOUL.md"
+
+
+def test_a_configured_result_contract_replaces_the_generic_summary_instruction():
+    prompt = dt._build_child_system_prompt(
+        "Brief on <ORGANIZATION_3>",
+        result_instructions="Return findings with every [Sn] marker.",
+    )
+    assert "YOUR TASK:\nBrief on <ORGANIZATION_3>" in prompt
+    assert "Return findings with every [Sn] marker." in prompt
+    assert "Any files you created or modified" not in prompt
+    assert "/workspace" not in prompt
+
+
+def test_without_a_contract_the_generic_instruction_is_unchanged():
+    prompt = dt._build_child_system_prompt("Fix the tests")
+    assert "Any files you created or modified" in prompt
+
+
+def _build_one_child(parent=None):
+    with patch("run_agent.AIAgent") as MockAgent:
+        MockAgent.return_value = MagicMock()
+        dt._build_child_agent(
+            task_index=0, goal="g", context=None, toolsets=None, model=None,
+            max_iterations=6, task_count=1, parent_agent=parent or _make_mock_parent(),
+        )
+    return MockAgent.call_args.kwargs
+
+
+def test_children_are_built_with_soul_and_the_configured_contract(monkeypatch):
+    monkeypatch.setattr(
+        dt, "_load_config", lambda: {"result_instructions": "CONTRACT: copy tokens verbatim."}
+    )
+    kwargs = _build_one_child()
+    assert kwargs["load_soul_identity"] is True
+    assert kwargs["skip_context_files"] is True  # cwd project files stay out
+    assert "CONTRACT: copy tokens verbatim." in kwargs["ephemeral_system_prompt"]
+
+
+def test_a_child_system_prompt_carries_the_trc_soul_rules(tmp_path, monkeypatch):
+    """The real prompt builder, given the flags the child is built with, picks up the TRC
+    SOUL.md and not Hermes' stock identity."""
+    import shutil
+    from types import SimpleNamespace
+
+    from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
+    from agent.system_prompt import build_system_prompt_parts
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    shutil.copy(_TRC_SOUL, home / "SOUL.md")
+    monkeypatch.setattr(dt, "_load_config", lambda: {})
+
+    kwargs = _build_one_child()
+    child_like = SimpleNamespace(
+        load_soul_identity=kwargs["load_soul_identity"],
+        skip_context_files=kwargs["skip_context_files"],
+        valid_tool_names=[],
+        _task_completion_guidance=False,
+        _tool_use_enforcement=False,
+        _environment_probe=False,
+        _kanban_worker_guidance="",
+        _memory_store=None,
+        _memory_manager=None,
+        model="",
+        provider="",
+        platform=kwargs["platform"],
+        pass_session_id=False,
+        session_id="",
+    )
+    with (
+        patch("run_agent.build_nous_subscription_prompt", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value=""),
+    ):
+        stable = build_system_prompt_parts(child_like)["stable"]
+    assert stable.startswith("RULE ZERO")
+    assert DEFAULT_AGENT_IDENTITY not in stable

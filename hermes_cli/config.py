@@ -2434,6 +2434,9 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+        # Replaces the generic end-of-task summary instruction in every child's
+        # prompt (what you did / files modified). Empty = the generic one.
+        "result_instructions": "",
         # Model-issued delegations run in the background by default: the result
         # comes back as a new message later. false = always foreground: the tool
         # call returns the children's results in the same turn, children stay

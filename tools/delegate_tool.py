@@ -683,6 +683,7 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
+    result_instructions: Optional[str] = None,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -705,20 +706,30 @@ def _build_child_system_prompt(
             f"{workspace_path}\n"
             "Use this exact path for local repository/workdir operations unless the task explicitly says otherwise."
         )
-    parts.append(
-        "\nComplete this task using the tools available to you. "
-        "When finished, provide a clear, concise summary of:\n"
-        "- What you did\n"
-        "- What you found or accomplished\n"
-        "- Any files you created or modified\n"
-        "- Any issues encountered\n\n"
-        "Important workspace rule: Never assume a repository lives at /workspace/... or any other container-style path unless the task/context explicitly gives that path. "
-        "If no exact local path is provided, discover it first before issuing git/workdir-specific commands.\n\n"
-        "Keep your final summary tight: lead with outcomes, prefer bullet "
-        "points over paragraphs, and don't replay your whole process. Your "
-        "response is returned to the parent agent as a summary, and overlong "
-        "summaries crowd out the parent's context window."
-    )
+    if result_instructions and str(result_instructions).strip():
+        # Deployment-defined result contract (delegation.result_instructions).
+        # It replaces the generic "what you did / files modified" summary, the
+        # /workspace rule and the brevity advice, none of which fit a child
+        # without terminal or file tools.
+        parts.append(
+            "\nComplete this task using the tools available to you.\n\n"
+            + str(result_instructions).strip()
+        )
+    else:
+        parts.append(
+            "\nComplete this task using the tools available to you. "
+            "When finished, provide a clear, concise summary of:\n"
+            "- What you did\n"
+            "- What you found or accomplished\n"
+            "- Any files you created or modified\n"
+            "- Any issues encountered\n\n"
+            "Important workspace rule: Never assume a repository lives at /workspace/... or any other container-style path unless the task/context explicitly gives that path. "
+            "If no exact local path is provided, discover it first before issuing git/workdir-specific commands.\n\n"
+            "Keep your final summary tight: lead with outcomes, prefer bullet "
+            "points over paragraphs, and don't replay your whole process. Your "
+            "response is returned to the parent agent as a summary, and overlong "
+            "summaries crowd out the parent's context window."
+        )
     if role == "orchestrator":
         child_note = (
             "Your own children MUST be leaves (cannot delegate further) "
@@ -1212,6 +1223,7 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+        result_instructions=delegation_cfg.get("result_instructions"),
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -1401,6 +1413,10 @@ def _build_child_agent(
             log_prefix=f"[subagent-{task_index}]",
             platform="subagent",
             skip_context_files=True,
+            # SOUL.md is the deployment's identity and rules (TRC: masking,
+            # citations, security). A child without it runs on the stock
+            # DEFAULT_AGENT_IDENTITY. cwd project files stay skipped.
+            load_soul_identity=True,
             skip_memory=True,
             clarify_callback=None,
             thinking_callback=child_thinking_cb,
