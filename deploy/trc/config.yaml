@@ -63,6 +63,38 @@ code_execution:
     the data, and print only results — each figure with its [Sn] marker and date.
     numpy and pandas are available.
 
+# ── Subagents (trc-orchestrator spec 2026-10-13 §5, Phase C) ──────────
+# delegate_task, for multi-section research and reports only (SOUL.md says when).
+# Enabled by `delegation` in platform_toolsets.api_server above.
+# Kill switch: remove it from there.
+delegation:
+  # Foreground only. The API server cannot hand a detached result back to the
+  # user's request: background would end the turn and answer later through a
+  # wake self-POST, a new turn outside the request that carried the identity.
+  background: false
+  # Nothing on disk outside the session DB (invariant I5): no live transcripts
+  # under cache/delegation/live, no summary spill files, no timeout diagnostic
+  # in logs/. Child sessions are in the session DB with parent_session_id.
+  live_log: false
+  spill_summaries: false
+  max_concurrent_children: 3
+  max_spawn_depth: 1
+  max_iterations: 6
+  # Above the 160 s MCP timeout below, so a child's one slow query returns, or
+  # times out with a structured result, before the child itself is cut off.
+  child_timeout_seconds: 170
+  # model / provider deliberately unset: children inherit the route's model and
+  # its provider filters, the data-retention decision in "Served model" below.
+  result_instructions: >-
+    Your reply goes to the assistant that gave you this task, not to the user.
+    Return your findings, not an account of what you did. Give every figure
+    with its unit, its date or period, and its [Sn] marker, exactly as the tool
+    returned them. Copy every placeholder in angle brackets and every [Sn]
+    marker character for character: never rename, renumber, merge, split or
+    drop one, and never replace one with a description. Never summarise a
+    figure away: every figure that bears on the task appears in your reply.
+    Say plainly what you looked for and did not find.
+
 # ── Loop guardrails (H4) ──────────────────────────────────────────────
 # `hard_stop_enabled` ships false and `max_turns` ships 90: a model looping on
 # a failing tool could spend ninety turns of external inference before anyone

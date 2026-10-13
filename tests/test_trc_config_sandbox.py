@@ -72,3 +72,32 @@ def test_scripts_reach_the_read_tools_and_render_report_through_the_sidecar():
     assert ce["max_tool_calls"] == 20
     assert ce["timeout"] == 270
     assert ce["sidecar_limits"] == {"wall": 240, "cpu": 60, "mem_mb": 768}
+
+
+def test_subagents_are_foreground_bounded_and_leave_no_files(tmp_path, monkeypatch):
+    """Spec 2026-10-13 §5 C2/C3/C5/C6, read through the MERGED config the delegate tool
+    acts on, not just the raw file."""
+    import shutil
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    shutil.copy(_DEPLOYED, home / "config.yaml")
+
+    from tools import delegate_tool as dt
+
+    cfg = dt._load_config()
+    assert dt._background_enabled(cfg) is False
+    assert dt._live_log_enabled(cfg) is False
+    assert dt._spill_summaries_enabled(cfg) is False
+    assert dt._get_max_concurrent_children() == 3
+    assert dt._get_max_spawn_depth() == 1
+    assert dt._get_child_timeout() == 170.0
+    assert cfg["max_iterations"] == 6
+    # Unset, so children inherit the route's model and its provider filters.
+    raw = _cfg()["delegation"]
+    assert "model" not in raw and "provider" not in raw
+    assert not cfg.get("model") and not cfg.get("provider")
+    contract = cfg["result_instructions"]
+    for phrase in ("[Sn]", "placeholder", "figure"):
+        assert phrase in contract, phrase
