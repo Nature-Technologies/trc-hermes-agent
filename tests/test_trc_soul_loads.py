@@ -29,3 +29,22 @@ def test_the_deployed_soul_loads_as_the_trc_prompt(tmp_path, monkeypatch):
     loaded = load_soul_md() or ""
     assert not loaded.startswith("[BLOCKED"), loaded[:200]
     assert loaded.startswith("RULE ZERO")
+
+
+def test_the_soul_keeps_subagents_for_reports_and_comparisons_in_one_turn(tmp_path, monkeypatch):
+    """Spec 2026-10-13 §5 C8: subagents only for multi-section research or reports; a
+    comparison is parallel lookups in one turn (cheaper and faster)."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    shutil.copy(_DEPLOYED, home / "SOUL.md")
+
+    from agent.prompt_builder import load_soul_md
+
+    # A real context window, as the agent passes: without one the 20K floor head/tail-trims.
+    loaded = load_soul_md(256_000) or ""
+    start = loaded.index("# Subagents (`delegate_task`)")
+    section = loaded[start:loaded.index("\n# ", start + 1)]
+    assert "ONLY for multi-section research or a report" in section
+    assert "Never use" in section and "comparison" in section
+    assert "all of them in the same turn" in section

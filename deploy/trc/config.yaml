@@ -26,6 +26,9 @@ platform_toolsets:
     - ragnarok
     - code_execution
     - skills_readonly
+    # delegate_task (spec 2026-10-13 §5): children get the three above, never
+    # delegate_task itself. Kill switch: remove this line. See `delegation:` below.
+    - delegation
 
 # ── Analysis sandbox (trc-backend spec 2026-09-28-hermes-analysis-sandbox-design) ──
 # execute_code runs scripts in the `hermes-sandbox` container (no network, no files,

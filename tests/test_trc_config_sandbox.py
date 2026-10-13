@@ -29,18 +29,19 @@ def _cfg() -> dict:
 
 def test_the_api_server_gets_ragnarok_and_code_execution_and_nothing_dangerous():
     """Plugin toolsets are on by default upstream, so this pins what must be present
-    and what must never be, rather than exact equality."""
+    and what must never be, rather than exact equality. `delegation` is allowed since
+    spec 2026-10-13 §5: children inherit only these toolsets, minus delegate_task."""
     from hermes_cli.tools_config import _get_platform_tools
     from tools.registry import discover_builtin_tools
 
     discover_builtin_tools()
     enabled = _get_platform_tools(_cfg(), "api_server")
-    assert {"ragnarok", "code_execution", "skills_readonly"} <= enabled
+    assert {"ragnarok", "code_execution", "skills_readonly", "delegation"} <= enabled
     # `skills` would add skill_manage: a model-written skill is an unreviewed prompt
     # that persists into every later session (deploy/trc/config.yaml, 2026-10-05).
     forbidden = {
         "terminal", "file", "web", "browser", "browser-cdp",
-        "delegation", "computer_use", "debugging", "coding", "skills",
+        "computer_use", "debugging", "coding", "skills",
     }
     assert not enabled & forbidden, enabled & forbidden
 
@@ -101,3 +102,9 @@ def test_subagents_are_foreground_bounded_and_leave_no_files(tmp_path, monkeypat
     contract = cfg["result_instructions"]
     for phrase in ("[Sn]", "placeholder", "figure"):
         assert phrase in contract, phrase
+
+
+def test_delegation_is_the_only_toolset_added_for_subagents():
+    assert _cfg()["platform_toolsets"]["api_server"] == [
+        "ragnarok", "code_execution", "skills_readonly", "delegation",
+    ]
