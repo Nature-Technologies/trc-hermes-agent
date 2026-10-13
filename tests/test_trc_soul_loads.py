@@ -193,3 +193,15 @@ def test_resolve_first_covers_scripts_generate_report_and_several_names(tmp_path
     )
     assert "Names are settled in chat before the script; a script never chooses between candidates." in flat
     assert "Never pair `generate_report` with any tool but `resolve_entity`" in flat
+
+
+def test_a_stale_knowledge_graph_ref_is_invalid_or_not_found_never_missing(tmp_path, monkeypatch):
+    """A ref from another session or an expired one returns `not_found`; a malformed one
+    returns `invalid`. Both mean stale: resolve again, never claim the record is absent."""
+    loaded = _load(tmp_path, monkeypatch)
+    flat = _flat(loaded)
+    assert (
+        "`invalid` or `not_found` for a `ref` means it is stale: resolve the name again, "
+        "and never tell the user the record does not exist." in flat
+    )
+    assert "`invalid` means a stale `ref`: resolve the name again." not in flat
