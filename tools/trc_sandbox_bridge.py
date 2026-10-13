@@ -200,14 +200,37 @@ def _turn_key() -> Optional[tuple]:
     return (identity_hash, chat, request)
 
 
+# Transient outcomes: a retry in the same turn must reach the server again.
+_UNCACHEABLE_STATUSES = frozenset({"busy", "timeout"})
+
+
+def _has_transient_status(value: Any) -> bool:
+    return isinstance(value, dict) and value.get("status") in _UNCACHEABLE_STATUSES
+
+
 def _is_cacheable(result: Any) -> bool:
+    """Errors and a ``busy`` / ``timeout`` status are not cached. The status is
+    read at the top level, in ``structuredContent``, and in an MCP ``result``
+    (a dict, or JSON text)."""
     if not isinstance(result, str):
         return False
     try:
         parsed = json.loads(result)
     except ValueError:
         return True
-    return not (isinstance(parsed, dict) and "error" in parsed)
+    if not isinstance(parsed, dict):
+        return True
+    if "error" in parsed:
+        return False
+    if _has_transient_status(parsed) or _has_transient_status(parsed.get("structuredContent")):
+        return False
+    inner = parsed.get("result")
+    if isinstance(inner, str):
+        try:
+            inner = json.loads(inner)
+        except ValueError:
+            return True
+    return not _has_transient_status(inner)
 
 
 def cached_bridged_call(tool_name: str, args: dict, call: Callable[[], str]) -> str:
