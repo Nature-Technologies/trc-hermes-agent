@@ -215,3 +215,140 @@ def test_background_children_keep_the_identity_of_the_request_that_spawned_them(
     assert seen["bg-1"]["identity"] == "jwt-bg"
     assert seen["bg-1"]["chat_id"] == "chat-bg"
     assert seen["bg-1"]["request_id"] == "req-bg"
+
+
+# --- C2: foreground on the API server ----------------------------------------------------
+
+_CREDS = {
+    "model": "m", "provider": None, "base_url": None, "api_key": None,
+    "api_mode": None, "command": None, "args": None,
+}
+
+
+def _bind_api_server_request(sid="raw-sid-7"):
+    """What ApiServerAdapter._bind_api_server_session binds for a continuable turn,
+    which is exactly the case that upstream dispatches in the background and wakes."""
+    from gateway.session_context import set_session_vars
+
+    set_session_vars(
+        platform="api_server", chat_id=sid, session_key=sid, session_id=sid,
+        async_delivery=False,
+    )
+
+
+def _no_background_dispatch(*args, **kwargs):
+    raise AssertionError("delegate_task dispatched in the background on the API server")
+
+
+def test_api_server_delegation_returns_results_in_the_same_request(monkeypatch):
+    import run_agent
+    import tools.async_delegation as ad
+
+    fake_child = MagicMock()
+    fake_child._delegate_role = "leaf"
+    fake_child.tool_progress_callback = None
+
+    def _fast_child(task_index, goal, child=None, parent_agent=None, **kw):
+        return {
+            "task_index": task_index, "status": "completed",
+            "summary": f"findings: {goal}", "api_calls": 1,
+            "duration_seconds": 0.1, "model": "m", "exit_reason": "completed",
+        }
+
+    monkeypatch.setattr(dt, "_load_config", lambda: {"background": False})
+    monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: fake_child)
+    monkeypatch.setattr(dt, "_run_single_child", _fast_child)
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: _CREDS)
+    monkeypatch.setattr(ad, "dispatch_async_delegation_batch", _no_background_dispatch)
+    _bind_api_server_request()
+
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent.session_id = "raw-sid-7"
+    parent._active_children = []
+    parent._active_children_lock = threading.Lock()
+
+    # The live model path, which asks for background=True on every top-level call.
+    single = json.loads(run_agent.AIAgent._dispatch_delegate_task(parent, {"goal": "brief on X"}))
+    batch = json.loads(run_agent.AIAgent._dispatch_delegate_task(
+        parent, {"tasks": [{"goal": "part 1"}, {"goal": "part 2"}]}
+    ))
+
+    assert single.get("status") != "dispatched"
+    assert single["results"][0]["summary"] == "findings: brief on X"
+    assert [r["summary"] for r in batch["results"]] == ["findings: part 1", "findings: part 2"]
+    # No completion event was queued, so gateway/wake.py has nothing to self-POST.
+    assert process_registry.completion_queue.empty()
+
+
+def _bare_agent():
+    """AIAgent with only the interrupt fields (tests/run_agent/test_interrupt_propagation.py)."""
+    from run_agent import AIAgent
+
+    agent = AIAgent.__new__(AIAgent)
+    agent._interrupt_requested = False
+    agent._interrupt_message = None
+    agent._execution_thread_id = None
+    agent._interrupt_thread_signal_pending = False
+    agent._active_children = []
+    agent._active_children_lock = threading.Lock()
+    agent.quiet_mode = True
+    agent.provider = "openrouter"
+    agent.model = "test/model"
+    agent._base_url = "http://localhost:1234"
+    return agent
+
+
+def test_stop_on_the_parent_interrupts_a_running_foreground_child(monkeypatch):
+    parent = _bare_agent()
+    parent._delegate_depth = 0
+    parent.session_id = "raw-sid-7"
+    child = _bare_agent()
+    started = threading.Event()
+
+    def _build(**kw):
+        # The real _build_child_agent registers the child for interrupt fan-out.
+        with parent._active_children_lock:
+            parent._active_children.append(child)
+        return child
+
+    def _run_until_interrupted(task_index, goal, child=None, parent_agent=None, **kw):
+        started.set()
+        deadline = time.monotonic() + 5
+        while not child._interrupt_requested and time.monotonic() < deadline:
+            time.sleep(0.01)
+        status = "interrupted" if child._interrupt_requested else "completed"
+        return {
+            "task_index": task_index, "status": status, "summary": None,
+            "api_calls": 0, "duration_seconds": 0.0, "exit_reason": status,
+        }
+
+    monkeypatch.setattr(dt, "_load_config", lambda: {"background": False})
+    monkeypatch.setattr(dt, "_build_child_agent", _build)
+    monkeypatch.setattr(dt, "_run_single_child", _run_until_interrupted)
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: _CREDS)
+
+    out = {}
+
+    def _request():
+        _bind_api_server_request()
+        out["raw"] = dt.delegate_task(goal="long report", background=True, parent_agent=parent)
+
+    t = threading.Thread(target=_request)
+    t.start()
+    assert started.wait(5)
+    parent.interrupt("Stop")  # what the SSE writer does on client disconnect / Stop
+    t.join(timeout=10)
+
+    result = json.loads(out["raw"])
+    assert result["results"][0]["status"] == "interrupted"
+    assert child._interrupt_requested is True
+
+
+def test_foreground_mode_tells_the_model_the_results_arrive_in_this_call(monkeypatch):
+    monkeypatch.setattr(dt, "_load_config", lambda: {"background": False})
+    desc = dt._build_top_level_description()
+    assert "RUN IN THE BACKGROUND" not in desc
+    assert "this same tool call" in desc
+    monkeypatch.setattr(dt, "_load_config", lambda: {})
+    assert "RUN IN THE BACKGROUND" in dt._build_top_level_description()

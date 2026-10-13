@@ -527,6 +527,22 @@ def _get_inherit_mcp_toolsets() -> bool:
     return is_truthy_value(cfg.get("inherit_mcp_toolsets"), default=True)
 
 
+def _background_enabled(cfg: Optional[dict] = None) -> bool:
+    """``delegation.background`` (default true).
+
+    When false, every delegation runs in the foreground, whatever the caller
+    asked for. The parent's tool call waits for the children and returns their
+    results. The children stay in ``parent._active_children``, so Stop
+    interrupts them. No async completion is queued, so ``gateway/wake.py`` has
+    nothing to self-POST. The TRC API server sets it: a detached result could
+    only come back as a new wake turn, outside the user's request and the
+    identity it carried.
+    """
+    if cfg is None:
+        cfg = _load_config()
+    return is_truthy_value(cfg.get("background"), default=True)
+
+
 def _is_mcp_toolset_name(name: str) -> bool:
     """Return True for canonical MCP toolsets and their registered aliases."""
     if not name:
@@ -2503,6 +2519,11 @@ def delegate_task(
 
     # Load config
     cfg = _load_config()
+    # delegation.background=false: foreground, whatever the caller asked for.
+    # This covers the live model path (run_agent._dispatch_delegate_task
+    # always asks for background) and the registry fallback alike.
+    if background and not _background_enabled(cfg):
+        background = False
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     # Model-supplied max_iterations is ignored — the config value is authoritative
     # so users get predictable budgets. The kwarg is retained for internal callers
@@ -3425,6 +3446,37 @@ def _build_top_level_description() -> str:
             f"config.yaml to enable nesting."
         )
 
+    try:
+        delegation_cfg = _load_config()
+    except Exception:
+        delegation_cfg = {}
+
+    if _background_enabled(delegation_cfg):
+        run_mode_clause = (
+            "BOTH MODES RUN IN THE BACKGROUND. delegate_task returns immediately — "
+            "you and the user keep working, and the completed result re-enters "
+            "the conversation as a new message. A "
+            "batch returns one handle, runs N subagents concurrently, and delivers "
+            "one consolidated result after ALL of them finish. Do NOT wait or poll; "
+            "just continue with other work after dispatching.\n\n"
+        )
+    else:
+        run_mode_clause = (
+            "BOTH MODES RUN IN THE FOREGROUND. delegate_task waits for every "
+            "subagent and returns all of their results in this same tool call; "
+            "use them in your answer. There is nothing to wait for or poll "
+            "afterwards.\n\n"
+        )
+    live_transcripts_clause = (
+        "LIVE TRANSCRIPTS: the dispatch response includes 'live_transcripts' — "
+        "one append-only human-readable log file per task (under "
+        "cache/delegation/live/<delegation_id>/). Each child streams its "
+        "assistant text, tool calls, and tool results there while it runs. "
+        "Read (or `tail -f` in a terminal) those paths any time you or the "
+        "user want to see what a subagent is actually doing instead of "
+        "waiting for the final summary.\n\n"
+    )
+
     return (
         "Spawn one or more subagents to work on tasks in isolated contexts. "
         "Each subagent gets its own conversation, terminal session, and toolset. "
@@ -3435,19 +3487,9 @@ def _build_top_level_description() -> str:
         f"2. Batch (parallel): provide 'tasks' array with up to {max_children} "
         f"items concurrently for this user (configured via "
         f"delegation.max_concurrent_children in config.yaml). {nesting_clause}\n\n"
-        "BOTH MODES RUN IN THE BACKGROUND. delegate_task returns immediately — "
-        "you and the user keep working, and the completed result re-enters "
-        "the conversation as a new message. A "
-        "batch returns one handle, runs N subagents concurrently, and delivers "
-        "one consolidated result after ALL of them finish. Do NOT wait or poll; "
-        "just continue with other work after dispatching.\n\n"
-        "LIVE TRANSCRIPTS: the dispatch response includes 'live_transcripts' — "
-        "one append-only human-readable log file per task (under "
-        "cache/delegation/live/<delegation_id>/). Each child streams its "
-        "assistant text, tool calls, and tool results there while it runs. "
-        "Read (or `tail -f` in a terminal) those paths any time you or the "
-        "user want to see what a subagent is actually doing instead of "
-        "waiting for the final summary.\n\n"
+        + run_mode_clause
+        + live_transcripts_clause
+        +
         "WHEN TO USE delegate_task:\n"
         "- Reasoning-heavy subtasks (debugging, code review, research synthesis)\n"
         "- Tasks that would flood your context with intermediate data\n"
