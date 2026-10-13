@@ -144,3 +144,19 @@ def test_resolving_names_spends_no_lookup_and_subagents_get_settled_names(tmp_pa
     assert "up to THREE data-tool calls for one user message (`resolve_entity` calls not counted)" in calls
     helpers = _flat(_section(loaded, "# Subagents (`delegate_task`)"))
     assert "settle every name with `resolve_entity` first" in helpers
+
+
+def test_the_soul_never_picks_a_candidate_for_the_user(tmp_path, monkeypatch):
+    """Spec §8 "Ask, don't pick": both pick-yourself lines are gone."""
+    raw = _flat(_DEPLOYED.read_text(encoding="utf-8"))
+    assert "re-call with exactly one" not in raw
+    assert "to pick one candidate" not in raw
+    loaded = _load(tmp_path, monkeypatch)
+    query_rules = _flat(_section(loaded, "# Reading a `query` result"))
+    assert (
+        "`status: \"ambiguous\"` lists `candidates`: ask the user which one they mean, "
+        "listing them; never choose for them." in query_rules
+    )
+    assert "re-call with that one's `subject_user_id`" in query_rules
+    live_rules = _flat(_section(loaded, "# Reading a `lookup_live`, `find_relationships`"))
+    assert "lists `candidates`: ask the user which one, listing them; never choose for them." in live_rules
