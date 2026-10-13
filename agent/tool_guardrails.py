@@ -221,6 +221,31 @@ def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str
     return False, ""
 
 
+def _has_busy_status(value: Any) -> bool:
+    return isinstance(value, Mapping) and value.get("status") == "busy"
+
+
+def is_busy_tool_result(result: str | None) -> bool:
+    """True for a structured ``busy``: the call was refused for capacity.
+
+    Covers Hermes' own MCP admission refusal (top-level ``status: busy``) and a
+    server's busy carried through an MCP result, in ``structuredContent`` or
+    as the JSON text of ``result``. A busy is backpressure, not a failing
+    call, so the loop guardrails ignore it. ``timeout`` and errors still count.
+    """
+    if not isinstance(result, str):
+        return False
+    data = safe_json_loads(result)
+    if not isinstance(data, Mapping):
+        return False
+    if _has_busy_status(data) or _has_busy_status(data.get("structuredContent")):
+        return True
+    inner = data.get("result")
+    if isinstance(inner, str):
+        inner = safe_json_loads(inner)
+    return _has_busy_status(inner)
+
+
 class ToolCallGuardrailController:
     """Per-turn controller for repeated failed/non-progressing tool calls."""
 
@@ -292,6 +317,11 @@ class ToolCallGuardrailController:
     ) -> ToolGuardrailDecision:
         args = _coerce_args(args)
         signature = ToolCallSignature.from_call(tool_name, args)
+        if is_busy_tool_result(result):
+            # Neutral: neither a failure (exact / same-tool counts) nor a
+            # repeat of the same result (no-progress). Counts already built
+            # from real failures are kept, so a busy can't launder a loop.
+            return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
         if failed is None:
             failed, _ = classify_tool_failure(tool_name, result)
 

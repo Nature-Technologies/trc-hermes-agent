@@ -277,3 +277,74 @@ def test_after_call_survives_lone_surrogates_in_result_and_args():
     controller.after_call("web_search", {"query": dirty}, '{"error":"\ud835 boom"}', failed=True)
     controller.after_call("web_search", {"query": dirty}, '{"error":"\ud835 boom"}', failed=True)
     assert controller.before_call("web_search", {"query": dirty}).action == "block"
+
+
+# --- A structured `busy` is backpressure, not a failure (final review 2026-10-13) --------
+
+_TRC_HARD_STOP = {
+    "hard_stop_enabled": True,
+    "hard_stop_after": {"exact_failure": 3, "same_tool_failure": 4, "idempotent_no_progress": 3},
+}
+_QUERY = "mcp_ragnarok_query"
+_HERMES_BUSY = json.dumps({"status": "busy", "error": "MCP server 'ragnarok' is busy"})
+_BACKEND_BUSY_STRUCTURED = json.dumps({
+    "result": "the search is at capacity",
+    "structuredContent": {"status": "busy", "error": "the search is at capacity"},
+})
+_BACKEND_BUSY_TEXT = json.dumps({"result": json.dumps({"status": "busy", "error": "at capacity"})})
+
+
+def _trc_controller():
+    from dataclasses import replace
+
+    cfg = ToolCallGuardrailConfig.from_mapping(_TRC_HARD_STOP)
+    # Read-only, so idempotent_no_progress applies too.
+    return ToolCallGuardrailController(replace(cfg, idempotent_tools=frozenset({_QUERY})))
+
+
+def _batch_then_one_more(controller, result):
+    """Three parallel lookups refused in one batch, then one more refused. Production
+    passes failed= from display._detect_tool_failure, which tags busy as [error]."""
+    from agent.display import _detect_tool_failure
+
+    decisions = []
+    for args in ({"q": "a"}, {"q": "b"}, {"q": "c"}, {"q": "a"}, {"q": "a"}, {"q": "a"}):
+        before = controller.before_call(_QUERY, args)
+        if not before.allows_execution:
+            decisions.append(before)
+            break
+        failed, _ = _detect_tool_failure(_QUERY, result)
+        decisions.append(controller.after_call(_QUERY, args, result, failed=failed))
+    return decisions
+
+
+def test_busy_results_never_halt_or_block():
+    for busy in (_HERMES_BUSY, _BACKEND_BUSY_STRUCTURED, _BACKEND_BUSY_TEXT):
+        controller = _trc_controller()
+        decisions = _batch_then_one_more(controller, busy)
+        assert all(d.action == "allow" for d in decisions), (busy, [d.code for d in decisions])
+        assert controller.halt_decision is None, busy
+        assert controller.before_call(_QUERY, {"q": "a"}).allows_execution
+
+
+def test_busy_results_without_an_explicit_failed_flag_are_neutral_too():
+    controller = _trc_controller()
+    for _ in range(6):
+        decision = controller.after_call(_QUERY, {"q": "a"}, _HERMES_BUSY)
+        assert decision.action == "allow"
+    assert controller.halt_decision is None
+
+
+def test_real_errors_still_halt():
+    error = json.dumps({"error": "MCP call failed: ConnectError: refused"})
+    controller = _trc_controller()
+    decisions = _batch_then_one_more(controller, error)
+    assert decisions[-1].action in {"halt", "block"}, [d.code for d in decisions]
+    assert controller.halt_decision is not None
+
+
+def test_a_timeout_status_still_counts_as_a_failure():
+    timeout = json.dumps({"status": "timeout", "error": "search ran out of time"})
+    controller = _trc_controller()
+    decisions = _batch_then_one_more(controller, timeout)
+    assert decisions[-1].action in {"halt", "block"}, [d.code for d in decisions]
