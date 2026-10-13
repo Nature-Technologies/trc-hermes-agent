@@ -46,6 +46,9 @@ Example config::
                               # credential and must not reach servers with no
                               # business seeing it. Streamable HTTP only.
                               # Default: false.
+        max_concurrent_calls: 6       # tools/call in flight at once on this
+                              # server (HTTP only; default 1 = one at a time)
+        max_concurrent_calls_per_user: 3  # per end user (default: the cap above)
         user_identity_header: "X-Hermes-End-User-Jwt"  # outbound header name
                               # for the above (default shown). The value is the
                               # token verbatim — Hermes forwards, never mints.
@@ -105,9 +108,12 @@ Thread safety:
 """
 
 import asyncio
+import base64
+import contextlib
 import contextvars
 import concurrent.futures
 import errno
+import hashlib
 import inspect
 import json
 import logging
@@ -346,6 +352,12 @@ _MCP_LOG_LEVEL_MAP = {
 
 _DEFAULT_TOOL_TIMEOUT = 300      # seconds for tool calls
 _DEFAULT_CONNECT_TIMEOUT = 60    # seconds for initial connection per server
+
+# Admission control for tools/call (see MCPServerTask._configure_call_limits).
+# ``max_concurrent_calls`` caps one server's in-flight tools/call; 1 keeps the
+# historical one-at-a-time behaviour on ``_rpc_lock``. The per-user cap defaults
+# to the server cap.
+_DEFAULT_MAX_CONCURRENT_CALLS = 1
 
 # Key under ``params._meta`` carrying one tools/call's correlation id to the
 # outbound request hook (see _make_end_user_identity_hook).
@@ -1881,6 +1893,8 @@ class MCPServerTask:
         "_rpc_lock", "_pending_refresh_tasks",
         "_pending_call_context",
         "_call_identities",
+        "_max_concurrent_calls", "_max_concurrent_calls_per_user",
+        "_call_semaphore", "_user_call_semaphores", "_user_call_holders",
         "_forward_user_identity", "_user_identity_header",
         "_chat_id_header", "_request_id_header",
         "_lifecycle_started_at", "_last_tool_call_at",
@@ -1947,6 +1961,12 @@ class MCPServerTask:
         # the entry named in the POST's params._meta.hermes_call, so concurrent
         # calls can never stamp each other's identity (invariant I1).
         self._call_identities: Dict[str, "_CallIdentity"] = {}
+        # tools/call admission limits; see _configure_call_limits.
+        self._max_concurrent_calls: int = _DEFAULT_MAX_CONCURRENT_CALLS
+        self._max_concurrent_calls_per_user: int = _DEFAULT_MAX_CONCURRENT_CALLS
+        self._call_semaphore: Optional[asyncio.Semaphore] = None
+        self._user_call_semaphores: Dict[str, asyncio.Semaphore] = {}
+        self._user_call_holders: Dict[str, int] = {}
         # Per-request end-user identity forwarding (opt-in, HTTP transport only).
         # ``_forward_user_identity`` / the header names are resolved from config
         # when the streamable-HTTP transport connects.
@@ -1976,6 +1996,39 @@ class MCPServerTask:
     def _is_http(self) -> bool:
         """Check if this server uses HTTP transport."""
         return "url" in self._config
+
+    def _configure_call_limits(self, config: dict) -> None:
+        """Read the tools/call admission limits from this server's config.
+
+        ``max_concurrent_calls`` (default 1) and ``max_concurrent_calls_per_user``
+        (default and ceiling: ``max_concurrent_calls``) apply to HTTP servers
+        only. A stdio server is one JSON-RPC stream and stays serialized on
+        ``_rpc_lock`` whatever the config says.
+        """
+        max_calls = _safe_numeric(
+            config.get("max_concurrent_calls", _DEFAULT_MAX_CONCURRENT_CALLS),
+            _DEFAULT_MAX_CONCURRENT_CALLS, int,
+        )
+        per_user = _safe_numeric(
+            config.get("max_concurrent_calls_per_user", max_calls), max_calls, int,
+        )
+        if "url" not in config:
+            max_calls = per_user = 1
+        per_user = min(per_user, max_calls)
+        unchanged = (
+            (max_calls, per_user)
+            == (self._max_concurrent_calls, self._max_concurrent_calls_per_user)
+            and (max_calls == 1 or self._call_semaphore is not None)
+        )
+        if unchanged:
+            # run() calls this on every (re)connect. Keep the live semaphores so
+            # calls already admitted still count against the caps.
+            return
+        self._max_concurrent_calls = max_calls
+        self._max_concurrent_calls_per_user = per_user
+        self._call_semaphore = asyncio.Semaphore(max_calls) if max_calls > 1 else None
+        self._user_call_semaphores = {}
+        self._user_call_holders = {}
 
     def _advertises_tools(self) -> bool:
         """Whether the server advertises the ``tools`` capability.
@@ -3142,6 +3195,7 @@ class MCPServerTask:
         """
         self._config = config
         self.tool_timeout = config.get("timeout", _DEFAULT_TOOL_TIMEOUT)
+        self._configure_call_limits(config)
         self._auth_type = (config.get("auth") or "").lower().strip()
         self._idle_timeout_seconds = _get_lifecycle_seconds(config, "idle_timeout_seconds")
         self._max_lifetime_seconds = _get_lifecycle_seconds(config, "max_lifetime_seconds")
@@ -4373,6 +4427,68 @@ def _server_call_map(server: Any, attr: str) -> dict:
     return calls
 
 
+def _end_user_slot_key(identity: Optional[str]) -> str:
+    """The per-end-user admission key for *identity*. Never the token itself.
+
+    Open WebUI mints a fresh JWT per request (``iat``/``exp`` change), so the
+    raw token cannot key a per-user cap. Use the unverified ``sub`` claim: this
+    is a fairness key, not an authorization decision, and the MCP server still
+    verifies every POST's signature. An undecodable token falls back to a hash
+    of the token; no identity shares one anonymous bucket.
+    """
+    if not identity:
+        return "anon"
+    try:
+        payload = identity.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        sub = json.loads(base64.urlsafe_b64decode(payload)).get("sub")
+        if isinstance(sub, (str, int)) and str(sub):
+            return "sub:" + hashlib.sha256(str(sub).encode()).hexdigest()[:16]
+    except Exception:
+        pass
+    return "tok:" + hashlib.sha256(identity.encode()).hexdigest()[:16]
+
+
+@contextlib.asynccontextmanager
+async def _admit_call(server: Any, slot_key: str):
+    """Hold one tools/call admission slot on *server* for the block.
+
+    With ``max_concurrent_calls`` 1 (and on every stdio server) the slot is
+    ``_rpc_lock``, which keeps today's ordering against list_tools refreshes
+    and resource/prompt RPCs. Above 1 it is the end user's semaphore, then the
+    server's, always in that order so two calls can never each hold the one
+    the other waits for.
+    """
+    server_sem = getattr(server, "_call_semaphore", None)
+    if not isinstance(server_sem, asyncio.Semaphore):
+        async with server._rpc_lock:
+            yield
+        return
+
+    # Everything below runs on the single MCP event loop thread, so the two
+    # dicts need no lock. The holder count includes calls still waiting, so a
+    # user's semaphore is dropped only when nobody holds or awaits it.
+    user_sems = _server_call_map(server, "_user_call_semaphores")
+    holders = _server_call_map(server, "_user_call_holders")
+    user_sem = user_sems.get(slot_key)
+    if user_sem is None:
+        user_sem = asyncio.Semaphore(server._max_concurrent_calls_per_user)
+        user_sems[slot_key] = user_sem
+    holders[slot_key] = holders.get(slot_key, 0) + 1
+    try:
+        async with user_sem:
+            async with server_sem:
+                yield
+    finally:
+        left = holders.get(slot_key, 1) - 1
+        if left > 0:
+            holders[slot_key] = left
+        else:
+            holders.pop(slot_key, None)
+            if user_sems.get(slot_key) is user_sem:
+                user_sems.pop(slot_key, None)
+
+
 def _make_end_user_identity_hook(
     server: Any,
     header_name: str,
@@ -4949,6 +5065,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         # thread, for the same reason as identity — the ContextVar cannot be
         # read on the MCP loop, so it rides this call's _CallIdentity entry (below).
         end_user_bridged = _resolve_end_user_bridged()
+        slot_key = _end_user_slot_key(end_user_identity)
 
         # One line per hop, so a broken metadata chain is visible without a
         # debugger. Identities, presence flags and names only -- never the token
@@ -4969,7 +5086,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             call_id = uuid.uuid4().hex
             identities = _server_call_map(server, "_call_identities")
             _mark_server_call_started(server)
-            async with server._rpc_lock:
+            async with _admit_call(server, slot_key):
                 # Snapshot the agent's context so an elicitation callback
                 # triggered during this call can replay it (moved per call in B4).
                 server._pending_call_context = contextvars.copy_context()
