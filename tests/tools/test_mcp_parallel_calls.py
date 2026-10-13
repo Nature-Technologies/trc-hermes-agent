@@ -628,11 +628,14 @@ def test_an_admission_timeout_leaves_no_holder_or_semaphore_behind():
     only ``admission_timeout`` takes effect despite the unchanged-caps return."""
     import asyncio
 
-    from tools.mcp_tool import MCPAdmissionTimeout, MCPServerTask, _admit_call
+    from tools.mcp_tool import (
+        MCPAdmissionTimeout, MCPServerTask, _admission_timeout_of, _admit_call,
+    )
 
     server = MCPServerTask("x")
     server._configure_call_limits({"url": MCP_URL, **PARALLEL})
-    assert server._admission_timeout == 60.0
+    # Unset on the semaphore path (caps > 1): the 60 s default bounds the wait.
+    assert _admission_timeout_of(server) == 60.0
     server_sem = server._call_semaphore
     server._configure_call_limits({"url": MCP_URL, **PARALLEL, "admission_timeout": 0.1})
     assert server._admission_timeout == 0.1
@@ -684,6 +687,71 @@ def test_an_admission_timeout_on_the_rpc_lock_path_raises_busy_and_frees_the_loc
         assert not server._rpc_lock.locked()
 
     asyncio.run(_go())
+
+
+@pytest.mark.parametrize("config", [{"url": MCP_URL}, {"command": "srv", **PARALLEL}])
+def test_the_default_lock_path_wait_is_bounded_only_by_the_call_deadline(
+    monkeypatch, config,
+):
+    """Final review (ruling 3): with ``admission_timeout`` unset, a call admitted on
+    ``_rpc_lock`` (cap 1, or any stdio server) waits as it did upstream, bounded only
+    by the outer call deadline, never by the 60 s admission default. The default is
+    scaled down here so a wait past it costs milliseconds."""
+    import asyncio
+
+    from tools import mcp_tool
+    from tools.mcp_tool import (
+        _OUTER_DEADLINE_GRACE_SECONDS, MCPServerTask, _admission_timeout_of,
+        _admit_call, _outer_call_deadline,
+    )
+
+    monkeypatch.setattr(mcp_tool, "_DEFAULT_ADMISSION_TIMEOUT", 0.05)
+    server = MCPServerTask("x")
+    server._configure_call_limits(config)
+    assert server._call_semaphore is None
+    assert _admission_timeout_of(server) is None
+    # Coherent: the outer deadline adds no admission allowance it never uses.
+    assert _outer_call_deadline(180, server) == 180 + _OUTER_DEADLINE_GRACE_SECONDS
+
+    async def _go():
+        await server._rpc_lock.acquire()
+        admitted = asyncio.Event()
+
+        async def _wait():
+            async with _admit_call(server, "sub:a"):
+                admitted.set()
+
+        waiter = asyncio.create_task(_wait())
+        await asyncio.sleep(0.3)  # six times the (scaled) admission default
+        assert not waiter.done(), "the lock wait must not be cut at the default"
+        server._rpc_lock.release()
+        await asyncio.wait_for(waiter, 5)
+        assert admitted.is_set()
+
+    asyncio.run(_go())
+
+
+def test_an_explicit_admission_timeout_applies_on_every_path(monkeypatch):
+    from tools import mcp_tool
+    from tools.mcp_tool import (
+        _OUTER_DEADLINE_GRACE_SECONDS, MCPServerTask, _admission_timeout_of,
+        _outer_call_deadline,
+    )
+
+    monkeypatch.setattr(mcp_tool, "_DEFAULT_ADMISSION_TIMEOUT", 0.05)
+    for config in (
+        {"url": MCP_URL, "admission_timeout": 7},
+        {"command": "srv", "admission_timeout": 7},
+        {"url": MCP_URL, **PARALLEL, "admission_timeout": 7},
+    ):
+        server = MCPServerTask("x")
+        server._configure_call_limits(config)
+        assert _admission_timeout_of(server) == 7.0, config
+        assert _outer_call_deadline(180, server) == 187 + _OUTER_DEADLINE_GRACE_SECONDS
+    # Unset with caps > 1 keeps the (here scaled) default.
+    server = MCPServerTask("x")
+    server._configure_call_limits({"url": MCP_URL, **PARALLEL})
+    assert _admission_timeout_of(server) == 0.05
 
 
 @pytest.mark.parametrize("first_error", ["auth", "session_expired"])

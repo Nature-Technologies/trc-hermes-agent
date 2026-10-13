@@ -51,6 +51,9 @@ Example config::
         max_concurrent_calls_per_user: 3  # per end user (default: the cap above)
         admission_timeout: 60         # max wait for a slot; then {"status": "busy"}.
                               # ``timeout`` starts only after admission.
+                              # Unset: 60 s with caps > 1; at cap 1 and on
+                              # stdio the wait is bounded only by the call's
+                              # outer deadline, as before admission control.
         user_identity_header: "X-Hermes-End-User-Jwt"  # outbound header name
                               # for the above (default shown). The value is the
                               # token verbatim — Hermes forwards, never mints.
@@ -359,7 +362,9 @@ _DEFAULT_CONNECT_TIMEOUT = 60    # seconds for initial connection per server
 # ``max_concurrent_calls`` caps one server's in-flight tools/call; 1 keeps the
 # historical one-at-a-time behaviour on ``_rpc_lock``. The per-user cap defaults
 # to the server cap. ``admission_timeout`` bounds the wait for a slot; it is
-# separate from ``timeout``, which starts only once the call is admitted.
+# separate from ``timeout``, which starts only once the call is admitted. Unset,
+# the default applies only to the semaphore path (caps > 1): a call admitted on
+# ``_rpc_lock`` keeps the upstream wait, bounded only by the outer deadline.
 _DEFAULT_MAX_CONCURRENT_CALLS = 1
 _DEFAULT_ADMISSION_TIMEOUT = 60.0
 
@@ -1981,7 +1986,8 @@ class MCPServerTask:
         # tools/call admission limits; see _configure_call_limits.
         self._max_concurrent_calls: int = _DEFAULT_MAX_CONCURRENT_CALLS
         self._max_concurrent_calls_per_user: int = _DEFAULT_MAX_CONCURRENT_CALLS
-        self._admission_timeout: float = _DEFAULT_ADMISSION_TIMEOUT
+        # None = not configured (see _admission_timeout_of).
+        self._admission_timeout: Optional[float] = None
         self._call_semaphore: Optional[asyncio.Semaphore] = None
         self._user_call_semaphores: Dict[str, asyncio.Semaphore] = {}
         self._user_call_holders: Dict[str, int] = {}
@@ -2021,8 +2027,10 @@ class MCPServerTask:
         ``max_concurrent_calls`` (default 1) and ``max_concurrent_calls_per_user``
         (default and ceiling: ``max_concurrent_calls``) apply to HTTP servers
         only. A stdio server is one JSON-RPC stream and stays serialized on
-        ``_rpc_lock`` whatever the config says. ``admission_timeout`` (default
-        60 s) bounds the wait for a slot on every transport.
+        ``_rpc_lock`` whatever the config says. An explicit ``admission_timeout``
+        bounds the wait for a slot on every transport. Unset, it is None: the
+        semaphore path then uses the 60 s default and the ``_rpc_lock`` path
+        keeps the upstream wait (see _admission_timeout_of).
         """
         max_calls = _safe_numeric(
             config.get("max_concurrent_calls", _DEFAULT_MAX_CONCURRENT_CALLS),
@@ -2036,10 +2044,13 @@ class MCPServerTask:
         per_user = min(per_user, max_calls)
         # Before the unchanged-caps return: a change to admission_timeout alone
         # must still take effect on reconnect.
-        self._admission_timeout = _safe_numeric(
-            config.get("admission_timeout", _DEFAULT_ADMISSION_TIMEOUT),
-            _DEFAULT_ADMISSION_TIMEOUT, float, minimum=0.1,
-        )
+        if config.get("admission_timeout") is None:
+            self._admission_timeout = None
+        else:
+            self._admission_timeout = _safe_numeric(
+                config["admission_timeout"],
+                _DEFAULT_ADMISSION_TIMEOUT, float, minimum=0.1,
+            )
         unchanged = (
             (max_calls, per_user)
             == (self._max_concurrent_calls, self._max_concurrent_calls_per_user)
@@ -4503,23 +4514,35 @@ def _end_user_slot_key(identity: Optional[str]) -> str:
     return "tok:" + hashlib.sha256(identity.encode()).hexdigest()[:16]
 
 
-def _admission_timeout_of(server: Any) -> float:
-    """*server*'s ``admission_timeout``, or the default for a stand-in."""
+def _admission_timeout_of(server: Any) -> Optional[float]:
+    """The bound on one tools/call's wait for a slot on *server*, or None.
+
+    An explicit ``admission_timeout`` applies on every path. Unset (or a
+    stand-in without one), a call admitted on ``_rpc_lock`` (cap 1, any stdio
+    server) gets None: the wait is bounded only by the outer call deadline, the
+    behaviour before admission control. The semaphore path (caps > 1) gets the
+    default.
+    """
     value = getattr(server, "_admission_timeout", None)
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value)
-    return _DEFAULT_ADMISSION_TIMEOUT
+    if isinstance(getattr(server, "_call_semaphore", None), asyncio.Semaphore):
+        return _DEFAULT_ADMISSION_TIMEOUT
+    return None
 
 
 def _outer_call_deadline(tool_timeout: Optional[float], server: Any) -> Optional[float]:
     """Safety-net deadline for _run_on_mcp_loop around one tools/call.
 
     The real limits live inside _call: ``admission_timeout`` for the wait,
-    then ``tool_timeout`` from admission. This only has to outlast both.
+    then ``tool_timeout`` from admission. This only has to outlast both. With
+    no admission bound (the default ``_rpc_lock`` path) it is ``tool_timeout``
+    plus grace, so lock wait and call share that one deadline as upstream.
     """
     if tool_timeout is None:
         return None
-    return float(tool_timeout) + _admission_timeout_of(server) + _OUTER_DEADLINE_GRACE_SECONDS
+    admission = _admission_timeout_of(server) or 0.0
+    return float(tool_timeout) + admission + _OUTER_DEADLINE_GRACE_SECONDS
 
 
 @contextlib.asynccontextmanager
@@ -4530,8 +4553,10 @@ async def _admit_call(server: Any, slot_key: str):
     ``_rpc_lock``, which keeps today's ordering against list_tools refreshes
     and resource/prompt RPCs. Above 1 it is the end user's semaphore, then the
     server's, always in that order so two calls can never each hold the one
-    the other waits for. The wait is bounded by ``admission_timeout``; on
-    expiry whatever was taken is released and MCPAdmissionTimeout raised.
+    the other waits for. The wait is bounded by ``admission_timeout``
+    (_admission_timeout_of; None = unbounded here, the outer deadline still
+    applies); on expiry whatever was taken is released and
+    MCPAdmissionTimeout raised.
     """
     admission = _admission_timeout_of(server)
 

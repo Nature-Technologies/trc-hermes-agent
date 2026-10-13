@@ -2345,7 +2345,7 @@ class TestConfigurableTimeouts:
         asyncio.run(_test())
 
     def test_timeout_passed_to_handler(self):
-        """The outer deadline covers the admission wait plus the configured timeout.
+        """The outer deadline covers the configured timeout (plus any admission wait).
 
         The configured timeout itself is enforced inside the call, from the
         moment the call is admitted (see test_mcp_parallel_calls.py).
@@ -2373,8 +2373,11 @@ class TestConfigurableTimeouts:
 
                 mock_run.side_effect = fake_run
                 handler({})
+                # No admission_timeout configured and a cap of 1: the call
+                # admits on _rpc_lock, bounded (as upstream) only by this
+                # deadline, so it adds no admission allowance.
                 assert mock_run.call_args.kwargs["timeout"] == (
-                    180 + server._admission_timeout + _OUTER_DEADLINE_GRACE_SECONDS
+                    180 + _OUTER_DEADLINE_GRACE_SECONDS
                 )
         finally:
             _servers.pop("test_srv", None)
