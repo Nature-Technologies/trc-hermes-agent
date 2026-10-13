@@ -39,6 +39,7 @@ from toolsets import TOOLSETS
 _RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
+from tools.thread_context import propagate_contextvars_to_thread
 from utils import base_url_hostname, is_truthy_value
 
 
@@ -2014,7 +2015,14 @@ def _run_single_child(
                     stream_callback=_relay_child_text,
                 )
 
-        _child_future = _timeout_executor.submit(_run_with_thread_capture)
+        # The worker starts with an empty Context. Carry this request's
+        # ContextVars across so the child's tool calls see the end user's
+        # identity, chat id and request id (MCP identity is read from them on the
+        # calling thread). ContextVars only: the worker's approval callback is
+        # the subagent one installed by the initializer above.
+        _child_future = _timeout_executor.submit(
+            propagate_contextvars_to_thread(_run_with_thread_capture)
+        )
         try:
             result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:
@@ -2670,8 +2678,10 @@ def delegate_task(
             with DaemonThreadPoolExecutor(max_workers=max_children) as executor:
                 futures = {}
                 for i, t, child in children:
+                    # One Context copy per child: a Context cannot be entered by
+                    # two threads at once. See _run_single_child for why.
                     future = executor.submit(
-                        _run_single_child,
+                        propagate_contextvars_to_thread(_run_single_child),
                         task_index=i,
                         goal=t["goal"],
                         child=child,
