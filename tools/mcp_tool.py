@@ -1824,11 +1824,24 @@ class ElicitationHandler:
         #
         # The recv-loop task that fires this callback does NOT inherit
         # the agent's contextvars (HERMES_SESSION_PLATFORM etc.). When
-        # the MCP tool wrapper captured the agent's context onto
-        # owner._pending_call_context we replay it here via
+        # the MCP tool wrapper captured the agent's context per call
+        # (owner._call_contexts) we replay it here via
         # contextvars.Context.run so the gateway-platform detection in
         # request_elicitation_consent picks up the right session.
-        captured = getattr(self.owner, "_pending_call_context", None) if self.owner else None
+        resolver = getattr(self.owner, "_elicitation_context", None) if self.owner else None
+        if callable(resolver):
+            captured, ambiguous = resolver()
+        else:
+            captured = getattr(self.owner, "_pending_call_context", None) if self.owner else None
+            ambiguous = False
+        if ambiguous:
+            logger.warning(
+                "MCP server '%s' elicitation arrived with several tool calls in "
+                "flight; declining (cannot tell which session it belongs to)",
+                self.server_name,
+            )
+            self.metrics["declined"] += 1
+            return ElicitResult(action="decline")
 
         def _invoke_consent() -> str:
             if captured is None:
@@ -1899,8 +1912,7 @@ class MCPServerTask:
         "_sampling", "_elicitation",
         "_registered_tool_names", "_auth_type", "_refresh_lock",
         "_rpc_lock", "_pending_refresh_tasks",
-        "_pending_call_context",
-        "_call_identities",
+        "_call_contexts", "_call_identities",
         "_max_concurrent_calls", "_max_concurrent_calls_per_user",
         "_admission_timeout", "_call_semaphore", "_user_call_semaphores", "_user_call_holders",
         "_forward_user_identity", "_user_identity_header",
@@ -1953,16 +1965,13 @@ class MCPServerTask:
         # transports for conservative per-server ordering.
         self._rpc_lock = asyncio.Lock()
         self._pending_refresh_tasks: set[asyncio.Task] = set()
-        # contextvars snapshot of the agent task that's currently in
-        # session.call_tool(). The MCP recv loop dispatches incoming
-        # elicitation/create requests on a SEPARATE asyncio task whose
-        # context doesn't inherit HERMES_SESSION_PLATFORM, so the
-        # elicitation handler has no way to detect the gateway session
-        # that triggered the call. Capturing the agent's context here
-        # and replaying it inside the elicitation callback restores
-        # gateway-platform attribution and routes the approval prompt
-        # to the right surface (Telegram, Slack, etc.).
-        self._pending_call_context: Optional[contextvars.Context] = None
+        # contextvars snapshot of the AGENT THREAD for each in-flight tools/call,
+        # keyed like _call_identities. The MCP recv loop dispatches incoming
+        # elicitation/create requests on a separate asyncio task whose context
+        # has no HERMES_SESSION_PLATFORM; the elicitation handler replays the
+        # calling agent's snapshot (see _elicitation_context) so the approval
+        # prompt reaches the right surface (Telegram, Slack, api_server, ...).
+        self._call_contexts: Dict[str, contextvars.Context] = {}
         # End-user identity / chat / request / bridged flag for each in-flight
         # tools/call, keyed by the correlation id _make_tool_handler mints per
         # attempt and removes in its finally. The outbound request hook reads
@@ -2045,6 +2054,20 @@ class MCPServerTask:
         self._call_semaphore = asyncio.Semaphore(max_calls) if max_calls > 1 else None
         self._user_call_semaphores = {}
         self._user_call_holders = {}
+
+    def _elicitation_context(self) -> "tuple[Optional[contextvars.Context], bool]":
+        """``(context, ambiguous)`` for an elicitation arriving now.
+
+        The SDK does not tell the callback which tools/call an elicitation
+        belongs to. With exactly one call in flight it is that call's agent
+        context. With several it is ambiguous, and replaying the wrong one
+        would route an approval prompt to another user's session, so the
+        caller declines instead. With none there is nothing to replay.
+        """
+        contexts = list(self._call_contexts.values())
+        if len(contexts) == 1:
+            return contexts[0], False
+        return None, len(contexts) > 1
 
     def _advertises_tools(self) -> bool:
         """Whether the server advertises the ``tools`` capability.
@@ -5137,6 +5160,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         # thread, for the same reason as identity — the ContextVar cannot be
         # read on the MCP loop, so it rides this call's _CallIdentity entry (below).
         end_user_bridged = _resolve_end_user_bridged()
+        # Elicitation context for THIS call, captured on the agent thread
+        # (the loop thread's context has no gateway session vars).
+        agent_context = contextvars.copy_context()
         slot_key = _end_user_slot_key(end_user_identity)
 
         # One line per hop, so a broken metadata chain is visible without a
@@ -5156,12 +5182,11 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # One id per attempt: an auth / session-expiry retry re-enters here
             # and gets a fresh entry, never a half-finished one.
             call_id = uuid.uuid4().hex
-            identities = _server_call_map(server, "_call_identities")
             _mark_server_call_started(server)
+            contexts = _server_call_map(server, "_call_contexts")
+            identities = _server_call_map(server, "_call_identities")
             async with _admit_call(server, slot_key):
-                # Snapshot the agent's context so an elicitation callback
-                # triggered during this call can replay it (moved per call in B4).
-                server._pending_call_context = contextvars.copy_context()
+                contexts[call_id] = agent_context
                 try:
                     if getattr(server, "_forward_user_identity", False) is True:
                         identities[call_id] = _CallIdentity(
@@ -5191,7 +5216,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                             ) from None
                 finally:
                     identities.pop(call_id, None)
-                    server._pending_call_context = None
+                    contexts.pop(call_id, None)
             # The RPC round-trip completed — the session is demonstrably
             # healthy at the transport level (even if the tool itself
             # returned isError). Clear the rapid-drop budget (#62212).

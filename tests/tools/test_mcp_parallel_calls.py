@@ -750,3 +750,60 @@ def test_a_retry_that_times_out_in_admission_is_busy_not_a_breaker_strike(
     assert "needs_reauth" not in result
     assert calls["n"] == 1  # the retry never reached the server
     assert counts == 0
+
+
+# ---------------------------------------------------------------------------
+# B4 — elicitation context is the calling agent thread's, per call
+# ---------------------------------------------------------------------------
+
+
+def test_elicitation_replays_the_calling_agent_threads_context():
+    """A gateway var bound on the agent thread must reach the elicitation callback."""
+    from tools import mcp_tool
+
+    probe: contextvars.ContextVar = contextvars.ContextVar("b4_probe", default="")
+    seen: list = []
+    server = mcp_tool.MCPServerTask("elicit_srv")
+
+    async def _call_tool(name, arguments=None, **kwargs):
+        ctx, ambiguous = server._elicitation_context()
+        seen.append((ctx.run(probe.get) if ctx is not None else None, ambiguous))
+        return _ok_result()
+
+    server.session = SimpleNamespace(call_tool=_call_tool)
+    mcp_tool._ensure_mcp_loop()
+    mcp_tool._servers["elicit_srv"] = server
+    try:
+        handler = mcp_tool._make_tool_handler("elicit_srv", "pay", 15.0)
+
+        def _agent_thread():
+            probe.set("gateway:api_server")
+            return handler({})
+
+        result = json.loads(contextvars.Context().run(_agent_thread))
+    finally:
+        mcp_tool._servers.pop("elicit_srv", None)
+        mcp_tool._server_error_counts.pop("elicit_srv", None)
+
+    assert result == {"result": "ok"}
+    assert seen == [("gateway:api_server", False)]
+    assert server._call_contexts == {}
+
+
+def test_an_elicitation_during_concurrent_calls_is_declined_not_misrouted():
+    """Two calls in flight: replaying either context could prompt the wrong user."""
+    import asyncio
+
+    from tools.mcp_tool import ElicitationHandler, MCPServerTask
+
+    server = MCPServerTask("pay")
+    server._call_contexts["call-a"] = contextvars.copy_context()
+    server._call_contexts["call-b"] = contextvars.copy_context()
+    elicit = ElicitationHandler("pay", {"timeout": 5}, owner=server)
+    params = SimpleNamespace(mode="form", message="approve?", requested_schema={})
+
+    with patch("tools.approval.request_elicitation_consent", return_value="accept") as consent:
+        result = asyncio.run(elicit(context=None, params=params))
+
+    assert result.action == "decline"
+    consent.assert_not_called()
