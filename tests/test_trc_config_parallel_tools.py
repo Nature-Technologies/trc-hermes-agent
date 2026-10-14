@@ -62,4 +62,4 @@ def test_the_generic_parallel_guidance_block_stays_off(tmp_path, monkeypatch):
 def test_soul_tells_the_model_to_issue_independent_lookups_together():
     soul = (_DEPLOY / "SOUL.md").read_text(encoding="utf-8")
 
-    assert "issue them all in the same turn" in soul
+    assert "Make independent calls in the same turn." in soul

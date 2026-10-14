@@ -12,13 +12,15 @@ scanner alone, so a future change to how SOUL.md is read is covered too.
 
 from __future__ import annotations
 
+import re
 import shutil
 from pathlib import Path
 
-_DEPLOYED = Path(__file__).resolve().parents[1] / "deploy" / "trc" / "SOUL.md"
+_DEPLOY = Path(__file__).resolve().parents[1] / "deploy" / "trc"
+_DEPLOYED = _DEPLOY / "SOUL.md"
 
 
-def test_the_deployed_soul_loads_as_the_trc_prompt(tmp_path, monkeypatch):
+def _load(tmp_path, monkeypatch, context_length=None) -> str:
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -26,29 +28,48 @@ def test_the_deployed_soul_loads_as_the_trc_prompt(tmp_path, monkeypatch):
 
     from agent.prompt_builder import load_soul_md
 
-    loaded = load_soul_md() or ""
+    return load_soul_md(context_length) or ""
+
+
+def test_the_deployed_soul_loads_as_the_trc_prompt(tmp_path, monkeypatch):
+    loaded = _load(tmp_path, monkeypatch)
     assert not loaded.startswith("[BLOCKED"), loaded[:200]
     assert loaded.startswith("RULE ZERO")
 
 
-def test_the_soul_keeps_subagents_for_reports_and_comparisons_in_one_turn(tmp_path, monkeypatch):
-    """Spec 2026-10-13 §5 C8: subagents only for multi-section research or reports; a
-    comparison is parallel lookups in one turn (cheaper and faster)."""
+def test_the_whole_prompt_loads_unchanged_even_without_a_context_window(tmp_path, monkeypatch):
+    """No scanner rewrite and no head/tail trim. With no context window (the deploy
+    smoke check calls it that way) the loader trims at its 20 K floor; the budget keeps
+    the prompt well under it."""
+    loaded = _load(tmp_path, monkeypatch)
+    assert loaded == _DEPLOYED.read_text(encoding="utf-8").strip()
+
+
+def test_the_loaded_prompt_carries_the_contracts_other_components_rely_on(tmp_path, monkeypatch):
+    loaded = _load(tmp_path, monkeypatch, 256_000)
+    # Contract C2: resolve_entity's three decisions, each with what to do.
+    for decision in ("`pick`", "`each`", "`ask`"):
+        assert decision in loaded, decision
+    # Contract C3: the block the backend filter and the Open WebUI fork parse.
+    assert "trc:followups" in loaded
+
+
+def test_every_tool_the_prompt_routes_to_reaches_the_model(tmp_path, monkeypatch):
+    """Each route in SOUL.md (an arrow, then a backticked tool name) is a ragnarok tool
+    on the wire, or execute_code from the code_execution toolset: a route to a tool the
+    model does not have is a call to nothing."""
+    soul = _DEPLOYED.read_text(encoding="utf-8")
+    routed = set(re.findall(r"→\s+`([a-z_]+)`", soul))
+    assert {"resolve_entity", "rank_and_count"} <= routed
+
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
-    shutil.copy(_DEPLOYED, home / "SOUL.md")
+    shutil.copy(_DEPLOY / "config.yaml", home / "config.yaml")
+    from hermes_cli.config import load_config
 
-    from agent.prompt_builder import load_soul_md
-
-    # A real context window, as the agent passes: without one the 20K floor head/tail-trims.
-    loaded = load_soul_md(256_000) or ""
-    start = loaded.index("# Subagents (`delegate_task`)")
-    section = loaded[start:loaded.index("\n# ", start + 1)]
-    assert "ONLY for multi-section research or a report" in section
-    assert "Never use" in section and "comparison" in section
-    assert "all of them in the same turn" in section
-    assert "two or three entities" in section and "execute_code" in section
-    assert "four or more entities or periods" in section
-    assert "one `execute_code` run" in section
-    assert "Never mention helpers or subagents to the user." in section
+    cfg = load_config()
+    include = set(cfg["mcp_servers"]["ragnarok"]["tools"]["include"])
+    assert routed - {"execute_code"} <= include, routed - {"execute_code"} - include
+    if "execute_code" in routed:
+        assert "code_execution" in cfg["platform_toolsets"]["api_server"]
