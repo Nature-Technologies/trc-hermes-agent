@@ -66,6 +66,15 @@ and the list of tools that do, and the model usually corrects itself.
 After a prompt deploy, test in a new chat, and ask users to start one. Spec §11.9 leaves
 a prompt-version check, which would rebuild stale stored prompts, as a later option.
 
+**Deploy order with the backend.** The backend must go out with
+`QUERY_DATA_MODE_ENABLED=false` and stay that way until this config and the v2 prompt
+(tasks C2 and C3, which deploy together) are live on Hermes. Only then is the flag turned
+on. The reason is the same stored-prompt rule: a chat that began on SOUL v1 keeps v1 and
+expects `query` to return an `answer`. With data mode on, `query` without `answer` returns
+the passages and no generated answer (contract C7), which those chats are not written
+for. On staging, everyone who chatted before the deploy should start a new chat, both for
+this and for the tool-list mismatch above.
+
 ## Why it is a file here at all
 
 Hermes assembles its system prompt as identity → guidance → ephemeral. `SOUL.md` is the

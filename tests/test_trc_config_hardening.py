@@ -69,11 +69,14 @@ def _ragnarok_wire(deployed: dict) -> set[str]:
     return {name.removeprefix(_PREFIX) for name in registered}
 
 
-def test_the_mcp_resource_and_prompt_tools_stay_off_the_wire(deployed):
-    """They bypass `tools.include`: without `resources: false` / `prompts: false` the
-    model gets four tools no rule mentions."""
-    wire = _ragnarok_wire(deployed)
-    assert not wire & _UTILITY, wire & _UTILITY
+def test_nothing_reaches_the_wire_that_tools_include_does_not_list(deployed):
+    """The wire is the allowlist and nothing more. Hermes registers the four MCP utility
+    tools (`_UTILITY`) outside `tools.include` when the server advertises resources and
+    prompts; without `resources: false` / `prompts: false` the model gets tools no rule
+    mentions. Stated as an invariant, not a list of known names, so a tool registered
+    outside `include` by any other path fails here too."""
+    include = set(deployed["mcp_servers"]["ragnarok"]["tools"]["include"])
+    assert _ragnarok_wire(deployed) == include & set(_OFFERED)
 
 
 def test_meeting_briefing_is_off_the_wire_until_the_backend_has_meeting_data(deployed):
@@ -135,9 +138,13 @@ def test_every_allowlisted_script_tool_is_one_the_session_has(deployed):
 
 
 def test_scripts_reach_nothing_but_ragnarok(deployed):
-    script_tools = _script_tools(deployed)
-    assert script_tools
-    assert all(name.startswith(_PREFIX) for name in script_tools), script_tools
+    """On the allowlist itself: intersected with the session's tools (all ragnarok), a
+    `terminal` entry would be dropped and this could never fail."""
+    from tools.code_execution_tool import _sandbox_allowlist
+
+    allowlist = _sandbox_allowlist()
+    assert allowlist
+    assert all(name.startswith(_PREFIX) for name in allowlist), allowlist
 
 
 def test_a_script_can_fetch_the_inputs_of_a_derived_figure(deployed):
@@ -149,9 +156,13 @@ def test_a_script_can_fetch_the_inputs_of_a_derived_figure(deployed):
 def test_a_script_cannot_spend_the_live_budget_pick_a_name_or_record_figures(deployed):
     """lookup_live spends the firm-shared Addepar budget; resolve_entity can decide
     `ask`, which only the model can act on; record_computed is the gateway's call."""
-    script_tools = _script_tools(deployed)
+    from tools.code_execution_tool import _sandbox_allowlist
+
+    # The allowlist, not the intersection: record_computed is not on the wire, so the
+    # intersection would drop it and hide the entry.
+    allowlist = _sandbox_allowlist()
     for name in ("lookup_live", "resolve_entity", "record_computed"):
-        assert _PREFIX + name not in script_tools, name
+        assert _PREFIX + name not in allowlist, name
 
 
 @pytest.fixture
