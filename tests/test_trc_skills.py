@@ -1,10 +1,11 @@
-"""The TRC playbooks (deploy/trc/skills) and the read-only skills surface that serves
-them (2026-10-05).
+"""The TRC playbooks (deploy/trc/skills) and the read-only skills surface that would
+serve them (2026-10-05).
 
-The playbooks are mounted read-only over $HERMES_HOME/skills, so they are the only
-skills indexed, and the platform gets `skills_readonly` — skills_list and skill_view,
-never skill_manage. These tests pin the toolset, the files, and the index the model
-actually reads.
+The playbooks stay mounted read-only over $HERMES_HOME/skills, so they are the only
+skills indexed. Chat has carried no skill tool since answer-first P1
+(deploy/trc/config.yaml). A later report mode would get `skills_readonly`: skills_list
+and skill_view, never skill_manage. These tests pin that toolset, the files, and the
+index it would build.
 """
 
 from __future__ import annotations

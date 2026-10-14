@@ -8,19 +8,6 @@ from pathlib import Path
 import yaml
 
 _DEPLOYED = Path(__file__).resolve().parents[1] / "deploy" / "trc" / "config.yaml"
-_DATA_TOOLS = {
-    "mcp__ragnarok__query",
-    "mcp__ragnarok__read_document",
-    "mcp__ragnarok__list_entities",
-    "mcp__ragnarok__find_relationships",
-}
-# The full sandbox allowlist: the four read tools plus render_report (a script calls it to
-# publish a computed report, trc-backend spec §7) and period_series (one call for a
-# multi-period series, trc-backend spec 2026-10-01).
-_SANDBOX_TOOLS = _DATA_TOOLS | {
-    "mcp__ragnarok__render_report",
-    "mcp__ragnarok__period_series",
-}
 
 
 def _cfg() -> dict:
@@ -29,26 +16,26 @@ def _cfg() -> dict:
 
 def test_the_api_server_gets_ragnarok_and_code_execution_and_nothing_dangerous():
     """Plugin toolsets are on by default upstream, so this pins what must be present
-    and what must never be, rather than exact equality. `delegation` is allowed since
-    spec 2026-10-13 §5: children inherit only these toolsets, minus delegate_task."""
+    and what must never be, rather than exact equality. Since answer-first P1
+    (contract C5b) chat has no skills toolset and no `delegation`."""
     from hermes_cli.tools_config import _get_platform_tools
     from tools.registry import discover_builtin_tools
 
     discover_builtin_tools()
     enabled = _get_platform_tools(_cfg(), "api_server")
-    assert {"ragnarok", "code_execution", "skills_readonly", "delegation"} <= enabled
+    assert {"ragnarok", "code_execution"} <= enabled
     # `skills` would add skill_manage: a model-written skill is an unreviewed prompt
     # that persists into every later session (deploy/trc/config.yaml, 2026-10-05).
+    # `skills_readonly` and `delegation` left chat in answer-first P1 (contract C5b).
     forbidden = {
-        "terminal", "file", "web", "browser", "browser-cdp",
-        "computer_use", "debugging", "coding", "skills",
+        "terminal", "file", "web", "browser", "browser-cdp", "computer_use",
+        "debugging", "coding", "skills", "skills_readonly", "delegation",
     }
     assert not enabled & forbidden, enabled & forbidden
 
 
-def test_scripts_reach_the_read_tools_and_render_report_through_the_sidecar():
+def test_scripts_run_in_the_sidecar_within_its_limits():
     ce = _cfg()["code_execution"]
-    assert set(ce["sandbox_tools"]) == _SANDBOX_TOOLS
     assert ce["transport"] == "sidecar"
     assert ce["sidecar_socket"] == "/run/hermes-sandbox/sock"
     assert ce["record_computed_server"] == "ragnarok"
@@ -59,7 +46,8 @@ def test_scripts_reach_the_read_tools_and_render_report_through_the_sidecar():
 
 def test_subagents_are_foreground_bounded_and_leave_no_files(tmp_path, monkeypatch):
     """Spec 2026-10-13 §5 C2/C3/C5/C6, read through the MERGED config the delegate tool
-    acts on, not just the raw file."""
+    acts on, not just the raw file. Delegation is off in chat since answer-first P1
+    (contract C5b); these are the settings it comes back with in P2."""
     import shutil
 
     home = tmp_path / ".hermes"
@@ -95,9 +83,3 @@ def test_subagents_are_foreground_bounded_and_leave_no_files(tmp_path, monkeypat
         "Never call generate_report or render_report and never publish a report; "
         "return findings only." in contract
     )
-
-
-def test_delegation_is_the_only_toolset_added_for_subagents():
-    assert _cfg()["platform_toolsets"]["api_server"] == [
-        "ragnarok", "code_execution", "skills_readonly", "delegation",
-    ]

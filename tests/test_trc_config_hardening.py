@@ -107,3 +107,93 @@ def test_openrouter_calls_ask_for_no_response_cache(deployed, monkeypatch):
     headers = build_or_headers()
     assert "X-OpenRouter-Cache" not in headers
     assert "X-OpenRouter-Cache-TTL" not in headers
+
+
+def test_rankings_and_names_each_have_their_one_call_tool_on_the_wire(deployed):
+    wire = _ragnarok_wire(deployed)
+    assert {"resolve_entity", "rank_and_count"} <= wire
+    # Superseded by rank_and_count: with two roster tools the model has to choose.
+    assert "list_entities" not in wire
+
+
+def _script_tools(deployed: dict) -> frozenset[str]:
+    """The tools Hermes offers a sandbox script in this session: the allowlist
+    intersected with the session's tools, the call model_tools.py builds the
+    execute_code schema from."""
+    from tools.code_execution_tool import resolve_sandbox_tools
+
+    session = {_PREFIX + name for name in _ragnarok_wire(deployed)}
+    return resolve_sandbox_tools(session | {"execute_code"})
+
+
+def test_every_allowlisted_script_tool_is_one_the_session_has(deployed):
+    """An allowlist entry that is not on the wire is silently dropped by the
+    intersection: dead config that reads like a capability."""
+    from tools.code_execution_tool import _sandbox_allowlist
+
+    assert _script_tools(deployed) == _sandbox_allowlist()
+
+
+def test_scripts_reach_nothing_but_ragnarok(deployed):
+    script_tools = _script_tools(deployed)
+    assert script_tools
+    assert all(name.startswith(_PREFIX) for name in script_tools), script_tools
+
+
+def test_a_script_can_fetch_the_inputs_of_a_derived_figure(deployed):
+    """SOUL.md: a share, growth rate or average comes from execute_code, which fetches
+    its own inputs — a ranking's rows and firm total, or one entity's series."""
+    assert {_PREFIX + "rank_and_count", _PREFIX + "period_series"} <= _script_tools(deployed)
+
+
+def test_a_script_cannot_spend_the_live_budget_pick_a_name_or_record_figures(deployed):
+    """lookup_live spends the firm-shared Addepar budget; resolve_entity can decide
+    `ask`, which only the model can act on; record_computed is the gateway's call."""
+    script_tools = _script_tools(deployed)
+    for name in ("lookup_live", "resolve_entity", "record_computed"):
+        assert _PREFIX + name not in script_tools, name
+
+
+@pytest.fixture
+def chat_platform(deployed, tmp_path, monkeypatch) -> tuple[set[str], set[str]]:
+    """(toolsets, tool names) the API server gives the chat model, resolved the way
+    gateway/platforms/api_server.py does it: the gateway's own config loader, then
+    _get_platform_tools(..., "api_server"), then each toolset's tools. The ragnarok MCP
+    tools register at connect time; _ragnarok_wire covers those."""
+    from gateway import run as gateway_run
+    from hermes_cli.tools_config import _get_platform_tools
+    from tools.registry import discover_builtin_tools
+    from toolsets import resolve_toolset
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path / ".hermes")
+    discover_builtin_tools()
+    toolsets = set(_get_platform_tools(gateway_run._load_gateway_config(), "api_server"))
+    tools: set[str] = set()
+    for toolset in toolsets:
+        tools.update(resolve_toolset(toolset))
+    return toolsets, tools
+
+
+def test_no_skill_tool_reaches_the_chat_model(chat_platform):
+    """With none of these on the wire Hermes also leaves the skills index out of the
+    system prompt (agent/system_prompt.py), so SOUL.md is the only routing text."""
+    _, tools = chat_platform
+    assert not tools & {"skills_list", "skill_view", "skill_manage"}
+
+
+def test_delegate_task_is_off_the_chat_wire_until_long_task_escalation(chat_platform):
+    """SOUL v2 routes nothing to it, and its own description invites delegating
+    "research A and B simultaneously": a delegated comparison costs minutes (contract
+    C5b). It returns in P2, with a prompt rule for when to use it."""
+    toolsets, tools = chat_platform
+    assert "delegation" not in toolsets
+    assert "delegate_task" not in tools
+
+
+def test_the_execute_code_description_names_only_tools_the_model_has(deployed):
+    """The description routes the model too (rankings to rank_and_count, a series to
+    period_series); a tool it names that is off the wire is a call to nothing."""
+    intro = deployed["code_execution"]["description_intro"]
+    wire = _ragnarok_wire(deployed)
+    named = {name for name in _OFFERED if name in intro}
+    assert named <= wire, named - wire

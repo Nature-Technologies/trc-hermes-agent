@@ -14,27 +14,38 @@ model:
 # name as a toolset (toolsets.py, `get_toolset_alias_target`). If a deployed
 # build returns None for it, the fallback is `disabled_toolsets` listing every
 # non-MCP toolset — verify with `hermes tools --platform api_server`, which
-# must list the `mcp__ragnarok__*` tools in `tools.include` below, `execute_code`,
-# `skills_list` and `skill_view` — and never `skill_manage`.
+# must list the `mcp__ragnarok__*` tools in `tools.include` below and
+# `execute_code` — and no skill tool and no `delegate_task`.
 #
-# `skills_readonly` (2026-10-05): the TRC playbooks in deploy/trc/skills, mounted
-# read-only over $HERMES_HOME/skills so they are the ONLY skills indexed. Read, never
-# written: a model-written skill would be an unreviewed prompt in every later session,
-# outside the redaction boundary's retention sweep — the reason memory is off below.
+# Two toolsets and nothing else (answer-first contract C5b, P1):
+# - No skills toolset. `skills_readonly` (2026-10-05) served the TRC playbooks in
+#   deploy/trc/skills; their routing now lives in SOUL.md and the tool descriptions,
+#   and with no skill tool on the wire Hermes leaves the skills index out of the
+#   system prompt. The playbooks stay mounted read-only
+#   (docker-compose-staging-trc.yml) for a later report mode. `skills` itself is
+#   never listed: skill_manage would let the model write an unreviewed prompt into
+#   every later session, outside the redaction boundary's retention sweep — the
+#   reason memory is off below.
+# - No `delegation`. SOUL v2 routes nothing to delegate_task, and an unguided
+#   delegated comparison costs minutes. It returns with long-task escalation in P2;
+#   the `delegation:` settings below stay for then.
 platform_toolsets:
   api_server:
     - ragnarok
     - code_execution
-    - skills_readonly
-    # delegate_task (spec 2026-10-13 §5): children get the three above, never
-    # delegate_task itself. Kill switch: remove this line. See `delegation:` below.
-    - delegation
 
 # ── Analysis sandbox (trc-backend spec 2026-09-28-hermes-analysis-sandbox-design) ──
 # execute_code runs scripts in the `hermes-sandbox` container (no network, no files,
-# no secrets) and never in this process. Scripts reach data ONLY through the four
-# tools below, via the gateway's bridge, with this request's verified identity.
-# Kill switch: remove `code_execution` from platform_toolsets.api_server.
+# no secrets) and never in this process. Scripts reach data ONLY through the
+# ragnarok tools below, via the gateway's bridge, with this request's verified
+# identity; Hermes offers a script only the listed tools that are also on the wire
+# (`tools.include` below). Kill switch: remove `code_execution` from
+# platform_toolsets.api_server.
+#
+# Deliberately absent: `lookup_live` spends the firm-shared Addepar budget (50 calls
+# per 15 minutes), which a loop in a script could exhaust; `resolve_entity` can
+# decide `ask`, and a script cannot ask the user, so the model resolves names before
+# it writes the script.
 code_execution:
   transport: sidecar
   sidecar_socket: /run/hermes-sandbox/sock
@@ -47,29 +58,34 @@ code_execution:
     # per period (trc-backend spec 2026-10-01).
     - mcp__ragnarok__period_series
     - mcp__ragnarok__read_document
-    - mcp__ragnarok__list_entities
     - mcp__ragnarok__find_relationships
+    # A ranking's rows and the firm total, for a share or an average across them
+    # (answer-first contract C1; replaces list_entities).
+    - mcp__ragnarok__rank_and_count
     # A script publishes a computed report with report.publish() (trc-backend spec §7).
     - mcp__ragnarok__render_report
   # Gateway-only backend tool fed each run's output, for the "calculated" figure note.
   # Deliberately NOT in mcp_servers.ragnarok.tools.include: the model must not call it.
   record_computed_server: ragnarok
   description_intro: >-
-    Use this, without being asked, whenever an answer COMBINES figures: a change over
-    time, a trend, a comparison across entities or periods, a total, average, share,
-    ranking or count. A change over a span is a path, not one period: for ONE entity
-    call period_series once to get its whole monthly or quarterly series. Run a short
-    Python program for the calculation over TRC data. It runs
-    in an isolated sandbox with no network and no files; its only data source is the
-    ragnarok tools listed below, called with keyword arguments. Fetch inside the
-    program when you need many rows, pass answer=False to query when you need only
-    the data, and print only results — each figure with its [Sn] marker and date.
-    numpy and pandas are available.
+    Use this, without being asked, for a figure derived from others (a change, share,
+    growth rate or average) and for a chart or a computed report. A ranking, count or
+    roster is not a calculation: rank_and_count returns it in one call. A change over
+    a span is a path, not one period: for ONE entity call period_series once to get
+    its whole monthly or quarterly series. Run a short Python program for the
+    calculation over TRC data. It runs in an isolated sandbox with no network and no
+    files; its only data source is the ragnarok tools listed below, called with
+    keyword arguments. Fetch inside the program when you need many rows, pass
+    answer=False to query when you need only the data, and print only results — each
+    figure with its [Sn] marker and date. The values of an entity and of the entities
+    it owns overlap: rank them, do not add them. numpy and pandas are available.
 
 # ── Subagents (trc-orchestrator spec 2026-10-13 §5, Phase C) ──────────
-# delegate_task, for multi-section research and reports only (SOUL.md says when).
-# Enabled by `delegation` in platform_toolsets.api_server above.
-# Kill switch: remove it from there.
+# OFF in chat since answer-first P1 (contract C5b): `delegation` is not in
+# platform_toolsets.api_server above, so delegate_task is not on the wire. These
+# settings stay for P2, when long-task escalation brings it back for reports: add
+# `delegation` to platform_toolsets.api_server again, together with a SOUL rule for
+# when to use it.
 delegation:
   # Foreground only. The API server cannot hand a detached result back to the
   # user's request: background would end the turn and answer later through a
@@ -236,6 +252,11 @@ mcp_servers:
     # spec §12.1, P0a): no meeting parser is registered yet, so every call answers
     # `unavailable`. It comes back with the parsers (P3).
     #
+    # `resolve_entity` and `rank_and_count` (answer-first P1, contracts C1, C2, C5):
+    # one call for a name, one for any ranking, count or roster. `rank_and_count`
+    # supersedes `list_entities`, which is out: with two roster tools for one
+    # question the model has to choose between them.
+    #
     # `resources` / `prompts` (answer-first spec §12.3, P0a): Hermes registers the
     # four MCP utility tools (list_resources, read_resource, list_prompts,
     # get_prompt) OUTSIDE `include` whenever the server advertises those
@@ -243,14 +264,15 @@ mcp_servers:
     tools:
       include:
         - query
-        - period_series
         - read_document
-        - list_entities
-        - generate_report
-        - render_report
         - find_relationships
         - list_interactions
         - lookup_live
+        - period_series
+        - generate_report
+        - render_report
+        - resolve_entity
+        - rank_and_count
       resources: false
       prompts: false
 
