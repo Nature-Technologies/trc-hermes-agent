@@ -23,6 +23,8 @@ For: "which companies made a profit", "how did X perform", "our gains in Q4",
   portfolio. "Companies that made a profit" can also mean the companies' OWN operating
   profit, which lives only in their reporting packs, not in Addepar.
 - WHICH period: a quarter is its first to last day; say the dates you used.
+- A named company, client or fund: settle who it is with `resolve_entity` first; a near
+  match or several → ask which one, never choose for them.
 
 ## What the tools can give
 - `lookup_live` with `source="addepar"` and a date range returns, for ONE named

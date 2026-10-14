@@ -64,6 +64,9 @@ code_execution:
     - mcp__ragnarok__rank_and_count
     # A script publishes a computed report with report.publish() (trc-backend spec §7).
     - mcp__ragnarok__render_report
+    # A record's neighbours, ownership and files inside a script (orchestrator spec
+    # 2026-10-13 entity resolution §8, kept from dev #21).
+    - mcp__ragnarok__knowledge_graph
   # Gateway-only backend tool fed each run's output, for the "calculated" figure note.
   # Deliberately NOT in mcp_servers.ragnarok.tools.include: the model must not call it.
   record_computed_server: ragnarok
@@ -273,6 +276,9 @@ mcp_servers:
         - render_report
         - resolve_entity
         - rank_and_count
+        # Walk a record's connections, ownership and files (dev #21, orchestrator spec
+        # 2026-10-13 §8). Its own description routes "who owns X / files on X" to it.
+        - knowledge_graph
       resources: false
       prompts: false
 
