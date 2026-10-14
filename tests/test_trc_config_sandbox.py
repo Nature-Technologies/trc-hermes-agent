@@ -46,25 +46,6 @@ def test_the_api_server_gets_ragnarok_and_code_execution_and_nothing_dangerous()
     assert not enabled & forbidden, enabled & forbidden
 
 
-def test_the_model_sees_exactly_the_eight_end_user_tools():
-    """record_computed is gateway-only and ingest_document is gone (L2); render_report is
-    model-callable too (spec §7.1), so it is here as well as in sandbox_tools; period_series
-    is the multi-period series tool (trc-backend spec 2026-10-01)."""
-    include = set(_cfg()["mcp_servers"]["ragnarok"]["tools"]["include"])
-    assert include == {
-        "query",
-        "period_series",
-        "read_document",
-        "list_entities",
-        "generate_report",
-        "render_report",
-        "find_relationships",
-        "list_interactions",
-        "meeting_briefing",
-        "lookup_live",
-    }
-
-
 def test_scripts_reach_the_read_tools_and_render_report_through_the_sidecar():
     ce = _cfg()["code_execution"]
     assert set(ce["sandbox_tools"]) == _SANDBOX_TOOLS

@@ -227,9 +227,19 @@ mcp_servers:
     max_concurrent_calls: 6
     max_concurrent_calls_per_user: 3
     # H1 follow-up: `tools/mcp_tool.py` honours `tools.include`/`exclude` per
-    # MCP server. Pin the six end-user tools so `ingest_document` is off the
-    # wire by construction. A NEW backend tool must be added here to reach the
-    # model — the allowlist is the gate, not the prompt ban.
+    # MCP server. Pin the end-user tools so `ingest_document` is off the wire by
+    # construction. A NEW backend tool must be added here to reach the model —
+    # the allowlist is the gate, not the prompt ban. `record_computed` stays out:
+    # the gateway calls it (`code_execution` above), the model does not.
+    #
+    # `meeting_briefing` is out until the backend has meeting data (answer-first
+    # spec §12.1, P0a): no meeting parser is registered yet, so every call answers
+    # `unavailable`. It comes back with the parsers (P3).
+    #
+    # `resources` / `prompts` (answer-first spec §12.3, P0a): Hermes registers the
+    # four MCP utility tools (list_resources, read_resource, list_prompts,
+    # get_prompt) OUTSIDE `include` whenever the server advertises those
+    # capabilities, which FastMCP does. Both off, so `include` is the whole list.
     tools:
       include:
         - query
@@ -240,8 +250,28 @@ mcp_servers:
         - render_report
         - find_relationships
         - list_interactions
-        - meeting_briefing
         - lookup_live
+      resources: false
+      prompts: false
+
+# ── Tool search OFF (answer-first spec §12.3, P0a) ───────────────────
+# Upstream default is "auto": once the MCP schemas pass 10% of the context window,
+# Hermes replaces them with tool_search / tool_describe / tool_call bridge tools.
+# The TRC surface is a short pinned allowlist that SOUL.md routes by name; a bridge
+# would add a model step to every lookup and a second way to call each tool.
+# Quoted, because a bare `off` is YAML for false.
+tools:
+  tool_search:
+    enabled: "off"
+
+# ── OpenRouter response cache OFF (answer-first spec §12.3, P0a) ─────
+# Upstream default sends `X-OpenRouter-Cache: true` (TTL 300 s) on every OpenRouter
+# call, the main model's and the auxiliary ones (status hints): OpenRouter then keeps
+# each masked response to replay for an identical request. That is a copy of a turn
+# outside TRC's retention sweep, so it is off. `HERMES_OPENROUTER_CACHE` in the
+# environment would override this; the compose file does not set it.
+openrouter:
+  response_cache: false
 
 # ── Security ──────────────────────────────────────────────────────────
 # Secret redaction is ON by default — strings that look like API keys,
