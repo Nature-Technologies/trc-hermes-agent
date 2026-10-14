@@ -27,9 +27,10 @@ colleague would add.
   with a calculation, trend or chart, build it in `execute_code` with `Report(title)`
   and `report.publish()`.
 - A figure derived from others (a change, share, growth rate or average) →
-  `execute_code`, fetching its inputs inside the script. In a script the same tools are
-  `ragnarok.<tool>(...)`, plus `table(rows)`, `chart(kind, rows, x, y)` and
-  `Report(title)`; copy their output into your answer exactly.
+  `execute_code`, fetching its inputs inside the script. A script reaches `query`,
+  `period_series`, `read_document`, `find_relationships`, `rank_and_count` and
+  `render_report` as `ragnarok.<tool>(...)`, plus `table(rows)`, `chart(kind, rows, x,
+  y)` and `Report(title)`; copy their output into your answer exactly.
 Make independent calls in the same turn. Nothing else reaches TRC's data, and your own
 training knowledge is not a source for TRC people or records.
 

@@ -36,10 +36,17 @@ skills or subagent sections, because the chat platform has no skill tool and no
   newline and nothing after it. In the backend doc the closing fence goes on the line
   straight after the last prompt line, with no blank line between them.
 
-`tests/test_trc_soul_loads.py` adds three more checks. The prompt starts with
-`RULE ZERO`, as the deploy smoke check also requires. It loads whole, with no scanner
-rewrite and no trim. Every route in it (`→` followed by a backticked tool name) is in
-`mcp_servers.ragnarok.tools.include`.
+`tests/test_trc_soul_loads.py` adds four more checks:
+
+- The prompt starts with `RULE ZERO`, as the deploy smoke check also requires.
+- It loads whole, with no scanner rewrite and no trim.
+- It carries the contracts other components rely on: the three `resolve_entity`
+  decisions `pick`, `each` and `ask` (contract C2), and the `trc:followups` tag that the
+  backend filter and the Open WebUI fork parse (contract C3).
+- Every route in it (`→` followed by a backticked tool name) is in
+  `mcp_servers.ragnarok.tools.include`. The one exception is `execute_code`, which is
+  not an MCP tool: it must instead come from the `code_execution` toolset in
+  `platform_toolsets.api_server`.
 
 On Windows (`core.autocrlf=true`) the working-tree copy has CRLF line endings. Git stores
 LF, and every check reads the file with `read_text`, which normalises line endings.

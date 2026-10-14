@@ -103,8 +103,10 @@ services:
       - ${HERMES_SOUL_PATH:?HERMES_SOUL_PATH must be set}:/opt/data/SOUL.md:ro
       # The TRC playbooks (deploy/trc/skills), mounted OVER $HERMES_HOME/skills so the
       # generic skills an earlier boot synced into the volume are hidden and these are
-      # the only ones indexed. Read-only, for the same reason as SOUL.md; the platform
-      # also exposes no skill_manage (config.yaml, `skills_readonly`).
+      # the only ones indexed. Read-only, for the same reason as SOUL.md. Since
+      # answer-first P1 chat has no skill tool at all: the api_server platform toolsets
+      # are [ragnarok, code_execution] (config.yaml). The mount stays for P2 / a report
+      # mode, which would add `skills_readonly` (never `skills`, so no skill_manage).
       - ${HERMES_SKILLS_PATH:?HERMES_SKILLS_PATH must be set}:/opt/data/skills:ro
 
   hermes-sandbox:
