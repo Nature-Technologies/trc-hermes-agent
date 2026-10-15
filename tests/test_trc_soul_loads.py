@@ -12,14 +12,15 @@ scanner alone, so a future change to how SOUL.md is read is covered too.
 
 from __future__ import annotations
 
+import re
 import shutil
 from pathlib import Path
 
-_DEPLOYED = Path(__file__).resolve().parents[1] / "deploy" / "trc" / "SOUL.md"
+_DEPLOY = Path(__file__).resolve().parents[1] / "deploy" / "trc"
+_DEPLOYED = _DEPLOY / "SOUL.md"
 
 
-def _load(tmp_path, monkeypatch, context_length: int | None = 256_000) -> str:
-    """SOUL.md through the real loader (threat scanner + trim) at the deployed window."""
+def _load(tmp_path, monkeypatch, context_length=None) -> str:
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -27,212 +28,48 @@ def _load(tmp_path, monkeypatch, context_length: int | None = 256_000) -> str:
 
     from agent.prompt_builder import load_soul_md
 
-    loaded = load_soul_md(context_length) or ""
-    assert not loaded.startswith("[BLOCKED"), loaded[:200]
-    return loaded
-
-
-def _section(text: str, heading: str) -> str:
-    start = text.index(heading)
-    return text[start:text.index("\n# ", start + 1)]
-
-
-def _flat(text: str) -> str:
-    """Line wraps are layout, not wording."""
-    return " ".join(text.split())
+    return load_soul_md(context_length) or ""
 
 
 def test_the_deployed_soul_loads_as_the_trc_prompt(tmp_path, monkeypatch):
-    home = tmp_path / ".hermes"
-    home.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    shutil.copy(_DEPLOYED, home / "SOUL.md")
-
-    from agent.prompt_builder import load_soul_md
-
-    loaded = load_soul_md() or ""
+    loaded = _load(tmp_path, monkeypatch)
     assert not loaded.startswith("[BLOCKED"), loaded[:200]
     assert loaded.startswith("RULE ZERO")
 
 
-def test_the_soul_keeps_subagents_for_reports_and_comparisons_in_one_turn(tmp_path, monkeypatch):
-    """Spec 2026-10-13 §5 C8: subagents only for multi-section research or reports; a
-    comparison is parallel lookups in one turn (cheaper and faster)."""
+def test_the_whole_prompt_loads_unchanged_even_without_a_context_window(tmp_path, monkeypatch):
+    """No scanner rewrite and no head/tail trim. With no context window (the deploy
+    smoke check calls it that way) the loader trims at its 20 K floor; the budget keeps
+    the prompt well under it."""
+    loaded = _load(tmp_path, monkeypatch)
+    assert loaded == _DEPLOYED.read_text(encoding="utf-8").strip()
+
+
+def test_the_loaded_prompt_carries_the_contracts_other_components_rely_on(tmp_path, monkeypatch):
+    loaded = _load(tmp_path, monkeypatch, 256_000)
+    # Contract C2: resolve_entity's three decisions, each with what to do.
+    for decision in ("`pick`", "`each`", "`ask`"):
+        assert decision in loaded, decision
+    # Contract C3: the block the backend filter and the Open WebUI fork parse.
+    assert "trc:followups" in loaded
+
+
+def test_every_tool_the_prompt_routes_to_reaches_the_model(tmp_path, monkeypatch):
+    """Each route in SOUL.md (an arrow, then a backticked tool name) is a ragnarok tool
+    on the wire, or execute_code from the code_execution toolset: a route to a tool the
+    model does not have is a call to nothing."""
+    soul = _DEPLOYED.read_text(encoding="utf-8")
+    routed = set(re.findall(r"→\s+`([a-z_]+)`", soul))
+    assert {"resolve_entity", "rank_and_count"} <= routed
+
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
-    shutil.copy(_DEPLOYED, home / "SOUL.md")
+    shutil.copy(_DEPLOY / "config.yaml", home / "config.yaml")
+    from hermes_cli.config import load_config
 
-    from agent.prompt_builder import load_soul_md
-
-    # A real context window, as the agent passes: without one the 20K floor head/tail-trims.
-    loaded = load_soul_md(256_000) or ""
-    start = loaded.index("# Subagents (`delegate_task`)")
-    section = loaded[start:loaded.index("\n# ", start + 1)]
-    assert "ONLY for multi-section research or a report" in section
-    assert "Never use" in section and "comparison" in section
-    assert "all of them in the same turn" in section
-    assert "two or three entities" in section and "execute_code" in section
-    assert "four or more entities or periods" in section
-    assert "one `execute_code` run" in section
-    assert "Never mention helpers or subagents to the user." in section
-
-
-def test_the_whole_soul_fits_the_deployed_context_window(tmp_path, monkeypatch):
-    """SOUL.md grows with every rule; past the window's budget the loader head/tail-trims
-    the middle away silently (agent/prompt_builder.py::_truncate_content)."""
-    from agent.prompt_builder import _dynamic_context_file_max_chars
-
-    raw = _DEPLOYED.read_text(encoding="utf-8").strip()
-    assert len(raw) <= _dynamic_context_file_max_chars(256_000), len(raw)
-    assert _load(tmp_path, monkeypatch) == raw
-
-
-def test_the_soul_settles_a_name_with_resolve_entity_before_any_expensive_call(
-    tmp_path, monkeypatch
-):
-    """Orchestrator spec 2026-10-13 entity resolution §8: resolve first, then §3."""
-    loaded = _load(tmp_path, monkeypatch)
-    section = _flat(_section(loaded, "# A name: settle WHO before anything else"))
-    assert "names a client, company, fund, entity or person, call `resolve_entity`" in section
-    assert "BEFORE" in section
-    for tool in (
-        "query", "find_relationships", "lookup_live", "period_series",
-        "meeting_briefing", "generate_report", "knowledge_graph",
-    ):
-        assert f"`{tool}`" in section, tool
-    assert "TRC itself is the firm, not a name to resolve" in section
-    assert "its `ref` for `knowledge_graph`" in section
-    # I1: the chosen candidate carries its source into lookup_live, never into query.
-    assert "its `ref` for `knowledge_graph`, and for `lookup_live` its source as `source`" in section
-    assert "figures and holdings \"addepar\", contacts and meetings \"affinity\"" in section
-    # I2: the non-answer outcomes each have a rule.
-    assert "`ambiguous` with no candidates → records match but none can be shown: ask for the full name." in section
-    assert "never say no record exists" in section
-    assert "`invalid` → correct the argument (drop `category` or `source`)" in section
-    # I3: an author is not a name to resolve.
-    assert "(`author` in `list_interactions`)" in section
-    # M4 / M7 / M3.
-    assert "If `match_note` says the record is named differently" in section
-    assert "trust it over the kind of token the name arrived as" in section
-    assert "several unsettled names are one question" in _flat(loaded)
-    assert "except that a name settled by `resolve_entity` is passed as the candidate's `name`" in _flat(loaded)
-    # Listed with the other tools, before any routing rule uses it.
-    tools = _flat(_section(loaded, '# The "ragnarok" tools'))
-    assert "- `resolve_entity` —" in tools and "- `knowledge_graph` —" in tools
-
-
-def test_the_soul_asks_by_the_clarification_policy_in_plain_words(tmp_path, monkeypatch):
-    """Spec §3, one rule per row, asked as a plain question with no tool talk."""
-    section = _flat(_section(_load(tmp_path, monkeypatch), "# A name: settle WHO before anything else"))
-    # Row 1: one exact/normalized match → proceed, say which record was used.
-    assert "`ok` → go ahead with that candidate" in section
-    assert "naming the record you used" in section
-    # Row 2: one near match → "Did you mean X?"
-    assert "`ambiguous` with one candidate (a near match) → ask \"Did you mean X?\"" in section
-    # Row 3: several → "Which of these do you mean?", up to five, with type and source.
-    assert "\"Which of these do you mean?\" with up to five" in section
-    assert "\"in Addepar\" or \"in Affinity\"" in section
-    # Row 4: none → say so, ask for the name, no broad search.
-    assert "`not_found` → say no record matches that name" in section
-    assert "or should I look for it in the documents?\" Make no broad search unless the user says so." in section
-    # Nothing expensive first; the user chooses; no tool talk.
-    assert "When you ask, make no other call before the user answers, and never choose for them." in section
-    assert "naming no tool or search" in section
-
-
-def test_one_broad_call_first_is_for_unclear_topics_never_for_names(tmp_path, monkeypatch):
-    """Spec §8: the rule-2 conflict is removed; a token is resolved, not queried."""
-    loaded = _load(tmp_path, monkeypatch)
-    rules = _flat(_section(loaded, "# When a question can mean more than one thing"))
-    assert "different answers on WHAT, WHEN, or a WHO that names no one → make ONE broad call" in rules
-    assert "a name is never settled this way" in rules
-    tokens = _flat(_section(loaded, "# Placeholder tokens"))
-    assert "is an ordinary question: call `resolve_entity` with it." in tokens
-    assert "call `query` with it" not in tokens
-
-
-def test_resolving_names_spends_no_lookup_and_subagents_get_settled_names(tmp_path, monkeypatch):
-    loaded = _load(tmp_path, monkeypatch)
-    calls = _flat(_section(loaded, "# Calling tools in one turn"))
-    assert "up to THREE data-tool calls for one user message (`resolve_entity` calls not counted)" in calls
-    helpers = _flat(_section(loaded, "# Subagents (`delegate_task`)"))
-    assert "settle every name with `resolve_entity` first" in helpers
-
-
-def test_the_soul_never_picks_a_candidate_for_the_user(tmp_path, monkeypatch):
-    """Spec §8 "Ask, don't pick": both pick-yourself lines are gone."""
-    raw = _flat(_DEPLOYED.read_text(encoding="utf-8"))
-    assert "re-call with exactly one" not in raw
-    assert "to pick one candidate" not in raw
-    loaded = _load(tmp_path, monkeypatch)
-    query_rules = _flat(_section(loaded, "# Reading a `query` result"))
-    assert (
-        "`status: \"ambiguous\"` lists `candidates`: ask the user which one they mean, "
-        "listing them; never choose for them." in query_rules
-    )
-    assert "re-call with that one's `subject_user_id`" in query_rules
-    live_rules = _flat(_section(loaded, "# Reading a `lookup_live`, `find_relationships`"))
-    assert "lists `candidates`: ask the user which one, listing them; never choose for them." in live_rules
-
-
-def test_connections_ownership_and_files_route_to_knowledge_graph(tmp_path, monkeypatch):
-    """Spec §8 "Use the graph tool"; `query` stays for what documents say."""
-    loaded = _load(tmp_path, monkeypatch)
-    flat = _flat(loaded)
-    assert (
-        "what X owns or who owns it, which accounts a client holds, who or what X is "
-        "connected to, the files about X → `knowledge_graph` with X's `ref`" in flat
-    )
-    assert "What the documents SAY about X is still `query`." in flat
-    reading = _flat(_section(loaded, "# Reading a `lookup_live`, `find_relationships` or `knowledge_graph` result"))
-    assert "`knowledge_graph`: `nodes` and `edges` are the data" in reading
-    assert "never that X has no connections or files" in reading
-    assert "find_relationships, resolve_entity and knowledge_graph. Nothing else is reachable." in flat
-
-
-def test_resolve_first_covers_scripts_generate_report_and_several_names(tmp_path, monkeypatch):
-    """Fix round 1: no path around resolve-first, and resolving is never a second call."""
-    loaded = _load(tmp_path, monkeypatch)
-    flat = _flat(loaded)
-    assert (
-        "Then, once every name in it is settled (see \"A name: settle WHO before anything "
-        "else\"), go straight to `execute_code`" in flat
-    )
-    section = _flat(_section(loaded, "# A name: settle WHO before anything else"))
-    assert "`list_interactions`, `meeting_briefing`, `generate_report`, `knowledge_graph` or `execute_code`." in section
-    assert (
-        "Several names unsettled → resolve them all in the same turn and ask about all "
-        "of them in one message." in section
-    )
-    assert "Names are settled in chat before the script; a script never chooses between candidates." in flat
-    assert "Never pair `generate_report` with any tool but `resolve_entity`" in flat
-
-
-def test_a_stale_knowledge_graph_ref_is_invalid_or_not_found_never_missing(tmp_path, monkeypatch):
-    """A ref from another session or an expired one returns `not_found`; a malformed one
-    returns `invalid`. Both mean stale: resolve again, never claim the record is absent."""
-    loaded = _load(tmp_path, monkeypatch)
-    flat = _flat(loaded)
-    assert (
-        "`invalid` or `not_found` for a `ref` means it is stale: resolve the name again, "
-        "and never tell the user the record does not exist." in flat
-    )
-    assert "`invalid` means a stale `ref`: resolve the name again." not in flat
-
-
-def test_graph_files_are_record_files_only_and_withheld_nodes_stay_unnamed(tmp_path, monkeypatch):
-    """I4 and M5/M8: `files` is not every document; null names and refs stay hidden."""
-    loaded = _load(tmp_path, monkeypatch)
-    flat = _flat(loaded)
-    assert (
-        "`op=\"files\"` covers only X's Addepar and Affinity records and its connections': "
-        "documents about X filed elsewhere (letters, reports, Dropbox) are found with `query`."
-    ) in flat
-    reading = _flat(_section(loaded, "# Reading a `lookup_live`, `find_relationships` or `knowledge_graph` result"))
-    assert "`files` lists X's Addepar and Affinity record files only; never present them as every document on X" in reading
-    assert "A node or file whose `name` is null is withheld: count it, never name it." in reading
-    assert "A `ref` is for tools only; never show one to the user." in reading
-    assert "Either tool's `ambiguous`: one candidate in `did_you_mean` → ask \"Did you mean X?\"" in reading
-    assert "see \"When a question can mean more than one thing\"" in flat
-    assert "a client's legal entities and accounts (Addepar)" not in flat
+    cfg = load_config()
+    include = set(cfg["mcp_servers"]["ragnarok"]["tools"]["include"])
+    assert routed - {"execute_code"} <= include, routed - {"execute_code"} - include
+    if "execute_code" in routed:
+        assert "code_execution" in cfg["platform_toolsets"]["api_server"]

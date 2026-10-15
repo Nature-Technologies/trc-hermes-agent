@@ -83,7 +83,7 @@ def _sandbox_allowlist() -> frozenset:
     """The tools a sandbox script may call, before intersecting with the session.
 
     ``code_execution.sandbox_tools`` in config.yaml replaces the built-in list (the TRC
-    deployment sets its four ragnarok data tools); unset keeps SANDBOX_ALLOWED_TOOLS.
+    deployment sets its ragnarok data tools); unset keeps SANDBOX_ALLOWED_TOOLS.
 
     Key absent → SANDBOX_ALLOWED_TOOLS (backward-compatible default), EXCEPT under the
     sidecar transport → frozenset() and a warning once: an unreadable config.yaml reads

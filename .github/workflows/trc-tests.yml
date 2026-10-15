@@ -10,11 +10,18 @@ name: TRC Tests
 on:
   pull_request:
     branches: [dev, main]
-    paths-ignore:
-      - '**.md'
-      - 'website/**'
-      - 'docs/**'
-      - 'apps/**'
+    # `paths` with negations, not `paths-ignore`, because paths-ignore cannot
+    # re-include a path: deploy/trc/SOUL.md and the TRC playbooks are .md files
+    # the TRC tests check (test_trc_soul_budget.py, test_trc_soul_loads.py,
+    # test_trc_skills.py), so a PR that changes only them must still run the
+    # suite. Later patterns win over earlier ones.
+    paths:
+      - '**'
+      - '!**.md'
+      - '!website/**'
+      - '!docs/**'
+      - '!apps/**'
+      - 'deploy/trc/**'
   workflow_dispatch:
 
 permissions:

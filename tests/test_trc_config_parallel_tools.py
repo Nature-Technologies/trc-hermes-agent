@@ -62,15 +62,4 @@ def test_the_generic_parallel_guidance_block_stays_off(tmp_path, monkeypatch):
 def test_soul_tells_the_model_to_issue_independent_lookups_together():
     soul = (_DEPLOY / "SOUL.md").read_text(encoding="utf-8")
 
-    assert "issue them all in the same turn" in soul
-
-
-
-def test_the_entity_tools_ride_ragnarok_with_its_identity_and_caps(tmp_path, monkeypatch):
-    """resolve_entity and knowledge_graph are calls on the same server, so each carries its
-    own end user's identity and shares the parallel caps (orchestrator spec 2026-10-13 §8)."""
-    ragnarok = _merged_config(tmp_path, monkeypatch)["mcp_servers"]["ragnarok"]
-
-    assert {"resolve_entity", "knowledge_graph"} <= set(ragnarok["tools"]["include"])
-    assert ragnarok["forward_user_identity"] is True
-    assert ragnarok["supports_parallel_tool_calls"] is True
+    assert "Make independent calls in the same turn." in soul

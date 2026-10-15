@@ -1,0 +1,135 @@
+"""The budget SOUL v2 was written to (trc-orchestrator spec 2026-10-14 answer-first §4,
+§4.1; contract C6).
+
+The prompt is sent on every model call of every turn, so its length is paid on each one,
+and its wording sets the voice the answers take. The limits:
+
+- at most 6,500 characters (1,500 more are reserved for learned lessons, spec §8);
+- "never" kept for the security and token rules, at most ten times (v1 had 47);
+- none of the self-doubt phrases the eval's hedge lint counts in answers (spec §7);
+- routes to the P1 tools and names none that is off the chat wire;
+- a shape the backend's reviewed copy can hold byte for byte: no line that would close
+  its ```text block, and exactly one trailing newline, which is what
+  scripts/check_soul_matches_backend.py extracts from that block.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import re
+from pathlib import Path
+
+import pytest
+
+_ROOT = Path(__file__).resolve().parents[1]
+_SOUL = _ROOT / "deploy" / "trc" / "SOUL.md"
+_CHECK = _ROOT / "scripts" / "check_soul_matches_backend.py"
+
+_HEDGES = (
+    "honestly",
+    "I want to be straight",
+    "unfortunately",
+    "it seems",
+    "I wasn't able",
+    "I was not able",
+    "I couldn't",
+    "I could not",
+    "try again",
+)
+
+
+def _soul() -> str:
+    return _SOUL.read_text(encoding="utf-8")
+
+
+def test_the_prompt_fits_its_budget():
+    assert len(_soul()) <= 6500, len(_soul())
+
+
+def test_never_is_kept_for_the_rules_that_need_it():
+    hits = re.findall(r"\bnever\b", _soul(), flags=re.IGNORECASE)
+    assert len(hits) <= 10, len(hits)
+
+
+@pytest.mark.parametrize("phrase", _HEDGES)
+def test_the_prompt_models_no_hedge(phrase):
+    text = _soul().replace("’", "'").lower()
+    assert phrase.lower() not in text
+
+
+def test_names_and_rankings_route_to_their_one_call_tools():
+    soul = _soul()
+    assert "`resolve_entity`" in soul
+    assert "`rank_and_count`" in soul
+
+
+@pytest.mark.parametrize("tool", ["list_entities", "meeting_briefing", "skill_view"])
+def test_the_prompt_names_no_tool_that_is_off_the_chat_wire(tool):
+    assert tool not in _soul()
+
+
+def test_no_line_would_close_the_backend_text_block_early():
+    """Stricter than the backend's twin (`line.strip() != "```"`): an indented fence,
+    or a fence with a tag such as trc:followups, is rejected too."""
+    fences = [line for line in _soul().splitlines() if line.lstrip().startswith("```")]
+    assert not fences, fences
+
+
+def test_the_checkout_is_lf_with_no_bom():
+    """The sha256 both repos pin is of LF text. .gitattributes keeps a Windows
+    checkout from turning the file CRLF, so raw bytes hash the same everywhere."""
+    raw = _SOUL.read_bytes()
+    assert b"\r" not in raw
+    assert not raw.startswith(b"\xef\xbb\xbf")
+
+
+def test_the_drift_check_writes_lf(tmp_path, monkeypatch):
+    """`--write` regenerates SOUL.md from the backend block; on Windows a default
+    write_text would write CRLF. Linux writes LF either way, so the bytes alone cannot
+    catch a regression there: every text-mode write must also pin newline to LF."""
+    spec = importlib.util.spec_from_file_location("check_soul_matches_backend", _CHECK)
+    check = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(check)
+
+    doc = tmp_path / "integrations" / "openwebui" / "SYSTEM_PROMPT.md"
+    doc.parent.mkdir(parents=True)
+    doc.write_text("```text\nline one\nline two\n```\n", encoding="utf-8")
+    soul = tmp_path / "SOUL.md"
+    soul.write_text("stale\n", encoding="utf-8")
+    monkeypatch.setattr(check, "_SOUL", soul)
+    monkeypatch.setattr("sys.argv", ["check", "--backend", str(tmp_path), "--write"])
+    text_writes: list[object] = []
+    real_write_text = Path.write_text
+
+    def recording_write_text(self, data, *args, **kwargs):
+        text_writes.append(kwargs.get("newline"))
+        return real_write_text(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", recording_write_text)
+
+    assert check.main() == 0
+    assert all(newline == "\n" for newline in text_writes), text_writes
+    assert soul.read_bytes() == b"line one\nline two\n"
+
+
+def test_the_file_ends_with_exactly_one_newline():
+    soul = _soul()
+    assert soul.endswith("\n")
+    assert not soul.endswith("\n\n")
+
+
+def test_the_drift_check_reads_this_file_back_out_of_a_backend_block(tmp_path):
+    """Through the drift check's own extraction: the backend doc holds the prompt as
+    ```text, the prompt, then ``` on the next line."""
+    spec = importlib.util.spec_from_file_location("check_soul_matches_backend", _CHECK)
+    check = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(check)
+
+    soul = _soul()
+    doc = tmp_path / "integrations" / "openwebui" / "SYSTEM_PROMPT.md"
+    doc.parent.mkdir(parents=True)
+    doc.write_text(
+        "# TRC system prompt\n\nReviewed here.\n\n```text\n" + soul + "```\n\nNotes.\n",
+        encoding="utf-8",
+    )
+    assert check.backend_prompt(tmp_path) == soul

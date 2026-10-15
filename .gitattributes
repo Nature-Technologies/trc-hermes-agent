@@ -8,3 +8,8 @@ web/package-lock.json linguist-generated=true
 Dockerfile  text eol=lf
 *.dockerfile text eol=lf
 docker/entrypoint.sh text eol=lf
+
+# The TRC system prompt is byte-locked with trc-backend's SYSTEM_PROMPT.md, and both
+# repos pin its sha256 over LF text. Keep a Windows checkout LF too, so the raw bytes
+# hash the same on every platform.
+deploy/trc/SOUL.md text eol=lf
