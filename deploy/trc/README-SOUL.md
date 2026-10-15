@@ -75,6 +75,16 @@ the passages and no generated answer (contract C7), which those chats are not wr
 for. On staging, everyone who chatted before the deploy should start a new chat, both for
 this and for the tool-list mismatch above.
 
+The backend's own default is `True` (trc-backend `app/core/config.py`), so the flag must
+be set to `false` explicitly for the rollout window; an absent flag means data mode is on.
+This is a required deploy step, checked on the backend host before Hermes deploys:
+
+```bash
+docker exec app python -c "from app.core.config import get_settings; print(get_settings().query_data_mode_enabled)"
+```
+
+It must print `False` until C2 and C3 are live here, and `True` after the flag is turned on.
+
 ## Why it is a file here at all
 
 Hermes assembles its system prompt as identity → guidance → ephemeral. `SOUL.md` is the

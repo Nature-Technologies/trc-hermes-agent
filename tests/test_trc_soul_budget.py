@@ -31,7 +31,9 @@ _HEDGES = (
     "unfortunately",
     "it seems",
     "I wasn't able",
+    "I was not able",
     "I couldn't",
+    "I could not",
     "try again",
 )
 
@@ -67,7 +69,37 @@ def test_the_prompt_names_no_tool_that_is_off_the_chat_wire(tool):
 
 
 def test_no_line_would_close_the_backend_text_block_early():
-    assert "```" not in _soul().splitlines()
+    """Stricter than the backend's twin (`line.strip() != "```"`): an indented fence,
+    or a fence with a tag such as trc:followups, is rejected too."""
+    fences = [line for line in _soul().splitlines() if line.lstrip().startswith("```")]
+    assert not fences, fences
+
+
+def test_the_checkout_is_lf_with_no_bom():
+    """The sha256 both repos pin is of LF text. .gitattributes keeps a Windows
+    checkout from turning the file CRLF, so raw bytes hash the same everywhere."""
+    raw = _SOUL.read_bytes()
+    assert b"\r" not in raw
+    assert not raw.startswith(b"\xef\xbb\xbf")
+
+
+def test_the_drift_check_writes_lf(tmp_path, monkeypatch):
+    """`--write` regenerates SOUL.md from the backend block; on Windows a default
+    write_text would write CRLF."""
+    spec = importlib.util.spec_from_file_location("check_soul_matches_backend", _CHECK)
+    check = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(check)
+
+    doc = tmp_path / "integrations" / "openwebui" / "SYSTEM_PROMPT.md"
+    doc.parent.mkdir(parents=True)
+    doc.write_text("```text\nline one\nline two\n```\n", encoding="utf-8")
+    soul = tmp_path / "SOUL.md"
+    soul.write_text("stale\n", encoding="utf-8")
+    monkeypatch.setattr(check, "_SOUL", soul)
+    monkeypatch.setattr("sys.argv", ["check", "--backend", str(tmp_path), "--write"])
+
+    assert check.main() == 0
+    assert soul.read_bytes() == b"line one\nline two\n"
 
 
 def test_the_file_ends_with_exactly_one_newline():

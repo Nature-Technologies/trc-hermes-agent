@@ -12,18 +12,21 @@ FastMCP does.
 
 from __future__ import annotations
 
+import re
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import yaml
 
 _DEPLOYED = Path(__file__).resolve().parents[1] / "deploy" / "trc" / "config.yaml"
 _PREFIX = "mcp__ragnarok__"
 # A stand-in for the backend's MCP tool list: the end-user tools, plus the ones that
-# must never reach the model (record_computed is the gateway's own call; ingest_document
-# writes to the corpus).
+# must never reach the model (record_computed is the gateway's own call). The backend
+# no longer serves ingest_document (removed 2026-09-28); it stays here as the shape of a
+# corpus-write tool a future server could offer, which `include` must keep off the wire.
 _OFFERED = (
     "query", "period_series", "read_document", "list_entities", "generate_report",
     "render_report", "find_relationships", "list_interactions", "meeting_briefing",
@@ -145,6 +148,39 @@ def test_scripts_reach_nothing_but_ragnarok(deployed):
     allowlist = _sandbox_allowlist()
     assert allowlist
     assert all(name.startswith(_PREFIX) for name in allowlist), allowlist
+
+
+def _soul_script_tools() -> frozenset[str]:
+    """The tools SOUL.md tells the model a script reaches: the backticked names in its
+    "A script reaches … as `ragnarok.<tool>(...)`" sentence."""
+    soul = (_DEPLOYED.parent / "SOUL.md").read_text(encoding="utf-8")
+    match = re.search(r"A script reaches (.*?) as `ragnarok\.", soul, flags=re.DOTALL)
+    assert match, "SOUL.md no longer states which tools a script reaches"
+    return frozenset(_PREFIX + name for name in re.findall(r"`(\w+)`", match.group(1)))
+
+
+def test_scripts_reach_exactly_the_tools_the_prompt_says_they_reach(deployed):
+    """The byte-locked prompt is the reviewed statement of the untrusted-script surface
+    (contract C6). An allowlist wider than it is a surface no reviewer signed off on, and
+    one narrower is a script the model writes against a tool it does not get."""
+    from tools.code_execution_tool import _sandbox_allowlist
+
+    assert _sandbox_allowlist() == _soul_script_tools()
+
+
+def test_the_staging_container_cannot_turn_the_response_cache_back_on():
+    """HERMES_OPENROUTER_CACHE(_TTL) in the environment overrides
+    `openrouter.response_cache: false` (agent/auxiliary_client.py). The staging compose
+    is what sets the gateway's environment, so it must set neither, and it must not pull
+    in an env_file that could."""
+    compose = yaml.safe_load(
+        (_DEPLOYED.parent / "docker-compose-staging-trc.yml").read_text(encoding="utf-8")
+    )
+    service = compose["services"]["hermes-agent"]
+    assert "env_file" not in service
+    env = service.get("environment") or {}
+    names = env if isinstance(env, dict) else [str(e).partition("=")[0] for e in env]
+    assert not [n for n in names if str(n).startswith("HERMES_OPENROUTER_CACHE")]
 
 
 def test_a_script_can_fetch_the_inputs_of_a_derived_figure(deployed):

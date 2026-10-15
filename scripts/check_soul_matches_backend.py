@@ -68,7 +68,7 @@ def main() -> int:
         return 0
 
     if args.write:
-        _SOUL.write_text(expected, encoding="utf-8")
+        _SOUL.write_text(expected, encoding="utf-8", newline="\n")
         print(f"rewrote {_SOUL} from the backend prompt")
         return 0
 

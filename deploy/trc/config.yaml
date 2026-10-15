@@ -45,7 +45,10 @@ platform_toolsets:
 # Deliberately absent: `lookup_live` spends the firm-shared Addepar budget (50 calls
 # per 15 minutes), which a loop in a script could exhaust; `resolve_entity` can
 # decide `ask`, and a script cannot ask the user, so the model resolves names before
-# it writes the script.
+# it writes the script; `knowledge_graph` stays a model-only call (on the wire below),
+# because SOUL.md states the script surface as the six tools listed here and that text
+# is byte-locked with trc-backend (contract C6). A test pins this list to SOUL.md's
+# sentence (tests/test_trc_config_hardening.py).
 code_execution:
   transport: sidecar
   sidecar_socket: /run/hermes-sandbox/sock
@@ -64,9 +67,6 @@ code_execution:
     - mcp__ragnarok__rank_and_count
     # A script publishes a computed report with report.publish() (trc-backend spec §7).
     - mcp__ragnarok__render_report
-    # A record's neighbours, ownership and files inside a script (orchestrator spec
-    # 2026-10-13 entity resolution §8, kept from dev #21).
-    - mcp__ragnarok__knowledge_graph
   # Gateway-only backend tool fed each run's output, for the "calculated" figure note.
   # Deliberately NOT in mcp_servers.ragnarok.tools.include: the model must not call it.
   record_computed_server: ragnarok
@@ -246,8 +246,9 @@ mcp_servers:
     max_concurrent_calls: 6
     max_concurrent_calls_per_user: 3
     # H1 follow-up: `tools/mcp_tool.py` honours `tools.include`/`exclude` per
-    # MCP server. Pin the end-user tools so `ingest_document` is off the wire by
-    # construction. A NEW backend tool must be added here to reach the model —
+    # MCP server. Pin the end-user tools, so a tool the backend adds (or one that
+    # writes to the corpus) is off the wire by construction. A NEW backend tool must
+    # be added here to reach the model —
     # the allowlist is the gate, not the prompt ban. `record_computed` stays out:
     # the gateway calls it (`code_execution` above), the model does not.
     #
@@ -277,7 +278,9 @@ mcp_servers:
         - resolve_entity
         - rank_and_count
         # Walk a record's connections, ownership and files (dev #21, orchestrator spec
-        # 2026-10-13 §8). Its own description routes "who owns X / files on X" to it.
+        # 2026-10-13 §8), by the `ref` resolve_entity returns. Model-only: not in
+        # code_execution.sandbox_tools. Which questions reach it is set by the tool
+        # descriptions and SOUL.md together, not by this file.
         - knowledge_graph
       resources: false
       prompts: false
@@ -287,7 +290,8 @@ mcp_servers:
 # Hermes replaces them with tool_search / tool_describe / tool_call bridge tools.
 # The TRC surface is a short pinned allowlist that SOUL.md routes by name; a bridge
 # would add a model step to every lookup and a second way to call each tool.
-# Quoted, because a bare `off` is YAML for false.
+# Quoted for clarity: a bare `off` is YAML for false, which the parser also reads as
+# "off" (tools/tool_search.py), so the quotes are defensive, not load-bearing.
 tools:
   tool_search:
     enabled: "off"
