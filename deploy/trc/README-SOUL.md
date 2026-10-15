@@ -73,27 +73,18 @@ and the list of tools that do, and the model usually corrects itself.
 After a prompt deploy, test in a new chat, and ask users to start one. Spec §11.9 leaves
 a prompt-version check, which would rebuild stale stored prompts, as a later option.
 
-**Deploy order with the backend.** The backend must go out with
-`QUERY_DATA_MODE_ENABLED=false` and stay that way until this config and the v2 prompt
-(tasks C2 and C3, which deploy together) are live on Hermes. Only then is the flag turned
-on. The reason is the same stored-prompt rule: a chat that began on SOUL v1 keeps v1 and
-expects `query` to return an `answer`. With data mode on, `query` without `answer` returns
-the passages and no generated answer (contract C7), which those chats are not written
-for. On staging, everyone who chatted before the deploy should start a new chat, both for
-this and for the tool-list mismatch above.
-
-The backend's own default is `True` (trc-backend `app/core/config.py`), so the flag must
-be set to `false` explicitly for the rollout window; an absent flag means data mode is on.
-This is a required deploy step, checked on the backend host before Hermes deploys:
+**Deploy together with the backend.** The backend staging compose sets
+`QUERY_DATA_MODE_ENABLED: "true"` (contract C7): `query` returns passages and this
+prompt's model writes the answer. SOUL v2 is written for that; SOUL v1 expected `query`
+to return a generated `answer`. So publish this Hermes build (C2 + C3) together with the
+backend, and have everyone who chatted before the deploy start a new chat: a chat that
+began on v1 keeps v1 (the stored-prompt rule above). `"false"` in the backend compose is
+the kill switch: every `query` then generates its own answer, as before. Check on the
+backend host:
 
 ```bash
 docker exec app python -c "from app.core.config import get_settings; print(get_settings().query_data_mode_enabled)"
 ```
-
-It must print `False` until C2 and C3 are live here, and `True` after the flag is turned on.
-Turn it on as soon as the Hermes deploy is verified, not later: while it is off, the
-backend generates an answer for every `query` call, a script's `answer=False` included,
-so scripts get passages and an answer they did not ask for, more slowly.
 
 ## Why it is a file here at all
 
