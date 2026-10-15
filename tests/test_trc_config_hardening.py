@@ -172,12 +172,15 @@ def test_the_staging_container_cannot_turn_the_response_cache_back_on():
     """HERMES_OPENROUTER_CACHE(_TTL) in the environment overrides
     `openrouter.response_cache: false` (agent/auxiliary_client.py). The staging compose
     is what sets the gateway's environment, so it must set neither, and it must not pull
-    in an env_file that could."""
+    in an env_file, an `extends` or an `include` that could."""
     compose = yaml.safe_load(
         (_DEPLOYED.parent / "docker-compose-staging-trc.yml").read_text(encoding="utf-8")
     )
+    # Nothing merged in from another file, which this parse would not see.
+    assert "include" not in compose
     service = compose["services"]["hermes-agent"]
     assert "env_file" not in service
+    assert "extends" not in service
     env = service.get("environment") or {}
     names = env if isinstance(env, dict) else [str(e).partition("=")[0] for e in env]
     assert not [n for n in names if str(n).startswith("HERMES_OPENROUTER_CACHE")]

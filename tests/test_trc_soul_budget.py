@@ -85,7 +85,8 @@ def test_the_checkout_is_lf_with_no_bom():
 
 def test_the_drift_check_writes_lf(tmp_path, monkeypatch):
     """`--write` regenerates SOUL.md from the backend block; on Windows a default
-    write_text would write CRLF."""
+    write_text would write CRLF. Linux writes LF either way, so the bytes alone cannot
+    catch a regression there: every text-mode write must also pin newline to LF."""
     spec = importlib.util.spec_from_file_location("check_soul_matches_backend", _CHECK)
     check = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(check)
@@ -97,8 +98,17 @@ def test_the_drift_check_writes_lf(tmp_path, monkeypatch):
     soul.write_text("stale\n", encoding="utf-8")
     monkeypatch.setattr(check, "_SOUL", soul)
     monkeypatch.setattr("sys.argv", ["check", "--backend", str(tmp_path), "--write"])
+    text_writes: list[object] = []
+    real_write_text = Path.write_text
+
+    def recording_write_text(self, data, *args, **kwargs):
+        text_writes.append(kwargs.get("newline"))
+        return real_write_text(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", recording_write_text)
 
     assert check.main() == 0
+    assert all(newline == "\n" for newline in text_writes), text_writes
     assert soul.read_bytes() == b"line one\nline two\n"
 
 

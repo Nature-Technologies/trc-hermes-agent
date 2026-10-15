@@ -79,8 +79,8 @@ code_execution:
     calculation over TRC data. It runs in an isolated sandbox with no network and no
     files; its only data source is the ragnarok tools listed below, called with
     keyword arguments. Fetch inside the program when you need many rows, pass
-    answer=False to query when you need only the data, and print only results — each
-    figure with its [Sn] marker and date. The values of an entity and of the entities
+    answer=False to query when you need only the data and read its chunks, and print
+    only results — each figure with its [Sn] marker and date. The values of an entity and of the entities
     it owns overlap: rank them, do not add them. numpy and pandas are available.
 
 # ── Subagents (trc-orchestrator spec 2026-10-13 §5, Phase C) ──────────

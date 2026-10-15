@@ -24,12 +24,14 @@ skills or subagent sections, because the chat platform has no skill tool and no
 - At most **6,500 characters**. Another 1,500 are reserved for learned lessons (spec §8).
 - `never` (whole word, any case) at most **10** times, kept for the security and token
   rules. Every other rule is a positive instruction with its reason.
-- None of the hedge phrases the eval lint counts in answers: "honestly", "I want to be
-  straight", "unfortunately", "it seems", "I wasn't able", "I couldn't", "try again".
+- None of the hedge phrases the eval lint counts in answers (`evals/lint.py`, SOFTENERS
+  and RETRY_OFFERS): "honestly", "I want to be straight", "unfortunately", "it seems",
+  "I wasn't able", "I was not able", "I couldn't", "I could not", "try again".
 - It names `resolve_entity` and `rank_and_count`, and no tool that is off the chat wire
   (`list_entities`, `meeting_briefing`, `skill_view`).
-- **No line that is exactly three backticks.** It would close the backend doc's ```text
-  block early, and the drift check would compare half a prompt.
+- **No line that starts with three backticks**, indented or tagged. A bare fence would
+  close the backend doc's ```text block early, and the drift check would compare half a
+  prompt; a tagged one would break that doc's rendering.
 - **It ends with exactly one newline.** The drift check extracts the block with
   `^```text\n(.*?)^```$` (DOTALL, MULTILINE). What it compares runs from just after the
   opening fence's newline up to the closing fence, so it includes the last prompt line's
@@ -48,8 +50,10 @@ skills or subagent sections, because the chat platform has no skill tool and no
   not an MCP tool: it must instead come from the `code_execution` toolset in
   `platform_toolsets.api_server`.
 
-On Windows (`core.autocrlf=true`) the working-tree copy has CRLF line endings. Git stores
-LF, and every check reads the file with `read_text`, which normalises line endings.
+`.gitattributes` pins this file to LF (`deploy/trc/SOUL.md text eol=lf`), so a Windows
+checkout with `core.autocrlf=true` is LF too, and the raw bytes hash to the same sha256 on
+every platform; `test_the_checkout_is_lf_with_no_bom` checks them. Keep the pin: the
+sha256 both repos record is of LF text.
 
 ## Rollout: a new prompt reaches new chats only
 
@@ -84,6 +88,9 @@ docker exec app python -c "from app.core.config import get_settings; print(get_s
 ```
 
 It must print `False` until C2 and C3 are live here, and `True` after the flag is turned on.
+Turn it on as soon as the Hermes deploy is verified, not later: while it is off, the
+backend generates an answer for every `query` call, a script's `answer=False` included,
+so scripts get passages and an answer they did not ask for, more slowly.
 
 ## Why it is a file here at all
 
