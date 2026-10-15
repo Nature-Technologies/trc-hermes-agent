@@ -12,7 +12,10 @@ backend file, run it with `--write`.
 `docs/superpowers/specs/2026-10-14-answer-first-agent-design.md` §4 and §4.1. Its exact
 text is contract C6, Appendix A of `docs/superpowers/plans/2026-10-14-answer-first-p0-p1.md`.
 Against v1 (about 25,000 characters) it routes by the shape of the question, with
-`resolve_entity` for names and `rank_and_count` for rankings, counts and rosters. It
+`resolve_entity` for names and `rank_and_count` for rankings, counts and rosters. Since
+C6 amendment 3 (2026-10-15) `find_relationships` is who knows whom and last contact, and
+a resolved record's owners, accounts and files go to `knowledge_graph` by its `ref`; a
+script still reaches only the six tools its sentence names. It
 speaks in a confident voice, ends each answer with a `trc:followups` block, and has no
 skills or subagent sections, because the chat platform has no skill tool and no
 `delegate_task` any more (contract C5b).
